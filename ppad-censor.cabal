@@ -1,0 +1,56 @@
+cabal-version:      3.0
+name:               ppad-censor
+version:            0.1.0
+synopsis:           Sequential constant-time testing for Haskell
+license:            MIT
+license-file:       LICENSE
+author:             Jared Tobin
+maintainer:         jared@ppad.tech
+category:           Testing
+build-type:         Simple
+tested-with:        GHC == 9.10.3
+extra-doc-files:    CHANGELOG
+description:
+  Sequential constant-time testing via anytime-valid e-processes.
+  Declare a constant-time hypothesis (an IO action plus two input
+  samplers); the driver interleaves paired timings of the two input
+  classes and streams them through ppad-eproc's two-sample test,
+  halting as soon as the wealth process crosses threshold.
+
+flag llvm
+  description: Use GHC's LLVM backend.
+  default:     False
+  manual:      True
+
+source-repository head
+  type:     git
+  location: git.ppad.tech/censor.git
+
+library
+  default-language: Haskell2010
+  hs-source-dirs:   lib
+  ghc-options:
+      -Wall
+  if flag(llvm)
+    ghc-options: -fllvm -O2
+  exposed-modules:
+      Censor
+      Censor.Meter
+  build-depends:
+      base >= 4.9 && < 5
+    , ppad-eproc
+
+test-suite censor-tests
+  type:                exitcode-stdio-1.0
+  default-language:    Haskell2010
+  hs-source-dirs:      test
+  main-is:             Main.hs
+
+  ghc-options:
+    -rtsopts -Wall -O2
+
+  build-depends:
+      base
+    , ppad-censor
+    , tasty
+    , tasty-hunit

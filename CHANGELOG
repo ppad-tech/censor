@@ -1,0 +1,6 @@
+# Changelog
+
+- 0.1.0 (2026-05-31)
+  * Initial release. Sequential constant-time testing via
+    anytime-valid e-processes, with wall-clock measurement on macOS
+    and Linux.
