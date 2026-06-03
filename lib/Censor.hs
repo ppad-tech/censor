@@ -150,10 +150,7 @@ clip !lim !x = if x > lim then lim else x
 {-# INLINE clip #-}
 
 runOne :: Meter -> Int -> IO () -> IO Word64
-runOne (Meter m) !k act = m (rep k)
-  where
-    rep 0 = pure ()
-    rep i = act >> rep (i - 1)
+runOne (Meter m) !k !act = m k act
 {-# INLINE runOne #-}
 
 warmup :: Meter -> Config -> Hypothesis a -> IO Word64

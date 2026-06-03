@@ -11,8 +11,10 @@ import Weigh
 instance NFData C.Result where rnf !_ = ()
 
 constMeter :: Meter
-constMeter = Meter $ \act -> do
-  act
+constMeter = Meter $ \k act -> do
+  let go 0 = pure ()
+      go i = act >> go (i - 1)
+  go k
   pure 100
 {-# NOINLINE constMeter #-}
 

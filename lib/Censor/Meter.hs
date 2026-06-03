@@ -52,16 +52,23 @@ import Foreign.C.Types (CInt(..))
 
 -- | A measurement device.
 --
---   @'measure' m act@ runs @act@ and returns a 'Word64' reading. The
---   unit and semantics depend on the meter (nanoseconds for
---   'wallClock'; retired instructions, retired branches, or CPU
---   cycles for a 'withCounter' meter).
+--   @'measure' m k act@ runs @act@ @k@ times back-to-back and returns
+--   a single 'Word64' reading for the whole batch. The unit and
+--   semantics depend on the meter (nanoseconds for 'wallClock';
+--   retired instructions, retired branches, or CPU cycles for a
+--   'withCounter' meter).
+--
+--   Bundling the batch count into the meter API lets each meter
+--   decide where the inner loop lives -- the wall-clock meter samples
+--   the monotonic clock once at each end of the batch; the PMU meters
+--   arm and disarm the counter once per batch -- and avoids
+--   per-pair closure allocation in the driver wrapping the loop.
 newtype Meter = Meter
-  { measure :: IO () -> IO Word64
+  { measure :: Int -> IO () -> IO Word64
   }
 
 -- | Wall-clock meter. Reads the monotonic clock before and after the
---   action and returns the elapsed nanoseconds.
+--   @k@-fold batch and returns the elapsed nanoseconds.
 --
 --   Backed by @GHC.Clock.getMonotonicTimeNSec@, which dispatches to
 --   @mach_absolute_time@ on Darwin and @clock_gettime(CLOCK_MONOTONIC)@
@@ -69,13 +76,23 @@ newtype Meter = Meter
 wallClock :: Meter
 wallClock = Meter measureWall
 
-measureWall :: IO () -> IO Word64
-measureWall act = do
+measureWall :: Int -> IO () -> IO Word64
+measureWall !k !act = do
   !t0 <- getMonotonicTimeNSec
-  act
+  rep k act
   !t1 <- getMonotonicTimeNSec
   pure $! t1 - t0
 {-# INLINE measureWall #-}
+
+-- shared inner loop. INLINE so it specialises at each meter call site
+-- and the recursion compiles to a join-point with no per-iteration
+-- closure allocation.
+rep :: Int -> IO () -> IO ()
+rep !k !act = go k
+  where
+    go 0 = pure ()
+    go i = act >> go (i - 1)
+{-# INLINE rep #-}
 
 -- | A hardware event to count.
 data Counter =
@@ -146,9 +163,9 @@ withCounter counter k = onOneThread $ do
       | otherwise               = id
 
 meterFor :: CInt -> Meter
-meterFor !fd = Meter $ \act -> do
+meterFor !fd = Meter $ \k act -> do
   c_perf_begin fd
-  act
+  rep k act
   c_perf_end fd
 {-# INLINE meterFor #-}
 

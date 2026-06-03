@@ -19,8 +19,10 @@ instance NFData C.Result where rnf !_ = ()
 -- readings, so the e-process wealth stays flat and the run goes to
 -- budget).
 constMeter :: Meter
-constMeter = Meter $ \act -> do
-  act
+constMeter = Meter $ \k act -> do
+  let go 0 = pure ()
+      go i = act >> go (i - 1)
+  go k
   pure 100
 {-# NOINLINE constMeter #-}
 
