@@ -13,11 +13,14 @@
 -- A 'Meter' wraps an @IO@ action and returns a 'Word64' reading.
 -- 'wallClock' is available everywhere, backed by
 -- @GHC.Clock.getMonotonicTimeNSec@. On Linux, 'withCounter' provides
--- hardware performance-counter meters (retired instructions or
--- branches) via @perf_event_open@; these count a deterministic
--- property of the executed code rather than elapsed time, so they are
+-- hardware performance-counter meters (retired instructions, retired
+-- branches, or CPU cycles) via @perf_event_open@. The instruction and
+-- branch counters are deterministic properties of the executed code,
 -- immune to the frequency-scaling, cache, and scheduling noise that
--- limits 'wallClock' on sub-microsecond targets.
+-- limits 'wallClock' on sub-microsecond targets; the cycle counter is
+-- additionally sensitive to data-dependent latency within identical
+-- instruction streams (e.g. variable-time divider units, cache
+-- misses), at the cost of run-to-run microarchitectural noise.
 --
 -- Resolution caveat ('wallClock'): on Apple Silicon, the user-mode
 -- monotonic counter ticks at roughly 24 MHz (~42 ns per tick). Targets
@@ -51,8 +54,8 @@ import Foreign.C.Types (CInt(..))
 --
 --   @'measure' m act@ runs @act@ and returns a 'Word64' reading. The
 --   unit and semantics depend on the meter (nanoseconds for
---   'wallClock'; retired instructions or branches for a 'withCounter'
---   meter).
+--   'wallClock'; retired instructions, retired branches, or CPU
+--   cycles for a 'withCounter' meter).
 newtype Meter = Meter
   { measure :: IO () -> IO Word64
   }
@@ -76,8 +79,11 @@ measureWall act = do
 
 -- | A hardware event to count.
 data Counter =
-    InstructionsRetired  -- ^ @PERF_COUNT_HW_INSTRUCTIONS@
-  | BranchesRetired      -- ^ @PERF_COUNT_HW_BRANCH_INSTRUCTIONS@
+    InstructionsRetired  -- ^ @PERF_COUNT_HW_INSTRUCTIONS@; deterministic.
+  | BranchesRetired      -- ^ @PERF_COUNT_HW_BRANCH_INSTRUCTIONS@; deterministic.
+  | Cycles               -- ^ @PERF_COUNT_HW_CPU_CYCLES@; sensitive to
+                         --   data-dependent latency and microarch state,
+                         --   not deterministic.
   deriving (Eq, Show)
 
 -- | Why a 'withCounter' meter could not be opened.
@@ -104,6 +110,7 @@ foreign import ccall unsafe "censor_perf_close"
 counterCode :: Counter -> CInt
 counterCode InstructionsRetired = 0
 counterCode BranchesRetired     = 1
+counterCode Cycles              = 2
 
 -- | Acquire a hardware performance-counter 'Meter' for the duration of
 --   the callback, then release it.
@@ -116,10 +123,14 @@ counterCode BranchesRetired     = 1
 --   via 'runInBoundThread', otherwise inline on the sole OS thread --
 --   so that the open and every 'measure' share one thread.
 --
---   Throws 'MeterError' if the counter cannot be opened. Counts a
---   deterministic instruction\/branch tally, so a constant-time target
---   yields identical readings across input classes regardless of
---   operand values, cache state, or CPU frequency.
+--   Throws 'MeterError' if the counter cannot be opened. For
+--   'InstructionsRetired' and 'BranchesRetired' the reading is a
+--   deterministic property of the executed code, so a constant-time
+--   target yields identical readings across input classes regardless
+--   of operand values, cache state, or CPU frequency. For 'Cycles' the
+--   reading additionally reflects data-dependent latency and
+--   microarchitectural state, so equality across classes is not
+--   guaranteed even for CT code.
 withCounter :: Counter -> (Meter -> IO a) -> IO a
 withCounter counter k = onOneThread $ do
   fd <- c_perf_open (counterCode counter)

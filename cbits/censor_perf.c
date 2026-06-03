@@ -23,15 +23,19 @@ static long censor_perf_event_open(struct perf_event_attr *attr, pid_t pid,
   return syscall(__NR_perf_event_open, attr, pid, cpu, group, flags);
 }
 
-/* counter: 0 = instructions retired, 1 = branch instructions retired.
- * Returns a file descriptor (>= 0) on success, or -errno on failure. */
+/* counter: 0 = instructions retired, 1 = branch instructions retired,
+ * 2 = CPU cycles. Returns a file descriptor (>= 0) on success, or
+ * -errno on failure. */
 int censor_perf_open(int counter) {
   struct perf_event_attr attr;
   memset(&attr, 0, sizeof(attr));
   attr.type           = PERF_TYPE_HARDWARE;
   attr.size           = sizeof(attr);
-  attr.config         = (counter == 1) ? PERF_COUNT_HW_BRANCH_INSTRUCTIONS
-                                        : PERF_COUNT_HW_INSTRUCTIONS;
+  switch (counter) {
+    case 1:  attr.config = PERF_COUNT_HW_BRANCH_INSTRUCTIONS; break;
+    case 2:  attr.config = PERF_COUNT_HW_CPU_CYCLES;          break;
+    default: attr.config = PERF_COUNT_HW_INSTRUCTIONS;        break;
+  }
   attr.disabled       = 1;
   attr.exclude_kernel = 1;
   attr.exclude_hv     = 1;

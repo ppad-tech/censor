@@ -14,8 +14,11 @@
 -- the random class -- not a top-level CAF, whose distinct access path
 -- a sensitive meter would otherwise flag as a spurious difference.
 --
--- On Linux the demo measures with the deterministic instructions-
--- retired PMU meter, falling back to wall-clock if perf is unavailable.
+-- On Linux the demo runs each case under the deterministic
+-- instructions-retired PMU meter and again under the cycles meter
+-- (which is additionally sensitive to data-dependent latency and
+-- microarchitectural state), falling back to wall-clock if perf is
+-- unavailable.
 
 module Main where
 
@@ -165,6 +168,15 @@ cfg = C.defaultConfig
   , C.cfgBatch  = 50
   }
 
+-- Scalar.mul is fast enough that wall-clock readings on macOS (~42ns
+-- quantum) are dominated by per-call cache and allocator asymmetries
+-- between the fixed and random classes rather than mul itself. A
+-- larger inner-loop batch amortizes the fixed cost across enough muls
+-- that the per-call asymmetries average out. Irrelevant under the
+-- deterministic PMU meter, but harmless there.
+cfgBigBatch :: C.Config
+cfgBigBatch = cfg { C.cfgBatch = 2000 }
+
 runCaseWith :: C.Meter -> C.Config -> String -> IO (C.Hypothesis a) -> IO ()
 runCaseWith meter c name mkH = do
   putStrLn $ "-- " ++ name
@@ -184,7 +196,8 @@ runAll meter = do
   ga <- mkRng 0xCAFEBABE
   gb <- mkRng 0xDEADBEEF
   let rc = runCaseWith meter cfg
-  rc "positive: Scalar.mul (single multiply)"              (posScalarMul ga gb)
+  runCaseWith meter cfgBigBatch
+     "positive: Scalar.mul (single multiply, batch=2000)"  (posScalarMul ga gb)
   rc "positive: Scalar.inv (addition chain)"               (posScalarInv ga gb)
   rc "positive: Scalar.exp (constant-iteration ladder)"    (posScalarExp ga gb)
   rc "negative: deliberately leaky popcount-driven loop"   (negLeakyPopcount ga gb)
@@ -195,15 +208,20 @@ main = do
   hSetBuffering stdout LineBuffering
   putStrLn "ppad-censor demo: dudect-style fix-vs-random against ppad-fixed"
   putStrLn $ "config: " ++ show cfg
-  -- prefer the deterministic instructions-retired PMU meter; fall back
-  -- to wall-clock if perf_event_open is unavailable (non-Linux, or
-  -- kernel.perf_event_paranoid > 2).
-  attempt <- try (C.withCounter C.InstructionsRetired $ \meter -> do
-                    putStrLn "meter: instructions_retired\n"
-                    runAll meter) :: IO (Either C.MeterError ())
-  case attempt of
-    Right () -> pure ()
-    Left err -> do
-      putStrLn $ "meter: wall-clock (instructions_retired unavailable: "
+  -- Try each PMU meter in turn: instructions_retired (deterministic
+  -- code-path tally) and then cycles (catches data-dependent latency
+  -- too). Fall back to wall-clock only if perf_event_open is
+  -- unavailable (non-Linux, or kernel.perf_event_paranoid > 2).
+  ri <- tryMeter C.InstructionsRetired "instructions_retired"
+  rc <- tryMeter C.Cycles              "cycles"
+  case (ri, rc) of
+    (Left err, Left _) -> do
+      putStrLn $ "meter: wall-clock (PMU unavailable: "
               ++ show err ++ ")\n"
       runAll C.wallClock
+    _ -> pure ()
+  where
+    tryMeter counter label =
+      try (C.withCounter counter $ \meter -> do
+             putStrLn $ "\nmeter: " ++ label
+             runAll meter) :: IO (Either C.MeterError ())
