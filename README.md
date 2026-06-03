@@ -34,10 +34,35 @@ case result of
     "no leak detected within budget (" ++ show n ++ " samples)"
 ```
 
+On Linux, `withCounter` swaps the wall-clock meter for a hardware
+performance counter (retired instructions or branches), which is
+deterministic and immune to frequency scaling, cache, and scheduling
+noise — preferable for sub-microsecond targets:
+
+```haskell
+-- throws Censor.MeterError if perf_event_open is unavailable
+result <- C.withCounter C.InstructionsRetired $ \meter ->
+  C.runCT meter C.defaultConfig hyp
+```
+
+## Measurement hygiene
+
+The driver times only `target`, so any input-preparation work that
+leaks into the timed region shows up as a spurious class difference.
+Two rules keep the comparison honest:
+
+  * Return inputs in *normal form* from the samplers (force any lazy
+    conversions); otherwise the first use inside `target` pays for them.
+  * Build the fixed class the *same way* as the random class — a
+    heap-allocated value differing only in its data — rather than a
+    top-level constant. A CAF and a fresh heap value are reached by
+    different code, a difference an instruction-counter meter will
+    (correctly) flag.
+
 ## Phasing
 
-Phase 1 (this release) ships wall-clock measurement only, cross-
-platform via `GHC.Clock.getMonotonicTimeNSec`. Phase 2 will add PMU
-hardware counter meters (`instructions_retired`, `branches_retired`)
-on Linux, with a precondition tier that catches structural leaks
-without statistics.
+Phase 1 ships wall-clock measurement, cross-platform via
+`GHC.Clock.getMonotonicTimeNSec`. Phase 2 (this release) adds the
+`instructions_retired` and `branches_retired` PMU meters on Linux via
+`withCounter`. A precondition tier that catches structural leaks from
+the deterministic counts without statistics remains future work.

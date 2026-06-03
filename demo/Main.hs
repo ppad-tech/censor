@@ -2,14 +2,24 @@
 
 -- censor-demo: exercise the sequential CT tester against a few
 -- targets drawn from ppad-fixed. We adopt the dudect-style
--- "fix vs random" protocol: class A always supplies a canonical
--- fixed input, class B supplies fresh pseudorandom inputs. A
--- timing-leaky target should produce a measurable distributional
--- difference between classes; a CT target should not.
+-- "fix vs random" protocol: class A always supplies one fixed input,
+-- class B supplies fresh pseudorandom inputs. A timing-leaky target
+-- should produce a measurable distributional difference between
+-- classes; a CT target should not.
+--
+-- Two measurement-hygiene rules keep the comparison honest (see
+-- Censor's "Measurement hygiene" notes): inputs are returned in normal
+-- form, so no lazy conversion is paid inside the timed region, and the
+-- fixed input is an ordinary heap value built by the same sampler as
+-- the random class -- not a top-level CAF, whose distinct access path
+-- a sensitive meter would otherwise flag as a spurious difference.
+--
+-- On Linux the demo measures with the deterministic instructions-
+-- retired PMU meter, falling back to wall-clock if perf is unavailable.
 
 module Main where
 
-import Control.Exception (evaluate)
+import Control.Exception (evaluate, try)
 import Control.Monad (replicateM_)
 import qualified Data.Bits as B
 import Data.IORef
@@ -45,8 +55,20 @@ randomWider g = do
   pure $! W.wider (fromIntegral a) (fromIntegral b)
                   (fromIntegral c) (fromIntegral d)
 
+-- a random Montgomery value, forced to normal form: the to# conversion
+-- is performed here, not left as a thunk for the meter to pay inside
+-- the timed region.
 randomMont :: Rng -> IO MS.Montgomery
-randomMont g = MS.to <$> randomWider g
+randomMont g = do
+  !w <- randomWider g
+  evaluate (MS.to w)
+
+-- seed for the fixed class. drawing the fixed input from a dedicated
+-- generator (rather than naming a top-level constant) yields a
+-- reproducible but heap-allocated value, reached by the same code as
+-- the random class.
+fixedSeed :: Word64
+fixedSeed = 0x5EED5EED5EED5EED
 
 -- hypotheses -----------------------------------------------------------------
 
@@ -54,14 +76,15 @@ randomMont g = MS.to <$> randomWider g
 -- fully-unrolled limb arithmetic; should be CT.
 posScalarMul :: Rng -> Rng -> IO (C.Hypothesis (MS.Montgomery, MS.Montgomery))
 posScalarMul ga gb = do
-  let !fixA = MS.one
+  gFix  <- mkRng fixedSeed
+  !fixX <- randomMont gFix
   pure C.Hypothesis
     { C.target  = \(!x, !y) -> do
         !_ <- evaluate (MS.mul x y)
         pure ()
     , C.sampleA = do
         !y <- randomMont ga
-        pure (fixA, y)
+        pure (fixX, y)
     , C.sampleB = do
         !x <- randomMont gb
         !y <- randomMont gb
@@ -72,11 +95,13 @@ posScalarMul ga gb = do
 -- 256 squarings + a fixed number of multiplications; should be CT.
 posScalarInv :: Rng -> Rng -> IO (C.Hypothesis MS.Montgomery)
 posScalarInv _ga gb = do
+  gFix  <- mkRng fixedSeed
+  !fixX <- randomMont gFix
   pure C.Hypothesis
     { C.target  = \(!x) -> do
         !_ <- evaluate (MS.inv x)
         pure ()
-    , C.sampleA = pure MS.one
+    , C.sampleA = pure fixX
     , C.sampleB = randomMont gb
     }
 
@@ -84,14 +109,15 @@ posScalarInv _ga gb = do
 -- ladder driven by select#). Should be CT in the exponent.
 posScalarExp :: Rng -> Rng -> IO (C.Hypothesis (MS.Montgomery, Wider))
 posScalarExp _ga gb = do
-  let !fixedExp = W.wider 1 0 0 0
+  gFix  <- mkRng fixedSeed
+  !fixE <- randomWider gFix
   pure C.Hypothesis
     { C.target  = \(!b, !e) -> do
         !_ <- evaluate (MS.exp b e)
         pure ()
     , C.sampleA = do
         !b <- randomMont gb
-        pure (b, fixedExp)
+        pure (b, fixE)
     , C.sampleB = do
         !b <- randomMont gb
         !e <- randomWider gb
@@ -103,11 +129,12 @@ posScalarExp _ga gb = do
 -- reject this.
 negLeakyPopcount :: Rng -> Rng -> IO (C.Hypothesis Wider)
 negLeakyPopcount _ga gb = do
+  !fixZero <- evaluate (W.wider 0 0 0 0)
   pure C.Hypothesis
     { C.target  = \(!w) -> do
         let !n = B.popCount (W.from_vartime w :: Integer)
         replicateM_ (10 * n) (evaluate ())
-    , C.sampleA = pure (W.wider 0 0 0 0)
+    , C.sampleA = pure fixZero
     , C.sampleB = randomWider gb
     }
 
@@ -115,11 +142,12 @@ negLeakyPopcount _ga gb = do
 -- variable-time. Class A always converts zero, class B random.
 negFromVartime :: Rng -> Rng -> IO (C.Hypothesis Wider)
 negFromVartime _ga gb = do
+  !fixZero <- evaluate (W.wider 0 0 0 0)
   pure C.Hypothesis
     { C.target  = \(!w) -> do
         !_ <- evaluate (W.from_vartime w :: Integer)
         pure ()
-    , C.sampleA = pure (W.wider 0 0 0 0)
+    , C.sampleA = pure fixZero
     , C.sampleB = randomWider gb
     }
 
@@ -127,29 +155,22 @@ negFromVartime _ga gb = do
 
 -- looser alpha than the default, bigger budget than the test suite,
 -- and a small inner-loop batch so micro-targets clear the wall-clock
--- counter resolution.
+-- counter resolution. The CT controls now (correctly) run to the full
+-- budget before passing, so the budget is kept modest.
 cfg :: C.Config
 cfg = C.defaultConfig
   { C.cfgAlpha  = 1.0e-3
-  , C.cfgBudget = 200000
+  , C.cfgBudget = 50000
   , C.cfgWarmup = 500
   , C.cfgBatch  = 50
   }
 
--- bigger batch to defeat 42ns wall-clock quantisation for the
--- fast single-mul case.
-cfgBigBatch :: C.Config
-cfgBigBatch = cfg { C.cfgBatch = 2000 }
-
-runCase :: String -> IO (C.Hypothesis a) -> IO ()
-runCase = runCaseWith cfg
-
-runCaseWith :: C.Config -> String -> IO (C.Hypothesis a) -> IO ()
-runCaseWith c name mkH = do
+runCaseWith :: C.Meter -> C.Config -> String -> IO (C.Hypothesis a) -> IO ()
+runCaseWith meter c name mkH = do
   putStrLn $ "-- " ++ name
   hFlush stdout
   h <- mkH
-  r <- C.runCT C.wallClock c h
+  r <- C.runCT meter c h
   case r of
     C.Reject n w -> putStrLn $
       "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
@@ -157,24 +178,32 @@ runCaseWith c name mkH = do
       "  PASS    after " ++ show n ++ " pairs, logW=" ++ show w
   hFlush stdout
 
+-- run every case under the given meter.
+runAll :: C.Meter -> IO ()
+runAll meter = do
+  ga <- mkRng 0xCAFEBABE
+  gb <- mkRng 0xDEADBEEF
+  let rc = runCaseWith meter cfg
+  rc "positive: Scalar.mul (single multiply)"              (posScalarMul ga gb)
+  rc "positive: Scalar.inv (addition chain)"               (posScalarInv ga gb)
+  rc "positive: Scalar.exp (constant-iteration ladder)"    (posScalarExp ga gb)
+  rc "negative: deliberately leaky popcount-driven loop"   (negLeakyPopcount ga gb)
+  rc "negative: Wider.from_vartime (Integer conversion)"   (negFromVartime ga gb)
+
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  ga <- mkRng 0xCAFEBABE
-  gb <- mkRng 0xDEADBEEF
   putStrLn "ppad-censor demo: dudect-style fix-vs-random against ppad-fixed"
   putStrLn $ "config: " ++ show cfg
-  putStrLn ""
-  runCase "positive: Scalar.mul (batch=50)"
-          (posScalarMul ga gb)
-  runCaseWith cfgBigBatch
-          "positive: Scalar.mul (batch=2000)"
-          (posScalarMul ga gb)
-  runCase "positive: Scalar.inv (addition chain)"
-          (posScalarInv ga gb)
-  runCase "positive: Scalar.exp (constant-iteration ladder)"
-          (posScalarExp ga gb)
-  runCase "negative: deliberately leaky popcount-driven loop"
-          (negLeakyPopcount ga gb)
-  runCase "negative: Wider.from_vartime (Integer conversion)"
-          (negFromVartime ga gb)
+  -- prefer the deterministic instructions-retired PMU meter; fall back
+  -- to wall-clock if perf_event_open is unavailable (non-Linux, or
+  -- kernel.perf_event_paranoid > 2).
+  attempt <- try (C.withCounter C.InstructionsRetired $ \meter -> do
+                    putStrLn "meter: instructions_retired\n"
+                    runAll meter) :: IO (Either C.MeterError ())
+  case attempt of
+    Right () -> pure ()
+    Left err -> do
+      putStrLn $ "meter: wall-clock (instructions_retired unavailable: "
+              ++ show err ++ ")\n"
+      runAll C.wallClock

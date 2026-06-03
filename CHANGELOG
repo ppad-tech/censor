@@ -1,5 +1,13 @@
 # Changelog
 
+- Unreleased
+  * Add Phase-2 hardware performance-counter meters on Linux:
+    'Censor.withCounter' acquires an 'instructions_retired' or
+    'branches_retired' meter via perf_event_open (user-space only, so
+    usable unprivileged at perf_event_paranoid <= 2). The counter is
+    deterministic and thread-affine; the callback runs on one OS thread
+    and the fd is released on exit. wallClock is unchanged.
+
 - 0.1.0 (2026-05-31)
   * Initial release. Sequential constant-time testing via
     anytime-valid e-processes, with wall-clock measurement on macOS

@@ -38,6 +38,8 @@ library
       -Wall
   if flag(llvm)
     ghc-options: -fllvm -O2
+  if os(linux)
+    c-sources: cbits/censor_perf.c
   exposed-modules:
       Censor
       Censor.Meter

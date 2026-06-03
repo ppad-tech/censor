@@ -37,6 +37,9 @@ module Censor (
     -- * Measurement (re-exports)
   , Meter(..)
   , wallClock
+  , Counter(..)
+  , MeterError(..)
+  , withCounter
   ) where
 
 import Control.Monad (replicateM)
