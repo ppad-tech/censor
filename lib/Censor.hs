@@ -109,7 +109,7 @@ runCT meter cfg hyp = do
     _ -> pure ()
   let !lo    = 0 :: Double
       !hi    = fromIntegral bound :: Double
-      !tsCfg = TS.config lo hi (cfgAlpha cfg) B.ons
+      !tsCfg = TS.config lo hi (cfgAlpha cfg) B.Ons
       go !n !st
         | n >= cfgBudget cfg =
             pure $! Pass n (TS.logWealth st)

@@ -51,17 +51,48 @@
         ]
       },
       "locked": {
-        "lastModified": 1780271111,
-        "narHash": "sha256-Mx1pXuwpS5n41+pt9uUh+By5DgiXWQd+8l8Dc4z9jWU=",
-        "ref": "refs/heads/master",
-        "rev": "f47c6310e1bc44f8a0213beeac799ec75cc4d2b6",
-        "revCount": 1,
+        "lastModified": 1780443341,
+        "narHash": "sha256-g+34okSt42X10CnahuZ8K6qj5sNdqamzI8Tr5qQORLk=",
+        "ref": "master",
+        "rev": "a230e6558be4050da6ecb1a799d9993a9c957152",
+        "revCount": 3,
         "type": "git",
-        "url": "file:///Users/jtobin/src/ppad/eproc"
+        "url": "git://git.ppad.tech/eproc.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/eproc.git"
+      }
+    },
+    "ppad-fixed": {
+      "inputs": {
+        "flake-utils": [
+          "ppad-fixed",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-fixed",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1779456231,
+        "narHash": "sha256-lmQhxa6OL0XMRoWEzCUrgPWGFtF88DoCTZ76XMTzE7E=",
+        "ref": "refs/heads/master",
+        "rev": "49ee35d9e2342b21d4a3f3456251ad3e26c69503",
+        "revCount": 293,
+        "type": "git",
+        "url": "file:///Users/jtobin/src/ppad/fixed"
       },
       "original": {
         "type": "git",
-        "url": "file:///Users/jtobin/src/ppad/eproc"
+        "url": "file:///Users/jtobin/src/ppad/fixed"
       }
     },
     "ppad-nixpkgs": {
@@ -95,6 +126,7 @@
           "nixpkgs"
         ],
         "ppad-eproc": "ppad-eproc",
+        "ppad-fixed": "ppad-fixed",
         "ppad-nixpkgs": "ppad-nixpkgs"
       }
     },
