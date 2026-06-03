@@ -84,15 +84,16 @@
       "locked": {
         "lastModified": 1779456231,
         "narHash": "sha256-lmQhxa6OL0XMRoWEzCUrgPWGFtF88DoCTZ76XMTzE7E=",
-        "ref": "refs/heads/master",
+        "ref": "master",
         "rev": "49ee35d9e2342b21d4a3f3456251ad3e26c69503",
         "revCount": 293,
         "type": "git",
-        "url": "file:///Users/jtobin/src/ppad/fixed"
+        "url": "git://git.ppad.tech/fixed.git"
       },
       "original": {
+        "ref": "master",
         "type": "git",
-        "url": "file:///Users/jtobin/src/ppad/fixed"
+        "url": "git://git.ppad.tech/fixed.git"
       }
     },
     "ppad-nixpkgs": {

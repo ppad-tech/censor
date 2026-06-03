@@ -14,7 +14,9 @@
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
     };
     ppad-fixed = {
-      url = "git+file:///Users/jtobin/src/ppad/fixed";
+      type = "git";
+      url  = "git://git.ppad.tech/fixed.git";
+      ref  = "master";
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
     };
     flake-utils.follows = "ppad-nixpkgs/flake-utils";
