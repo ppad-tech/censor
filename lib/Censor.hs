@@ -45,9 +45,8 @@ module Censor (
 import Control.Monad (replicateM)
 import Data.List (sort)
 import Data.Word (Word64)
-import qualified Statistics.EProcess.Bettor as B
-import qualified Statistics.EProcess.Mean as M
-import qualified Statistics.EProcess.TwoSample as TS
+import qualified Numeric.Eproc.Paired as EP
+import Numeric.Eproc.Paired (Bettor(Ons))
 
 import Censor.Meter
 
@@ -112,13 +111,13 @@ runCT meter cfg hyp = do
     _ -> pure ()
   let !lo    = 0 :: Double
       !hi    = fromIntegral bound :: Double
-      !tsCfg = TS.config lo hi (cfgAlpha cfg) B.Ons
+      !epCfg = EP.config lo hi (cfgAlpha cfg) Ons
       go !n !st
         | n >= cfgBudget cfg =
-            pure $! Pass n (TS.logWealth st)
-        | otherwise = case TS.decide tsCfg st of
-            M.Reject -> pure $! Reject n (TS.logWealth st)
-            M.Continue -> do
+            pure $! Pass n (EP.log_wealth st)
+        | otherwise = case EP.decide epCfg st of
+            EP.Reject -> pure $! Reject n (EP.log_wealth st)
+            EP.Continue -> do
               -- alternate which class is measured first to cancel
               -- order-induced bias (cache warmth etc.).
               (!ta, !tb) <-
@@ -137,12 +136,12 @@ runCT meter cfg hyp = do
                     pure (x, y)
               let !tac = clip bound ta
                   !tbc = clip bound tb
-                  !st' = TS.update tsCfg st
+                  !st' = EP.update epCfg st
                     ( fromIntegral tac
                     , fromIntegral tbc
                     )
               go (n + 1) st'
-  go 0 (TS.initial tsCfg)
+  go 0 (EP.initial epCfg)
 
 -- internal
 
