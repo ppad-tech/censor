@@ -45,6 +45,46 @@ result <- C.withCounter C.InstructionsRetired $ \meter ->
   C.runCT meter C.defaultConfig hyp
 ```
 
+## Foreign targets
+
+For C, Rust, or cgo-shimmed Go constructs, `Censor.FFI` brackets a
+single pinned workspace outside the timed region and presents a
+regular `Hypothesis (Ptr Word8)` for `runCT` to consume. Samplers
+fill the workspace in place; the target reads (and optionally
+writes) it via offsets the caller chooses.
+
+```haskell
+import qualified Censor as C
+import qualified Censor.FFI as F
+import Foreign.Ptr (Ptr, plusPtr)
+import Data.Word (Word8)
+
+-- C side: void ct_mul(const uint8_t *a, const uint8_t *b,
+--                     uint8_t *out);   -- 32-byte operands.
+foreign import ccall unsafe "ct_mul"
+  c_mul :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> IO ()
+
+let hyp = F.FFIHypothesis
+      { F.ffiWorkspaceBytes = 96      -- two 32B inputs + 32B output
+      , F.ffiSampleA = \p -> do
+          fillFixed     (p `plusPtr`  0) 32   -- A: fixed input
+          fillRandom ga (p `plusPtr` 32) 32   -- A: random partner
+      , F.ffiSampleB = \p -> do
+          fillRandom gb (p `plusPtr`  0) 32
+          fillRandom gb (p `plusPtr` 32) 32
+      , F.ffiTarget = \p ->
+          c_mul p (p `plusPtr` 32) (p `plusPtr` 64)
+      }
+
+result <- F.withFFIHypothesis hyp $ \h ->
+  C.runCT C.wallClock C.defaultConfig h
+```
+
+`ffiTarget` should be a single FFI call with no in-Haskell
+preparation — any marshalling done inside it lands in the timed
+region and shows up as A/B noise. Use `ccall unsafe`, not `safe`,
+to avoid the RTS thread-state save/restore on every call.
+
 ## Measurement hygiene
 
 The driver times only `target`, so any input-preparation work that
