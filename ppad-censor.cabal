@@ -42,6 +42,7 @@ library
     c-sources: cbits/censor_perf.c
   exposed-modules:
       Censor
+      Censor.FFI
       Censor.Meter
   build-depends:
       base >= 4.9 && < 5

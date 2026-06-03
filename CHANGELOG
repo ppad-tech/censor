@@ -1,6 +1,11 @@
 # Changelog
 
 - Unreleased
+  * Add 'Censor.FFI', a buffer-allocating helper for testing
+    foreign-function targets (C, Rust, Go via cgo, etc.) under the
+    same sequential CT driver. A single pinned workspace is allocated
+    once outside the timed region; samplers fill it in place and the
+    target consumes it via the user's chosen offset layout.
   * Add Phase-2 hardware performance-counter meters on Linux:
     'Censor.withCounter' acquires an 'InstructionsRetired',
     'BranchesRetired', or 'Cycles' meter via perf_event_open
