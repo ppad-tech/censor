@@ -1,21 +1,22 @@
 cabal-version:      3.0
 name:               ppad-censor
 version:            0.1.0
-synopsis:           Sequential constant-time testing for Haskell
+synopsis:           Sequential constant-time testing for Haskell.
 license:            MIT
 license-file:       LICENSE
 author:             Jared Tobin
 maintainer:         jared@ppad.tech
 category:           Testing
 build-type:         Simple
-tested-with:        GHC == 9.10.3
+tested-with:        GHC == { 9.10.3 }
 extra-doc-files:    CHANGELOG
 description:
-  Sequential constant-time testing via anytime-valid e-processes.
-  Declare a constant-time hypothesis (an IO action plus two input
-  samplers); the driver interleaves paired timings of the two input
-  classes and streams them through ppad-eproc's two-sample test,
-  halting as soon as the wealth process crosses threshold.
+  A pure Haskell framework for sequential constant-time testing via
+  anytime-valid e-processes. Declare a constant-time hypothesis (an
+  @IO@ action plus two input samplers); the driver interleaves paired
+  timings of the two input classes and streams them through
+  ppad-eproc's two-sample test, halting as soon as the wealth process
+  crosses threshold.
 
 flag llvm
   description: Use GHC's LLVM backend.

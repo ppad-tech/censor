@@ -227,11 +227,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1780597956,
-        "narHash": "sha256-dbpRx40o+q2jWiOzhwPYAv/e78akLPXfczAV8XZg6B4=",
+        "lastModified": 1780601511,
+        "narHash": "sha256-NJLQAscngI1fcDOG7oyTNFr4evGfrifZOq1OqRzHgRg=",
         "ref": "master",
-        "rev": "0a4b12ab29ad1259b97f3db16f47539af56449eb",
-        "revCount": 16,
+        "rev": "2a3196374cc7b58d3cd7ad1fd774a5cd914469aa",
+        "revCount": 18,
         "type": "git",
         "url": "git://git.ppad.tech/eproc.git"
       },
