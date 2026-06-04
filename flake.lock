@@ -34,7 +34,111 @@
         "type": "github"
       }
     },
+    "ppad-aead": {
+      "inputs": {
+        "flake-utils": [
+          "ppad-aead",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-aead",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-base16": "ppad-base16",
+        "ppad-chacha": "ppad-chacha",
+        "ppad-nixpkgs": [
+          "ppad-nixpkgs"
+        ],
+        "ppad-poly1305": [
+          "ppad-poly1305"
+        ]
+      },
+      "locked": {
+        "lastModified": 1778958158,
+        "narHash": "sha256-fLhiModq6mEPps62ina9wxYBQ7PWHFpx8OuZjBflQnk=",
+        "ref": "master",
+        "rev": "c143529d6ed0f9e3b52fd24b52df27ee744a5f57",
+        "revCount": 29,
+        "type": "git",
+        "url": "git://git.ppad.tech/aead.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/aead.git"
+      }
+    },
     "ppad-base16": {
+      "inputs": {
+        "flake-utils": [
+          "ppad-aead",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-aead",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-aead",
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1778943993,
+        "narHash": "sha256-8eZyChH7WDgMTj804Ht4VFvS+WER9pPtlwYZgWlO60Q=",
+        "ref": "master",
+        "rev": "480f24d852e100bb87cd69f2eda531bdb1306495",
+        "revCount": 37,
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      }
+    },
+    "ppad-base16_2": {
+      "inputs": {
+        "flake-utils": [
+          "ppad-poly1305",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-poly1305",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-poly1305",
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1778943993,
+        "narHash": "sha256-8eZyChH7WDgMTj804Ht4VFvS+WER9pPtlwYZgWlO60Q=",
+        "ref": "master",
+        "rev": "480f24d852e100bb87cd69f2eda531bdb1306495",
+        "revCount": 37,
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      }
+    },
+    "ppad-base16_3": {
       "inputs": {
         "flake-utils": [
           "ppad-secp256k1",
@@ -66,6 +170,44 @@
         "ref": "master",
         "type": "git",
         "url": "git://git.ppad.tech/base16.git"
+      }
+    },
+    "ppad-chacha": {
+      "inputs": {
+        "flake-utils": [
+          "ppad-aead",
+          "ppad-chacha",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-aead",
+          "ppad-chacha",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-base16": [
+          "ppad-aead",
+          "ppad-base16"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-aead",
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1766951845,
+        "narHash": "sha256-mWnL5bYOeFyos27YmaN2aIxzblf+HgRgYxNA+gVkZ8s=",
+        "ref": "master",
+        "rev": "6da57b480038c829424daa7fc6d4289159b84a08",
+        "revCount": 24,
+        "type": "git",
+        "url": "git://git.ppad.tech/chacha.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/chacha.git"
       }
     },
     "ppad-eproc": {
@@ -229,6 +371,41 @@
         "url": "git://git.ppad.tech/nixpkgs.git"
       }
     },
+    "ppad-poly1305": {
+      "inputs": {
+        "flake-utils": [
+          "ppad-poly1305",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-poly1305",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-base16": "ppad-base16_2",
+        "ppad-fixed": [
+          "ppad-fixed"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1778948958,
+        "narHash": "sha256-vuroggP/yEuE+zqdACQMAeSR8XVKrCs/+rLXaGofG/w=",
+        "ref": "master",
+        "rev": "a0a1e67bd9f37b5d2ba97f0d092766132f531d1b",
+        "revCount": 36,
+        "type": "git",
+        "url": "git://git.ppad.tech/poly1305.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/poly1305.git"
+      }
+    },
     "ppad-secp256k1": {
       "inputs": {
         "flake-utils": [
@@ -241,7 +418,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16",
+        "ppad-base16": "ppad-base16_3",
         "ppad-fixed": "ppad-fixed_2",
         "ppad-hmac-drbg": "ppad-hmac-drbg",
         "ppad-nixpkgs": [
@@ -351,9 +528,11 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
+        "ppad-aead": "ppad-aead",
         "ppad-eproc": "ppad-eproc",
         "ppad-fixed": "ppad-fixed",
         "ppad-nixpkgs": "ppad-nixpkgs",
+        "ppad-poly1305": "ppad-poly1305",
         "ppad-secp256k1": "ppad-secp256k1"
       }
     },

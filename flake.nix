@@ -25,12 +25,30 @@
       ref  = "master";
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
     };
+    # Hoisted so we can pin its ppad-fixed input to our top-level
+    # ppad-fixed; without that, aead -> poly1305 brings its own
+    # ppad-fixed and the build trips on multiple versions.
+    ppad-poly1305 = {
+      type = "git";
+      url  = "git://git.ppad.tech/poly1305.git";
+      ref  = "master";
+      inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
+      inputs.ppad-fixed.follows = "ppad-fixed";
+    };
+    ppad-aead = {
+      type = "git";
+      url  = "git://git.ppad.tech/aead.git";
+      ref  = "master";
+      inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
+      inputs.ppad-poly1305.follows = "ppad-poly1305";
+    };
     flake-utils.follows = "ppad-nixpkgs/flake-utils";
     nixpkgs.follows = "ppad-nixpkgs/nixpkgs";
   };
 
   outputs = { self, nixpkgs, flake-utils, ppad-nixpkgs
-            , ppad-eproc, ppad-fixed, ppad-secp256k1 }:
+            , ppad-eproc, ppad-fixed, ppad-secp256k1
+            , ppad-poly1305, ppad-aead }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         lib = "ppad-censor";
@@ -54,15 +72,23 @@
             (hlib.enableCabalFlag secp "llvm")
             [ llvm clang ];
 
+        aead = ppad-aead.packages.${system}.default;
+        aead-llvm =
+          hlib.addBuildTools
+            (hlib.enableCabalFlag aead "llvm")
+            [ llvm clang ];
+
         hpkgs = pkgs.haskell.packages.ghc910.extend (new: old: {
           ppad-eproc = eproc;
           ppad-fixed = fixed-llvm;
           ppad-secp256k1 = secp-llvm;
+          ppad-aead = aead-llvm;
           ${lib} = hlib.enableCabalFlag
             (new.callCabal2nixWithOptions lib ./. "--flag=demo" {
                ppad-eproc = new.ppad-eproc;
                ppad-fixed = new.ppad-fixed;
                ppad-secp256k1 = new.ppad-secp256k1;
+               ppad-aead = new.ppad-aead;
              })
             "demo";
         });

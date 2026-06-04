@@ -1,11 +1,11 @@
 {-# LANGUAGE BangPatterns #-}
 
 -- censor-demo: exercise the sequential CT tester against a few
--- targets drawn from ppad-fixed and ppad-secp256k1. We adopt the
--- dudect-style "fix vs random" protocol: class A always supplies one
--- fixed input, class B supplies fresh pseudorandom inputs. A
--- timing-leaky target should produce a measurable distributional
--- difference between classes; a CT target should not.
+-- targets drawn from ppad-fixed, ppad-secp256k1, and ppad-aead. We
+-- adopt the dudect-style "fix vs random" protocol: class A always
+-- supplies one fixed input, class B supplies fresh pseudorandom
+-- inputs. A timing-leaky target should produce a measurable
+-- distributional difference between classes; a CT target should not.
 --
 -- Two measurement-hygiene rules keep the comparison honest (see
 -- Censor's "Measurement hygiene" notes): inputs are returned in normal
@@ -31,6 +31,7 @@ import Data.Word (Word8, Word64)
 import System.IO (hFlush, hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
+import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
 import qualified Crypto.Curve.Secp256k1 as Secp
 import qualified Data.Word.Wider as W
 import qualified Numeric.Montgomery.Secp256k1.Scalar as MS
@@ -68,18 +69,26 @@ randomMont g = do
   !w <- randomWider g
   evaluate (MS.to w)
 
--- a random 32-byte ByteString in NF. used to build messages and aux
--- random data for the signing hypotheses. constructed at sample time,
--- outside the timed region; replicateM is justified here -- it builds
--- a fixed four-element list of pre-forced Word64s, immediately
--- flattened into a strict ByteString that 'evaluate' fully forces.
-random32 :: Rng -> IO BS.ByteString
-random32 g = do
-  ws <- replicateM 4 (nextWord g)
-  evaluate $! BS.pack
+-- a random n-byte ByteString in NF. used to build keys, nonces,
+-- messages, AAD, plaintexts for the cryptographic hypotheses.
+-- constructed at sample time, outside the timed region; replicateM
+-- is justified -- it builds a fixed-length list of pre-forced
+-- Word64s, immediately flattened into a strict ByteString that
+-- 'evaluate' fully forces.
+randomBytes :: Rng -> Int -> IO BS.ByteString
+randomBytes g n = do
+  let !nws = (n + 7) `quot` 8
+  ws <- replicateM nws (nextWord g)
+  evaluate $! BS.take n $ BS.pack
     [ fromIntegral (w `B.shiftR` (8 * i)) :: Word8
     | w <- ws, i <- [0 .. 7 :: Int]
     ]
+
+random32 :: Rng -> IO BS.ByteString
+random32 g = randomBytes g 32
+
+random12 :: Rng -> IO BS.ByteString
+random12 g = randomBytes g 12
 
 -- seed for the fixed class. drawing the fixed input from a dedicated
 -- generator (rather than naming a top-level constant) yields a
@@ -207,6 +216,72 @@ posSignECDSA tex _ga gb = do
         pure (sec, msg)
     }
 
+-- positive control: AEAD-ChaCha20-Poly1305 encrypt. The secret is
+-- the 256-bit key; AAD, nonce, plaintext are public per call. Both
+-- ChaCha20 keystream generation and Poly1305 MAC computation have
+-- key-independent control flow; CT should hold.
+posAEADEncrypt
+  :: Rng -> Rng
+  -> IO (C.Hypothesis
+           (BS.ByteString, BS.ByteString, BS.ByteString, BS.ByteString))
+posAEADEncrypt _ga gb = do
+  gFix    <- mkRng fixedSeed
+  !fixKey <- random32 gFix
+  pure C.Hypothesis
+    { C.target = \(!key, !nonce, !aad, !pt) -> do
+        r <- evaluate (AEAD.encrypt aad key nonce pt)
+        case r of
+          Right (!_, !_) -> pure ()
+          Left _         -> pure ()
+    , C.sampleA = do
+        !nonce <- random12 gb
+        !aad   <- random32 gb
+        !pt    <- randomBytes gb 256
+        pure (fixKey, nonce, aad, pt)
+    , C.sampleB = do
+        !key   <- random32 gb
+        !nonce <- random12 gb
+        !aad   <- random32 gb
+        !pt    <- randomBytes gb 256
+        pure (key, nonce, aad, pt)
+    }
+
+-- positive control: AEAD-ChaCha20-Poly1305 decrypt on a valid
+-- ciphertext + MAC. The (cip, mac) pair is pre-computed at sample
+-- time using the chosen key, so the timed region exercises the
+-- full success path: keystream regeneration, Poly1305 recompute,
+-- and the ct_eq tag comparison. CT in the key should hold.
+posAEADDecrypt
+  :: Rng -> Rng
+  -> IO (C.Hypothesis
+           ( BS.ByteString, BS.ByteString, BS.ByteString
+           , BS.ByteString, BS.ByteString ))
+posAEADDecrypt _ga gb = do
+  gFix    <- mkRng fixedSeed
+  !fixKey <- random32 gFix
+  let mkSample !key = do
+        !nonce <- random12 gb
+        !aad   <- random32 gb
+        !pt    <- randomBytes gb 256
+        case AEAD.encrypt aad key nonce pt of
+          Left _ -> error
+            "censor-demo: AEAD encrypt failed during sample setup"
+          Right (cip, mac) -> do
+            !c <- evaluate cip
+            !m <- evaluate mac
+            pure (key, nonce, aad, c, m)
+  pure C.Hypothesis
+    { C.target = \(!key, !nonce, !aad, !cip, !mac) -> do
+        r <- evaluate (AEAD.decrypt aad key nonce (cip, mac))
+        case r of
+          Right !_ -> pure ()
+          Left _   -> pure ()
+    , C.sampleA = mkSample fixKey
+    , C.sampleB = do
+        !key <- random32 gb
+        mkSample key
+    }
+
 -- negative control: a deliberately leaky target whose work scales
 -- with the popcount of the value. A CT tester worth its salt must
 -- reject this.
@@ -291,14 +366,16 @@ runAll tex meter = do
   rh "positive: Secp.mul_wnaf (wNAF point multiplication)" (posMulWNAF tex ga gb)
   rh "positive: Secp.sign_schnorr' (BIP0340)"              (posSignSchnorr tex ga gb)
   rh "positive: Secp.sign_ecdsa' (RFC6979)"                (posSignECDSA tex ga gb)
+  rc "positive: AEAD.encrypt (ChaCha20-Poly1305, 256 B)"   (posAEADEncrypt ga gb)
+  rc "positive: AEAD.decrypt (ChaCha20-Poly1305, 256 B)"   (posAEADDecrypt ga gb)
   rc "negative: deliberately leaky popcount-driven loop"   (negLeakyPopcount ga gb)
   rc "negative: Wider.from_vartime (Integer conversion)"   (negFromVartime ga gb)
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  putStrLn "ppad-censor demo: dudect-style fix-vs-random \
-           \against ppad-fixed and ppad-secp256k1"
+  putStrLn "ppad-censor demo: dudect-style fix-vs-random against \
+           \ppad-fixed, ppad-secp256k1, and ppad-aead"
   putStrLn $ "config: " ++ show cfg
   -- one-shot secp256k1 precomputation, shared across all secp targets
   -- and across every meter.
