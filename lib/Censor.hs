@@ -46,7 +46,7 @@ import Control.Monad (replicateM)
 import Data.List (sort)
 import Data.Word (Word64)
 import qualified Numeric.Eproc.Paired as EP
-import Numeric.Eproc.Paired (Bettor(Ons))
+import Numeric.Eproc.Paired (Bettor(Newton))
 
 import Censor.Meter
 
@@ -111,7 +111,7 @@ runCT meter cfg hyp = do
     _ -> pure ()
   let !lo    = 0 :: Double
       !hi    = fromIntegral bound :: Double
-      !epCfg = EP.config lo hi (cfgAlpha cfg) Ons
+      !epCfg = EP.config lo hi (cfgAlpha cfg) Newton
       go !n !st
         | n >= cfgBudget cfg =
             pure $! Pass n (EP.log_wealth st)
