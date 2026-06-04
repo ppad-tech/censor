@@ -141,4 +141,6 @@ executable censor-demo-ffi
     build-depends:
         base
       , ppad-censor
-    extra-libraries: censor_rs_demo
+    extra-libraries:
+        censor_rs_demo
+        censor_rs_fastcrypto

@@ -1,28 +1,27 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 
--- censor-demo-ffi: exercise the FFI bridge against a small Rust
--- library exposing two 32-byte inequality witnesses -- one
--- constant-time and one deliberately leaky. Both consume the same
--- 64-byte workspace layout:
---
---   workspace = [a (32B) | b (32B)]
---
--- and the same fix-vs-random protocol is applied: class A places
--- two byte-identical 32-byte regions in the workspace; class B
--- places two independent random 32-byte regions. The CT primitive
--- walks all bytes either way; the naive primitive short-circuits
--- on the first mismatch and is detectably faster on class B.
+-- censor-demo-ffi: exercise the FFI bridge against two small Rust
+-- libraries. The first (rs-demo) exposes a controlled pair of
+-- 32-byte inequality witnesses -- one constant-time and one
+-- deliberately leaky -- as a positive/negative control pair. The
+-- second (rs-fastcrypto) bridges fastcrypto's secp256r1
+-- production sign path, whose underlying table-indexed scalar
+-- multiplication is suspected to leak the secret scalar via
+-- timing; censor is expected to reject it.
 
 module Main where
 
 import Control.Exception (try)
+import Control.Monad (when)
 import qualified Data.Bits as B
 import Data.IORef
 import Data.Word (Word8, Word64)
+import Foreign.C.Types (CSize(..))
+import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)
-import Foreign.Ptr (Ptr, plusPtr)
-import Foreign.Storable (pokeByteOff)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
+import Foreign.Storable (peek, poke, pokeByteOff)
 import System.IO (hFlush, hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
@@ -68,11 +67,36 @@ writeWord !dst !off !w !lim = go 0
 
 -- foreign imports ------------------------------------------------------------
 
+-- rs-demo
 foreign import ccall unsafe "censor_ct_neq32"
   c_ct_neq32    :: Ptr Word8 -> Ptr Word8 -> IO Word8
 
 foreign import ccall unsafe "censor_naive_neq32"
   c_naive_neq32 :: Ptr Word8 -> Ptr Word8 -> IO Word8
+
+-- rs-fastcrypto
+foreign import ccall unsafe "h_secp256r1_keypair_from_bytes"
+  h_kp_from_bytes :: Ptr Word8 -> IO (Ptr ())
+
+foreign import ccall unsafe "h_secp256r1_keypair_free"
+  h_kp_free       :: Ptr () -> IO ()
+
+foreign import ccall unsafe "h_secp256r1_sign"
+  h_sign          :: Ptr () -> Ptr Word8 -> CSize -> IO ()
+
+fixedSeed :: Word64
+fixedSeed = 0x5EED5EED5EED5EED
+
+-- build a fastcrypto Secp256r1KeyPair from a 32-byte secret drawn
+-- from the supplied RNG. errors on invalid scalar (vanishingly
+-- improbable).
+mkKeyPair :: Rng -> IO (Ptr ())
+mkKeyPair g = allocaBytes 32 $ \seedPtr -> do
+  fillRandom g seedPtr 32
+  kp <- h_kp_from_bytes seedPtr
+  when (kp == nullPtr) $
+    error "fastcrypto keypair_from_bytes returned null"
+  pure kp
 
 -- hypotheses -----------------------------------------------------------------
 
@@ -122,6 +146,40 @@ negNaiveNeq32 ga gb = F.FFIHypothesis
       pure ()
   }
 
+-- fastcrypto secp256r1 sign. workspace layout:
+--
+--   [keypair_ptr (8B) | msg (32B)]   = 40B total
+--
+-- class A pins a single keypair built once at hypothesis setup;
+-- class B builds a fresh keypair every pair (leaked -- accepted
+-- for a one-shot demo, ~3 MB peak at the default budget). The
+-- timed call runs only the dereference + sign; secret-key
+-- construction and message generation happen in the sampler,
+-- outside the timed region.
+--
+-- the underlying scalar mul uses fastcrypto's WindowedScalar-
+-- Multiplier (table-indexed on the secret scalar's bits) so per-
+-- call timing is expected to leak across the two classes; censor
+-- should reject this decisively under PMU.
+negFastcryptoSign
+  :: Rng -> Rng -> IO F.FFIHypothesis
+negFastcryptoSign ga gb = do
+  gFix  <- mkRng fixedSeed
+  fixKp <- mkKeyPair gFix
+  pure F.FFIHypothesis
+    { F.ffiWorkspaceBytes = 8 + 32
+    , F.ffiSampleA = \p -> do
+        poke (castPtr p) fixKp
+        fillRandom ga (p `plusPtr` 8) 32
+    , F.ffiSampleB = \p -> do
+        kp <- mkKeyPair gb
+        poke (castPtr p) kp
+        fillRandom gb (p `plusPtr` 8) 32
+    , F.ffiTarget = \p -> do
+        kp <- peek (castPtr p) :: IO (Ptr ())
+        h_sign kp (p `plusPtr` 8) 32
+    }
+
 -- driver ---------------------------------------------------------------------
 
 cfg :: C.Config
@@ -132,11 +190,22 @@ cfg = C.defaultConfig
   , C.cfgBatch  = 1000
   }
 
-runCase :: C.Meter -> String -> F.FFIHypothesis -> IO ()
-runCase meter name fh = do
+-- a config tuned for the slower fastcrypto sign target. 1000-batch
+-- inner loops keep total run-time bounded; sign is ~tens of µs so
+-- a single call is already far above any quantum.
+cfgSign :: C.Config
+cfgSign = C.defaultConfig
+  { C.cfgAlpha  = 1.0e-3
+  , C.cfgBudget = 10000
+  , C.cfgWarmup = 200
+  , C.cfgBatch  = 1
+  }
+
+runCase :: C.Meter -> C.Config -> String -> F.FFIHypothesis -> IO ()
+runCase meter c name fh = do
   putStrLn $ "-- " ++ name
   hFlush stdout
-  result <- F.withFFIHypothesis fh $ \h -> C.runCT meter cfg h
+  result <- F.withFFIHypothesis fh $ \h -> C.runCT meter c h
   case result of
     C.Reject n w -> putStrLn $
       "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
@@ -148,17 +217,23 @@ runAll :: C.Meter -> IO ()
 runAll meter = do
   ga <- mkRng 0xCAFEBABE
   gb <- mkRng 0xDEADBEEF
-  runCase meter "positive: rust censor_ct_neq32 (XOR fold, 32B)"
+  runCase meter cfg "positive: rust censor_ct_neq32 (XOR fold, 32B)"
     (posCTNeq32 ga gb)
-  runCase meter "negative: rust censor_naive_neq32 (short-circuit)"
+  runCase meter cfg "negative: rust censor_naive_neq32 (short-circuit)"
     (negNaiveNeq32 ga gb)
+  signHyp <- negFastcryptoSign ga gb
+  runCase meter cfgSign
+    "negative: fastcrypto::secp256r1 sign (WindowedScalarMultiplier)"
+    signHyp
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
   putStrLn "ppad-censor demo-ffi: dudect-style fix-vs-random \
-           \against rust constant-time and naive 32-byte inequality"
-  putStrLn $ "config: " ++ show cfg
+           \against rust 32-byte inequality witnesses and \
+           \fastcrypto secp256r1 sign"
+  putStrLn $ "cfg:     " ++ show cfg
+  putStrLn $ "cfgSign: " ++ show cfgSign
   -- Try the deterministic instructions_retired PMU meter; fall
   -- back to wall-clock on non-Linux or when perf_event_paranoid
   -- blocks unprivileged access.
