@@ -227,11 +227,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1780595689,
-        "narHash": "sha256-53WAZRHvD/JZkO2MfuK2kTYN7iGXhAXgCTGFytB1cmA=",
+        "lastModified": 1780597956,
+        "narHash": "sha256-dbpRx40o+q2jWiOzhwPYAv/e78akLPXfczAV8XZg6B4=",
         "ref": "master",
-        "rev": "18bc2ced8ae223a05147151379439ce6818bf625",
-        "revCount": 15,
+        "rev": "0a4b12ab29ad1259b97f3db16f47539af56449eb",
+        "revCount": 16,
         "type": "git",
         "url": "git://git.ppad.tech/eproc.git"
       },
@@ -258,11 +258,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1779456231,
-        "narHash": "sha256-lmQhxa6OL0XMRoWEzCUrgPWGFtF88DoCTZ76XMTzE7E=",
+        "lastModified": 1780597966,
+        "narHash": "sha256-TbbKDxBraF9WbkaKDXNpRRjeumr6GRMZl6LhSkdu5iE=",
         "ref": "master",
-        "rev": "49ee35d9e2342b21d4a3f3456251ad3e26c69503",
-        "revCount": 293,
+        "rev": "e396a7f0d97471e8a9c19ac83f3d3366c3300a4e",
+        "revCount": 294,
         "type": "git",
         "url": "git://git.ppad.tech/fixed.git"
       },
