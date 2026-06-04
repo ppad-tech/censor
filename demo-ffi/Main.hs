@@ -234,15 +234,24 @@ main = do
            \fastcrypto secp256r1 sign"
   putStrLn $ "cfg:     " ++ show cfg
   putStrLn $ "cfgSign: " ++ show cfgSign
-  -- Try the deterministic instructions_retired PMU meter; fall
-  -- back to wall-clock on non-Linux or when perf_event_paranoid
-  -- blocks unprivileged access.
-  ri <- try (C.withCounter C.InstructionsRetired $ \meter -> do
-               putStrLn "\nmeter: instructions_retired"
-               runAll meter) :: IO (Either C.MeterError ())
-  case ri of
-    Left err -> do
+  -- Try each PMU meter in turn. instructions_retired catches
+  -- control-flow leaks (different code paths retire different
+  -- counts) but is blind to data-dependent latency from cache
+  -- misses, so it can pass a target that nonetheless leaks via
+  -- table-indexed loads. cycles counts stall cycles too and is
+  -- the right meter for table-lookup-style leaks. Fall back to
+  -- wall-clock only if perf_event_open is unavailable (non-Linux,
+  -- or kernel.perf_event_paranoid > 2).
+  ri <- tryMeter C.InstructionsRetired "instructions_retired"
+  rc <- tryMeter C.Cycles              "cycles"
+  case (ri, rc) of
+    (Left err, Left _) -> do
       putStrLn $ "meter: wall-clock (PMU unavailable: "
               ++ show err ++ ")\n"
       runAll C.wallClock
-    Right () -> pure ()
+    _ -> pure ()
+  where
+    tryMeter counter label =
+      try (C.withCounter counter $ \meter -> do
+             putStrLn $ "\nmeter: " ++ label
+             runAll meter) :: IO (Either C.MeterError ())
