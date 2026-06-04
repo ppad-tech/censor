@@ -190,15 +190,20 @@ cfg = C.defaultConfig
   , C.cfgBatch  = 1000
   }
 
--- a config tuned for the slower fastcrypto sign target. 1000-batch
--- inner loops keep total run-time bounded; sign is ~tens of µs so
--- a single call is already far above any quantum.
+-- a config tuned for the slower fastcrypto sign target. The
+-- windowed-multiplier table-lookup leak is small in absolute
+-- cycle terms (a handful of L1/L2 misses per call out of ~90k
+-- total cycles, i.e. fractions of a percent), so we need both a
+-- big budget and a sizeable inner-loop batch to push the wealth
+-- process past the rejection threshold cleanly. batch=50
+-- amortizes per-measurement scheduler noise; budget=50000 gives
+-- the bettor plenty of pairs to bank.
 cfgSign :: C.Config
 cfgSign = C.defaultConfig
   { C.cfgAlpha  = 1.0e-3
-  , C.cfgBudget = 10000
+  , C.cfgBudget = 50000
   , C.cfgWarmup = 200
-  , C.cfgBatch  = 1
+  , C.cfgBatch  = 50
   }
 
 runCase :: C.Meter -> C.Config -> String -> F.FFIHypothesis -> IO ()
