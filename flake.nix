@@ -124,6 +124,28 @@
             (hlib.enableCabalFlag aead "llvm")
             [ llvm clang ];
 
+        # rust staticlib exercised by censor-demo-ffi. self-contained:
+        # no external crates, so no cargo lockfile vendoring required
+        # and 'cargo build --offline' is safe inside the nix sandbox.
+        rs-demo = pkgs.stdenv.mkDerivation {
+          pname   = "censor-rs-demo";
+          version = "0.1.0";
+          src     = ./rs-demo;
+          nativeBuildInputs = [ pkgs.cargo pkgs.rustc ];
+          buildPhase = ''
+            runHook preBuild
+            HOME=$TMPDIR cargo build --release --offline \
+              --target-dir target
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/lib
+            cp target/release/libcensor_rs_demo.a $out/lib/
+            runHook postInstall
+          '';
+        };
+
         hpkgs = pkgs.haskell.packages.ghc910.extend (new: old: {
           ppad-eproc = eproc;
           ppad-fixed = fixed-llvm;
@@ -132,22 +154,36 @@
           ppad-secp256k1 = secp-llvm;
           ppad-bip32 = bip32-llvm;
           ppad-aead = aead-llvm;
-          ${lib} = hlib.enableCabalFlag
-            (new.callCabal2nixWithOptions lib ./. "--flag=demo" {
-               ppad-eproc = new.ppad-eproc;
-               ppad-fixed = new.ppad-fixed;
-               ppad-sha256 = new.ppad-sha256;
-               ppad-sha512 = new.ppad-sha512;
-               ppad-secp256k1 = new.ppad-secp256k1;
-               ppad-bip32 = new.ppad-bip32;
-               ppad-aead = new.ppad-aead;
-             })
-            "demo";
+          ${lib} = hlib.overrideCabal (hlib.enableCabalFlag
+            (hlib.enableCabalFlag
+              (new.callCabal2nixWithOptions lib ./.
+                 "--flag=demo --flag=demo-ffi" {
+                 ppad-eproc = new.ppad-eproc;
+                 ppad-fixed = new.ppad-fixed;
+                 ppad-sha256 = new.ppad-sha256;
+                 ppad-sha512 = new.ppad-sha512;
+                 ppad-secp256k1 = new.ppad-secp256k1;
+                 ppad-bip32 = new.ppad-bip32;
+                 ppad-aead = new.ppad-aead;
+                 # supplied at link time via --extra-lib-dirs
+                 # below; cabal2nix would otherwise treat the
+                 # extra-libraries entry as a missing nix arg.
+                 censor_rs_demo = null;
+               })
+              "demo")
+            "demo-ffi")
+            (drv: {
+              configureFlags = (drv.configureFlags or []) ++ [
+                "--extra-lib-dirs=${rs-demo}/lib"
+              ];
+            });
         });
 
         cc    = pkgs.stdenv.cc;
         ghc   = hpkgs.ghc;
         cabal = hpkgs.cabal-install;
+        cargo = pkgs.cargo;
+        rustc = pkgs.rustc;
       in
         {
           packages.default = hpkgs.${lib};
@@ -163,6 +199,8 @@
               cabal
               cc
               llvm
+              cargo
+              rustc
             ];
 
             shellHook = ''
@@ -172,6 +210,7 @@
               echo "ghc:   $(${ghc}/bin/ghc --version)"
               echo "cabal: $(${cabal}/bin/cabal --version)"
               echo "llc:   $(${llvm}/bin/llc --version | head -2 | tail -1)"
+              echo "rustc: $(${rustc}/bin/rustc --version)"
             '';
           };
         }
