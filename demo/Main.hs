@@ -7,12 +7,20 @@
 -- inputs. A timing-leaky target should produce a measurable
 -- distributional difference between classes; a CT target should not.
 --
--- Two measurement-hygiene rules keep the comparison honest (see
--- Censor's "Measurement hygiene" notes): inputs are returned in normal
--- form, so no lazy conversion is paid inside the timed region, and the
--- fixed input is an ordinary heap value built by the same sampler as
--- the random class -- not a top-level CAF, whose distinct access path
--- a sensitive meter would otherwise flag as a spurious difference.
+-- Three measurement-hygiene rules keep the comparison honest (see
+-- Censor's "Measurement hygiene" notes):
+--
+--   * inputs are returned in normal form, so no lazy conversion is
+--     paid inside the timed region;
+--   * the fixed input is an ordinary heap value built by the same
+--     sampler as the random class -- not a top-level CAF, whose
+--     distinct access path a sensitive meter would otherwise flag as
+--     a spurious difference;
+--   * the samplers themselves are symmetric in allocation count, size,
+--     and order. Class A's sampler draws and discards the same random
+--     values that class B's keeps in lieu of the fixed input, so the
+--     nursery occupancy and GC scheduling induced by sampling does not
+--     drift between classes.
 --
 -- On Linux the demo runs each case under the deterministic
 -- instructions-retired PMU meter and again under the cycles meter
@@ -110,6 +118,7 @@ posScalarMul ga gb = do
         !_ <- evaluate (MS.mul x y)
         pure ()
     , C.sampleA = do
+        !_ <- randomMont ga       -- balance: x slot
         !y <- randomMont ga
         pure (fixX, y)
     , C.sampleB = do
@@ -121,21 +130,23 @@ posScalarMul ga gb = do
 -- positive control: Montgomery modular inversion (addition chain).
 -- 256 squarings + a fixed number of multiplications; should be CT.
 posScalarInv :: Rng -> Rng -> IO (C.Hypothesis MS.Montgomery)
-posScalarInv _ga gb = do
+posScalarInv ga gb = do
   gFix  <- mkRng fixedSeed
   !fixX <- randomMont gFix
   pure C.Hypothesis
     { C.target  = \(!x) -> do
         !_ <- evaluate (MS.inv x)
         pure ()
-    , C.sampleA = pure fixX
+    , C.sampleA = do
+        !_ <- randomMont ga       -- balance: x slot
+        pure fixX
     , C.sampleB = randomMont gb
     }
 
 -- positive control: Montgomery exponentiation (constant-iteration
 -- ladder driven by select#). Should be CT in the exponent.
 posScalarExp :: Rng -> Rng -> IO (C.Hypothesis (MS.Montgomery, Wider))
-posScalarExp _ga gb = do
+posScalarExp ga gb = do
   gFix  <- mkRng fixedSeed
   !fixE <- randomWider gFix
   pure C.Hypothesis
@@ -143,7 +154,8 @@ posScalarExp _ga gb = do
         !_ <- evaluate (MS.exp b e)
         pure ()
     , C.sampleA = do
-        !b <- randomMont gb
+        !b <- randomMont ga
+        !_ <- randomWider ga      -- balance: e slot
         pure (b, fixE)
     , C.sampleB = do
         !b <- randomMont gb
@@ -156,14 +168,16 @@ posScalarExp _ga gb = do
 -- @mul_wnaf tex s@ should not depend on the scalar @s@.
 posMulWNAF
   :: Secp.Context -> Rng -> Rng -> IO (C.Hypothesis Wider)
-posMulWNAF tex _ga gb = do
+posMulWNAF tex ga gb = do
   gFix  <- mkRng fixedSeed
   !fixS <- randomWider gFix
   pure C.Hypothesis
     { C.target  = \(!s) -> do
         !_ <- evaluate (Secp.mul_wnaf tex s)
         pure ()
-    , C.sampleA = pure fixS
+    , C.sampleA = do
+        !_ <- randomWider ga      -- balance: s slot
+        pure fixS
     , C.sampleB = randomWider gb
     }
 
@@ -175,7 +189,7 @@ posSignSchnorr
   :: Secp.Context
   -> Rng -> Rng
   -> IO (C.Hypothesis (Wider, BS.ByteString, BS.ByteString))
-posSignSchnorr tex _ga gb = do
+posSignSchnorr tex ga gb = do
   gFix    <- mkRng fixedSeed
   !fixSec <- randomWider gFix
   pure C.Hypothesis
@@ -183,8 +197,9 @@ posSignSchnorr tex _ga gb = do
         !_ <- evaluate (Secp.sign_schnorr' tex sec msg aux)
         pure ()
     , C.sampleA = do
-        !msg <- random32 gb
-        !aux <- random32 gb
+        !_   <- randomWider ga    -- balance: sec slot
+        !msg <- random32 ga
+        !aux <- random32 ga
         pure (fixSec, msg, aux)
     , C.sampleB = do
         !sec <- randomWider gb
@@ -200,7 +215,7 @@ posSignECDSA
   :: Secp.Context
   -> Rng -> Rng
   -> IO (C.Hypothesis (Wider, BS.ByteString))
-posSignECDSA tex _ga gb = do
+posSignECDSA tex ga gb = do
   gFix    <- mkRng fixedSeed
   !fixSec <- randomWider gFix
   pure C.Hypothesis
@@ -208,7 +223,8 @@ posSignECDSA tex _ga gb = do
         !_ <- evaluate (Secp.sign_ecdsa' tex sec msg)
         pure ()
     , C.sampleA = do
-        !msg <- random32 gb
+        !_   <- randomWider ga    -- balance: sec slot
+        !msg <- random32 ga
         pure (fixSec, msg)
     , C.sampleB = do
         !sec <- randomWider gb
@@ -224,7 +240,7 @@ posAEADEncrypt
   :: Rng -> Rng
   -> IO (C.Hypothesis
            (BS.ByteString, BS.ByteString, BS.ByteString, BS.ByteString))
-posAEADEncrypt _ga gb = do
+posAEADEncrypt ga gb = do
   gFix    <- mkRng fixedSeed
   !fixKey <- random32 gFix
   pure C.Hypothesis
@@ -234,9 +250,10 @@ posAEADEncrypt _ga gb = do
           Right (!_, !_) -> pure ()
           Left _         -> pure ()
     , C.sampleA = do
-        !nonce <- random12 gb
-        !aad   <- random32 gb
-        !pt    <- randomBytes gb 256
+        !_     <- random32 ga         -- balance: key slot
+        !nonce <- random12 ga
+        !aad   <- random32 ga
+        !pt    <- randomBytes ga 256
         pure (fixKey, nonce, aad, pt)
     , C.sampleB = do
         !key   <- random32 gb
@@ -256,13 +273,13 @@ posAEADDecrypt
   -> IO (C.Hypothesis
            ( BS.ByteString, BS.ByteString, BS.ByteString
            , BS.ByteString, BS.ByteString ))
-posAEADDecrypt _ga gb = do
+posAEADDecrypt ga gb = do
   gFix    <- mkRng fixedSeed
   !fixKey <- random32 gFix
-  let mkSample !key = do
-        !nonce <- random12 gb
-        !aad   <- random32 gb
-        !pt    <- randomBytes gb 256
+  let mkSample !rng !key = do
+        !nonce <- random12 rng
+        !aad   <- random32 rng
+        !pt    <- randomBytes rng 256
         case AEAD.encrypt aad key nonce pt of
           Left _ -> error
             "censor-demo: AEAD encrypt failed during sample setup"
@@ -276,10 +293,12 @@ posAEADDecrypt _ga gb = do
         case r of
           Right !_ -> pure ()
           Left _   -> pure ()
-    , C.sampleA = mkSample fixKey
+    , C.sampleA = do
+        !_ <- random32 ga             -- balance: key slot
+        mkSample ga fixKey
     , C.sampleB = do
         !key <- random32 gb
-        mkSample key
+        mkSample gb key
     }
 
 -- negative control: a deliberately leaky target whose work scales
