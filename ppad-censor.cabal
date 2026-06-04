@@ -25,7 +25,8 @@ flag llvm
 
 flag demo
   description: Build the censor-demo executable (depends on ppad-fixed,
-               ppad-secp256k1, and ppad-aead).
+               ppad-secp256k1, ppad-aead, ppad-sha256, ppad-sha512,
+               and ppad-bip32).
   default:     False
   manual:      True
 
@@ -113,6 +114,9 @@ executable censor-demo
         base
       , bytestring
       , ppad-aead
+      , ppad-bip32
       , ppad-censor
       , ppad-fixed
       , ppad-secp256k1
+      , ppad-sha256
+      , ppad-sha512

@@ -1,11 +1,12 @@
 {-# LANGUAGE BangPatterns #-}
 
 -- censor-demo: exercise the sequential CT tester against a few
--- targets drawn from ppad-fixed, ppad-secp256k1, and ppad-aead. We
--- adopt the dudect-style "fix vs random" protocol: class A always
--- supplies one fixed input, class B supplies fresh pseudorandom
--- inputs. A timing-leaky target should produce a measurable
--- distributional difference between classes; a CT target should not.
+-- targets drawn from ppad-fixed, ppad-secp256k1, ppad-aead,
+-- ppad-sha256, ppad-sha512, and ppad-bip32. We adopt the
+-- dudect-style "fix vs random" protocol: class A always supplies
+-- one fixed input, class B supplies fresh pseudorandom inputs. A
+-- timing-leaky target should produce a measurable distributional
+-- difference between classes; a CT target should not.
 --
 -- Three measurement-hygiene rules keep the comparison honest (see
 -- Censor's "Measurement hygiene" notes):
@@ -23,10 +24,8 @@
 --     drift between classes.
 --
 -- On Linux the demo runs each case under the deterministic
--- instructions-retired PMU meter and again under the cycles meter
--- (which is additionally sensitive to data-dependent latency and
--- microarchitectural state), falling back to wall-clock if perf is
--- unavailable.
+-- instructions-retired PMU meter, falling back to wall-clock if
+-- perf is unavailable.
 
 module Main where
 
@@ -35,12 +34,15 @@ import Control.Monad (replicateM, replicateM_)
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
 import Data.IORef
-import Data.Word (Word8, Word64)
+import Data.Word (Word8, Word32, Word64)
 import System.IO (hFlush, hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
 import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
 import qualified Crypto.Curve.Secp256k1 as Secp
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Crypto.Hash.SHA512 as SHA512
+import qualified Crypto.HDKey.BIP32 as BIP32
 import qualified Data.Word.Wider as W
 import qualified Numeric.Montgomery.Secp256k1.Scalar as MS
 import Data.Word.Wider (Wider)
@@ -301,6 +303,122 @@ posAEADDecrypt ga gb = do
         mkSample gb key
     }
 
+-- positive control: HMAC-SHA256 with a secret key. The inner+outer
+-- block transformations are key-independent in control flow; the
+-- only length-dependent work is in the message, which we hold
+-- constant across pairs.
+posHMACSHA256
+  :: Rng -> Rng -> IO (C.Hypothesis (BS.ByteString, BS.ByteString))
+posHMACSHA256 ga gb = do
+  gFix    <- mkRng fixedSeed
+  !fixKey <- random32 gFix
+  pure C.Hypothesis
+    { C.target = \(!key, !msg) -> do
+        !_ <- evaluate (SHA256.hmac key msg)
+        pure ()
+    , C.sampleA = do
+        !_   <- random32 ga             -- balance: key slot
+        !msg <- randomBytes ga 256
+        pure (fixKey, msg)
+    , C.sampleB = do
+        !key <- random32 gb
+        !msg <- randomBytes gb 256
+        pure (key, msg)
+    }
+
+-- positive control: HMAC-SHA512 with a secret key. Same structure
+-- as HMAC-SHA256.
+posHMACSHA512
+  :: Rng -> Rng -> IO (C.Hypothesis (BS.ByteString, BS.ByteString))
+posHMACSHA512 ga gb = do
+  gFix    <- mkRng fixedSeed
+  !fixKey <- random32 gFix
+  pure C.Hypothesis
+    { C.target = \(!key, !msg) -> do
+        !_ <- evaluate (SHA512.hmac key msg)
+        pure ()
+    , C.sampleA = do
+        !_   <- random32 ga             -- balance: key slot
+        !msg <- randomBytes ga 256
+        pure (fixKey, msg)
+    , C.sampleB = do
+        !key <- random32 gb
+        !msg <- randomBytes gb 256
+        pure (key, msg)
+    }
+
+-- positive control: constant-time MAC equality. The == on 'MAC'
+-- walks all 32 bytes regardless of where (or whether) a mismatch
+-- occurs. Class A compares two byte-identical tags (full walk,
+-- returns True); class B compares two independently-derived tags
+-- (full walk, returns False with overwhelming probability). A
+-- non-CT implementation would early-exit on B and be measurably
+-- faster.
+posMACEq
+  :: Rng -> Rng -> IO (C.Hypothesis (SHA256.MAC, SHA256.MAC))
+posMACEq ga gb =
+  pure C.Hypothesis
+    { C.target = \(!a, !b) -> do
+        !_ <- evaluate (a == b)
+        pure ()
+    , C.sampleA = do
+        -- A: build two random tags, discard the first to balance
+        -- B's allocation, return the second as both sides of the
+        -- pair so '==' walks all bytes and returns True.
+        !k1  <- random32 ga
+        !m1  <- randomBytes ga 256
+        !_   <- evaluate $! SHA256.hmac k1 m1
+        !k2  <- random32 ga
+        !m2  <- randomBytes ga 256
+        !tag <- evaluate $! SHA256.hmac k2 m2
+        pure (tag, tag)
+    , C.sampleB = do
+        -- B: build two independent tags; identical only with
+        -- negligible probability, so '==' walks all bytes and
+        -- returns False.
+        !k1   <- random32 gb
+        !m1   <- randomBytes gb 256
+        !tag1 <- evaluate $! SHA256.hmac k1 m1
+        !k2   <- random32 gb
+        !m2   <- randomBytes gb 256
+        !tag2 <- evaluate $! SHA256.hmac k2 m2
+        pure (tag1, tag2)
+    }
+
+-- positive control: BIP32 child key derivation. The secret is the
+-- parent xpriv. Derivation runs HMAC-SHA512 keyed on the chain
+-- code with the parent key + child index as data, then a scalar
+-- add on the secp256k1 group order. CT in the parent secret.
+posBIP32Derive
+  :: Rng -> Rng -> IO (C.Hypothesis (BIP32.HDKey, Word32))
+posBIP32Derive ga gb = do
+  gFix     <- mkRng fixedSeed
+  !fixSeed <- randomBytes gFix 64
+  !fixHD   <- case BIP32.master fixSeed of
+    Just h  -> evaluate h
+    Nothing -> error
+      "censor-demo: BIP32 master failed on fixed seed"
+  pure C.Hypothesis
+    { C.target = \(!hd, !i) -> do
+        !_ <- evaluate (BIP32.derive_child_priv hd i)
+        pure ()
+    , C.sampleA = do
+        !seed <- randomBytes ga 64
+        !_    <- evaluate (BIP32.master seed)  -- balance B's master
+        !w    <- nextWord ga
+        let !i = fromIntegral w :: Word32
+        pure (fixHD, i)
+    , C.sampleB = do
+        !seed <- randomBytes gb 64
+        !hd   <- case BIP32.master seed of
+          Just h  -> evaluate h
+          Nothing -> error
+            "censor-demo: BIP32 master failed on random seed"
+        !w    <- nextWord gb
+        let !i = fromIntegral w :: Word32
+        pure (hd, i)
+    }
+
 -- negative control: a deliberately leaky target whose work scales
 -- with the popcount of the value. A CT tester worth its salt must
 -- reject this.
@@ -387,6 +505,10 @@ runAll tex meter = do
   rh "positive: Secp.sign_ecdsa' (RFC6979)"                (posSignECDSA tex ga gb)
   rc "positive: AEAD.encrypt (ChaCha20-Poly1305, 256 B)"   (posAEADEncrypt ga gb)
   rc "positive: AEAD.decrypt (ChaCha20-Poly1305, 256 B)"   (posAEADDecrypt ga gb)
+  rh "positive: SHA256.hmac (256 B msg, secret key)"       (posHMACSHA256 ga gb)
+  rh "positive: SHA512.hmac (256 B msg, secret key)"       (posHMACSHA512 ga gb)
+  rc "positive: MAC == (constant-time tag comparison)"     (posMACEq ga gb)
+  rh "positive: BIP32 derive_child_priv (secret parent)"   (posBIP32Derive ga gb)
   rc "negative: deliberately leaky popcount-driven loop"   (negLeakyPopcount ga gb)
   rc "negative: Wider.from_vartime (Integer conversion)"   (negFromVartime ga gb)
 
@@ -394,25 +516,20 @@ main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
   putStrLn "ppad-censor demo: dudect-style fix-vs-random against \
-           \ppad-fixed, ppad-secp256k1, and ppad-aead"
+           \ppad-fixed, ppad-secp256k1, ppad-aead, ppad-sha256, \
+           \ppad-sha512, and ppad-bip32"
   putStrLn $ "config: " ++ show cfg
-  -- one-shot secp256k1 precomputation, shared across all secp targets
-  -- and across every meter.
+  -- one-shot secp256k1 precomputation, shared across all secp targets.
   let !tex = Secp.precompute
-  -- Try each PMU meter in turn: instructions_retired (deterministic
-  -- code-path tally) and then cycles (catches data-dependent latency
-  -- too). Fall back to wall-clock only if perf_event_open is
-  -- unavailable (non-Linux, or kernel.perf_event_paranoid > 2).
-  ri <- tryMeter tex C.InstructionsRetired "instructions_retired"
-  rc <- tryMeter tex C.Cycles              "cycles"
-  case (ri, rc) of
-    (Left err, Left _) -> do
+  -- Try the deterministic instructions_retired PMU meter. Fall back
+  -- to wall-clock if perf_event_open is unavailable (non-Linux, or
+  -- kernel.perf_event_paranoid > 2).
+  ri <- try (C.withCounter C.InstructionsRetired $ \meter -> do
+               putStrLn "\nmeter: instructions_retired"
+               runAll tex meter) :: IO (Either C.MeterError ())
+  case ri of
+    Left err -> do
       putStrLn $ "meter: wall-clock (PMU unavailable: "
               ++ show err ++ ")\n"
       runAll tex C.wallClock
-    _ -> pure ()
-  where
-    tryMeter tex counter label =
-      try (C.withCounter counter $ \meter -> do
-             putStrLn $ "\nmeter: " ++ label
-             runAll tex meter) :: IO (Either C.MeterError ())
+    Right () -> pure ()
