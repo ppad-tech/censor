@@ -23,7 +23,7 @@ A minimal constant-time test:
 import qualified Censor as C
 
 let hyp = C.Hypothesis
-      { C.target  = \x -> ...              -- IO action under test
+      { C.target  = \x -> ...               -- IO action under test
       , C.sampleA = ...                     -- IO producing class-A input
       , C.sampleB = ...                     -- IO producing class-B input
       }
@@ -169,26 +169,6 @@ proportional to the inner-loop count:
 ```
 
 You should compile with the `llvm` flag for maximum performance.
-
-## Security
-
-This library aims at the maximum security achievable in a
-garbage-collected language under an optimizing compiler such as GHC,
-in which strict constant-timeness can be [challenging to achieve][const].
-
-Censor is itself a constant-time-testing *framework*, not a CT
-primitive; the burden of writing well-formed hypotheses (input
-samplers symmetric in allocation, inputs returned in normal form,
-fixed class built the same way as random) falls on the caller.
-The "Measurement hygiene" section above sketches the standard pitfalls.
-
-The companion tool [substratum][subst] performs static
-constant-time auditing of GHC, LLVM, and rustc assembly output
-across AArch64, x86-64, and RV64; running both in concert is the
-recommended workflow for any sensitive primitive.
-
-If you discover any vulnerabilities, please disclose them via
-security@ppad.tech.
 
 ## Development
 
