@@ -143,4 +143,3 @@ executable censor-demo-ffi
       , ppad-censor
     extra-libraries:
         censor_rs_demo
-        censor_rs_fastcrypto

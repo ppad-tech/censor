@@ -124,38 +124,22 @@
             (hlib.enableCabalFlag aead "llvm")
             [ llvm clang ];
 
-        # rust staticlib exercised by censor-demo-ffi. self-contained:
-        # no external crates, so no cargo lockfile vendoring required
-        # and 'cargo build --offline' is safe inside the nix sandbox.
+        # rust staticlib exercised by censor-demo-ffi. bundles all
+        # FFI targets (the 32-byte inequality witnesses and the
+        # fastcrypto::secp256r1 sign bridge) in one crate so the
+        # Haskell linker sees only one copy of the Rust std runtime
+        # symbols -- ld.gold rejects the duplicates that ld on
+        # macOS silently accepts when two staticlibs are linked.
+        #
+        # outputHashes pin the git-sourced crates (fastcrypto and
+        # fastcrypto-derive, both from MystenLabs/fastcrypto at the
+        # same rev so they share the same hash).
         rs-demo = pkgs.stdenv.mkDerivation {
           pname   = "censor-rs-demo";
           version = "0.1.0";
           src     = ./rs-demo;
-          nativeBuildInputs = [ pkgs.cargo pkgs.rustc ];
-          buildPhase = ''
-            runHook preBuild
-            HOME=$TMPDIR cargo build --release --offline \
-              --target-dir target
-            runHook postBuild
-          '';
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out/lib
-            cp target/release/libcensor_rs_demo.a $out/lib/
-            runHook postInstall
-          '';
-        };
-
-        # rust staticlib bridging fastcrypto's leaky secp256r1 sign
-        # path. pulls in the MystenLabs fastcrypto crate (and its
-        # arkworks-backed transitive deps) via a vendored cargo
-        # lockfile; the outputHashes pin the git-sourced crates.
-        rs-fastcrypto = pkgs.stdenv.mkDerivation {
-          pname   = "censor-rs-fastcrypto";
-          version = "0.1.0";
-          src     = ./rs-fastcrypto;
           cargoDeps = pkgs.rustPlatform.importCargoLock {
-            lockFile = ./rs-fastcrypto/Cargo.lock;
+            lockFile = ./rs-demo/Cargo.lock;
             outputHashes = {
               "fastcrypto-0.1.9" =
                 "sha256-pku0vKWI5sIPcs0ef9fBfLHvZkI5DUhmmVLxkGRy9SQ=";
@@ -177,7 +161,7 @@
           installPhase = ''
             runHook preInstall
             mkdir -p $out/lib
-            cp target/release/libcensor_rs_fastcrypto.a $out/lib/
+            cp target/release/libcensor_rs_demo.a $out/lib/
             runHook postInstall
           '';
         };
@@ -203,16 +187,14 @@
                  ppad-aead = new.ppad-aead;
                  # supplied at link time via --extra-lib-dirs
                  # below; cabal2nix would otherwise treat the
-                 # extra-libraries entries as missing nix args.
+                 # extra-libraries entry as a missing nix arg.
                  censor_rs_demo = null;
-                 censor_rs_fastcrypto = null;
                })
               "demo")
             "demo-ffi")
             (drv: {
               configureFlags = (drv.configureFlags or []) ++ [
                 "--extra-lib-dirs=${rs-demo}/lib"
-                "--extra-lib-dirs=${rs-fastcrypto}/lib"
               ];
             });
         });

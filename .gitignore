@@ -5,6 +5,5 @@ result-doc
 sandbox
 .ghc.environment.*
 
-# rust target dirs for the rs-demo / rs-fastcrypto crates
+# rust target dir
 rs-demo/target
-rs-fastcrypto/target

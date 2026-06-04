@@ -304,7 +304,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "censor-rs-fastcrypto"
+name = "censor-rs-demo"
 version = "0.1.0"
 dependencies = [
  "fastcrypto",
