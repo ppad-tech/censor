@@ -19,12 +19,18 @@
       ref  = "master";
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
     };
+    ppad-secp256k1 = {
+      type = "git";
+      url  = "git://git.ppad.tech/secp256k1.git";
+      ref  = "master";
+      inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
+    };
     flake-utils.follows = "ppad-nixpkgs/flake-utils";
     nixpkgs.follows = "ppad-nixpkgs/nixpkgs";
   };
 
   outputs = { self, nixpkgs, flake-utils, ppad-nixpkgs
-            , ppad-eproc, ppad-fixed }:
+            , ppad-eproc, ppad-fixed, ppad-secp256k1 }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         lib = "ppad-censor";
@@ -42,13 +48,21 @@
             (hlib.enableCabalFlag fixed "llvm")
             [ llvm clang ];
 
+        secp = ppad-secp256k1.packages.${system}.default;
+        secp-llvm =
+          hlib.addBuildTools
+            (hlib.enableCabalFlag secp "llvm")
+            [ llvm clang ];
+
         hpkgs = pkgs.haskell.packages.ghc910.extend (new: old: {
           ppad-eproc = eproc;
           ppad-fixed = fixed-llvm;
+          ppad-secp256k1 = secp-llvm;
           ${lib} = hlib.enableCabalFlag
             (new.callCabal2nixWithOptions lib ./. "--flag=demo" {
                ppad-eproc = new.ppad-eproc;
                ppad-fixed = new.ppad-fixed;
+               ppad-secp256k1 = new.ppad-secp256k1;
              })
             "demo";
         });

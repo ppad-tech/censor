@@ -23,7 +23,8 @@ flag llvm
   manual:      True
 
 flag demo
-  description: Build the censor-demo executable (depends on ppad-fixed).
+  description: Build the censor-demo executable (depends on ppad-fixed
+               and ppad-secp256k1).
   default:     False
   manual:      True
 
@@ -109,5 +110,7 @@ executable censor-demo
   else
     build-depends:
         base
+      , bytestring
       , ppad-censor
       , ppad-fixed
+      , ppad-secp256k1

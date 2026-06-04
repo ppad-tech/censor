@@ -1,11 +1,11 @@
 {-# LANGUAGE BangPatterns #-}
 
 -- censor-demo: exercise the sequential CT tester against a few
--- targets drawn from ppad-fixed. We adopt the dudect-style
--- "fix vs random" protocol: class A always supplies one fixed input,
--- class B supplies fresh pseudorandom inputs. A timing-leaky target
--- should produce a measurable distributional difference between
--- classes; a CT target should not.
+-- targets drawn from ppad-fixed and ppad-secp256k1. We adopt the
+-- dudect-style "fix vs random" protocol: class A always supplies one
+-- fixed input, class B supplies fresh pseudorandom inputs. A
+-- timing-leaky target should produce a measurable distributional
+-- difference between classes; a CT target should not.
 --
 -- Two measurement-hygiene rules keep the comparison honest (see
 -- Censor's "Measurement hygiene" notes): inputs are returned in normal
@@ -23,13 +23,15 @@
 module Main where
 
 import Control.Exception (evaluate, try)
-import Control.Monad (replicateM_)
+import Control.Monad (replicateM, replicateM_)
 import qualified Data.Bits as B
+import qualified Data.ByteString as BS
 import Data.IORef
-import Data.Word (Word64)
+import Data.Word (Word8, Word64)
 import System.IO (hFlush, hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
+import qualified Crypto.Curve.Secp256k1 as Secp
 import qualified Data.Word.Wider as W
 import qualified Numeric.Montgomery.Secp256k1.Scalar as MS
 import Data.Word.Wider (Wider)
@@ -65,6 +67,19 @@ randomMont :: Rng -> IO MS.Montgomery
 randomMont g = do
   !w <- randomWider g
   evaluate (MS.to w)
+
+-- a random 32-byte ByteString in NF. used to build messages and aux
+-- random data for the signing hypotheses. constructed at sample time,
+-- outside the timed region; replicateM is justified here -- it builds
+-- a fixed four-element list of pre-forced Word64s, immediately
+-- flattened into a strict ByteString that 'evaluate' fully forces.
+random32 :: Rng -> IO BS.ByteString
+random32 g = do
+  ws <- replicateM 4 (nextWord g)
+  evaluate $! BS.pack
+    [ fromIntegral (w `B.shiftR` (8 * i)) :: Word8
+    | w <- ws, i <- [0 .. 7 :: Int]
+    ]
 
 -- seed for the fixed class. drawing the fixed input from a dedicated
 -- generator (rather than naming a top-level constant) yields a
@@ -127,6 +142,71 @@ posScalarExp _ga gb = do
         pure (b, e)
     }
 
+-- positive control: wNAF scalar multiplication of the secp256k1
+-- generator. The CT property of interest is that the timing of
+-- @mul_wnaf tex s@ should not depend on the scalar @s@.
+posMulWNAF
+  :: Secp.Context -> Rng -> Rng -> IO (C.Hypothesis Wider)
+posMulWNAF tex _ga gb = do
+  gFix  <- mkRng fixedSeed
+  !fixS <- randomWider gFix
+  pure C.Hypothesis
+    { C.target  = \(!s) -> do
+        !_ <- evaluate (Secp.mul_wnaf tex s)
+        pure ()
+    , C.sampleA = pure fixS
+    , C.sampleB = randomWider gb
+    }
+
+-- positive control: BIP0340 Schnorr signing under a precomputed
+-- context. The secret-key path runs through wNAF mul; messages and
+-- aux randomness are public, so a leak (if any) shows up as
+-- fix-vs-random on the secret.
+posSignSchnorr
+  :: Secp.Context
+  -> Rng -> Rng
+  -> IO (C.Hypothesis (Wider, BS.ByteString, BS.ByteString))
+posSignSchnorr tex _ga gb = do
+  gFix    <- mkRng fixedSeed
+  !fixSec <- randomWider gFix
+  pure C.Hypothesis
+    { C.target = \(!sec, !msg, !aux) -> do
+        !_ <- evaluate (Secp.sign_schnorr' tex sec msg aux)
+        pure ()
+    , C.sampleA = do
+        !msg <- random32 gb
+        !aux <- random32 gb
+        pure (fixSec, msg, aux)
+    , C.sampleB = do
+        !sec <- randomWider gb
+        !msg <- random32 gb
+        !aux <- random32 gb
+        pure (sec, msg, aux)
+    }
+
+-- positive control: RFC6979 ECDSA signing under a precomputed
+-- context. RFC6979 derives the nonce deterministically from the
+-- secret + message, then signs via wNAF mul.
+posSignECDSA
+  :: Secp.Context
+  -> Rng -> Rng
+  -> IO (C.Hypothesis (Wider, BS.ByteString))
+posSignECDSA tex _ga gb = do
+  gFix    <- mkRng fixedSeed
+  !fixSec <- randomWider gFix
+  pure C.Hypothesis
+    { C.target = \(!sec, !msg) -> do
+        !_ <- evaluate (Secp.sign_ecdsa' tex sec msg)
+        pure ()
+    , C.sampleA = do
+        !msg <- random32 gb
+        pure (fixSec, msg)
+    , C.sampleB = do
+        !sec <- randomWider gb
+        !msg <- random32 gb
+        pure (sec, msg)
+    }
+
 -- negative control: a deliberately leaky target whose work scales
 -- with the popcount of the value. A CT tester worth its salt must
 -- reject this.
@@ -177,6 +257,13 @@ cfg = C.defaultConfig
 cfgBigBatch :: C.Config
 cfgBigBatch = cfg { C.cfgBatch = 2000 }
 
+-- Secp targets are far slower per call than the Montgomery scalar
+-- arithmetic (microseconds rather than nanoseconds), so a per-call
+-- batch of 1 is already well above any wall-clock quantum and keeps
+-- total run-time modest.
+cfgHeavy :: C.Config
+cfgHeavy = cfg { C.cfgBatch = 1 }
+
 runCaseWith :: C.Meter -> C.Config -> String -> IO (C.Hypothesis a) -> IO ()
 runCaseWith meter c name mkH = do
   putStrLn $ "-- " ++ name
@@ -191,37 +278,45 @@ runCaseWith meter c name mkH = do
   hFlush stdout
 
 -- run every case under the given meter.
-runAll :: C.Meter -> IO ()
-runAll meter = do
+runAll :: Secp.Context -> C.Meter -> IO ()
+runAll tex meter = do
   ga <- mkRng 0xCAFEBABE
   gb <- mkRng 0xDEADBEEF
   let rc = runCaseWith meter cfg
+      rh = runCaseWith meter cfgHeavy
   runCaseWith meter cfgBigBatch
      "positive: Scalar.mul (single multiply, batch=2000)"  (posScalarMul ga gb)
   rc "positive: Scalar.inv (addition chain)"               (posScalarInv ga gb)
   rc "positive: Scalar.exp (constant-iteration ladder)"    (posScalarExp ga gb)
+  rh "positive: Secp.mul_wnaf (wNAF point multiplication)" (posMulWNAF tex ga gb)
+  rh "positive: Secp.sign_schnorr' (BIP0340)"              (posSignSchnorr tex ga gb)
+  rh "positive: Secp.sign_ecdsa' (RFC6979)"                (posSignECDSA tex ga gb)
   rc "negative: deliberately leaky popcount-driven loop"   (negLeakyPopcount ga gb)
   rc "negative: Wider.from_vartime (Integer conversion)"   (negFromVartime ga gb)
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  putStrLn "ppad-censor demo: dudect-style fix-vs-random against ppad-fixed"
+  putStrLn "ppad-censor demo: dudect-style fix-vs-random \
+           \against ppad-fixed and ppad-secp256k1"
   putStrLn $ "config: " ++ show cfg
+  -- one-shot secp256k1 precomputation, shared across all secp targets
+  -- and across every meter.
+  let !tex = Secp.precompute
   -- Try each PMU meter in turn: instructions_retired (deterministic
   -- code-path tally) and then cycles (catches data-dependent latency
   -- too). Fall back to wall-clock only if perf_event_open is
   -- unavailable (non-Linux, or kernel.perf_event_paranoid > 2).
-  ri <- tryMeter C.InstructionsRetired "instructions_retired"
-  rc <- tryMeter C.Cycles              "cycles"
+  ri <- tryMeter tex C.InstructionsRetired "instructions_retired"
+  rc <- tryMeter tex C.Cycles              "cycles"
   case (ri, rc) of
     (Left err, Left _) -> do
       putStrLn $ "meter: wall-clock (PMU unavailable: "
               ++ show err ++ ")\n"
-      runAll C.wallClock
+      runAll tex C.wallClock
     _ -> pure ()
   where
-    tryMeter counter label =
+    tryMeter tex counter label =
       try (C.withCounter counter $ \meter -> do
              putStrLn $ "\nmeter: " ++ label
-             runAll meter) :: IO (Either C.MeterError ())
+             runAll tex meter) :: IO (Either C.MeterError ())
