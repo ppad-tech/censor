@@ -1,14 +1,23 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 
--- censor-demo-ffi: exercise the FFI bridge against two small Rust
--- libraries. The first (rs-demo) exposes a controlled pair of
--- 32-byte inequality witnesses -- one constant-time and one
--- deliberately leaky -- as a positive/negative control pair. The
--- second (rs-fastcrypto) bridges fastcrypto's secp256r1
--- production sign path, whose underlying table-indexed scalar
--- multiplication is suspected to leak the secret scalar via
--- timing; censor is expected to reject it.
+-- censor-demo-ffi: exercise the FFI bridge against the bundled
+-- Rust staticlib (rs-demo). Three groups of targets:
+--
+--   * a controlled pair of 32-byte inequality witnesses, one
+--     constant-time and one deliberately leaky, as a
+--     positive/negative control;
+--   * fastcrypto's secp256r1 production sign path, whose
+--     underlying table-indexed scalar multiplication leaks the
+--     secret scalar via timing -- censor is expected to reject
+--     it under PMU on x86-64;
+--   * a Bernstein-Yang Fr inverter vendored from halo2curves
+--     with the `core::hint::black_box(mask)` guard stripped
+--     from `cond_add`/`cond_neg`. On aarch64 the compiled code
+--     is genuinely branch-free in the secret; on x86-64 LLVM
+--     inserts a secret-dependent conditional jump and censor
+--     should reject under PMU. See
+--     ppad.tech/articles/introducing-substratum.md.
 
 module Main where
 
@@ -18,7 +27,7 @@ import qualified Data.Bits as B
 import Data.IORef
 import Data.Word (Word8, Word64)
 import Foreign.C.Types (CSize(..))
-import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Marshal.Alloc (allocaBytes, mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (peek, poke, pokeByteOff)
@@ -83,6 +92,10 @@ foreign import ccall unsafe "h_secp256r1_keypair_free"
 
 foreign import ccall unsafe "h_secp256r1_sign"
   h_sign          :: Ptr () -> Ptr Word8 -> CSize -> IO ()
+
+-- rs-demo: bn254 Fr Bernstein-Yang inverter, black_box removed
+foreign import ccall unsafe "h_byinv_fr_invert"
+  h_byinv_fr_invert :: Ptr Word8 -> Ptr Word8 -> IO ()
 
 fixedSeed :: Word64
 fixedSeed = 0x5EED5EED5EED5EED
@@ -180,6 +193,42 @@ negFastcryptoSign ga gb = do
         h_sign kp (p `plusPtr` 8) 32
     }
 
+-- bn254 Fr Bernstein-Yang inverter with black_box removed from
+-- cond_add/cond_neg. workspace layout:
+--
+--   [input scalar (32B) | output buffer (32B)]   = 64B total
+--
+-- class A pins a fixed scalar prepared once at setup; class B
+-- draws a fresh random scalar every pair. Both samplers consume
+-- 32 random bytes from their RNG to keep nursery occupancy
+-- symmetric -- class A then overwrites with the fixed buffer.
+--
+-- on aarch64 (LLVM's `csel` lowering) per-call instruction
+-- counts are identical across the two classes and the e-process
+-- should exhaust budget cleanly. on x86-64 LLVM collapses the
+-- masked add into a secret-dependent conditional jump (the
+-- `jbe LBB1_5` site documented by substratum) and per-call
+-- instructions retired diverge by ~1 per invert -- small in
+-- absolute terms, but deterministic, so the wealth process
+-- accumulates fast under PMU.
+negBYInvFr :: Rng -> Rng -> IO F.FFIHypothesis
+negBYInvFr ga gb = do
+  fixBuf <- mallocBytes 32
+  gFix   <- mkRng fixedSeed
+  fillRandom gFix fixBuf 32
+  pure F.FFIHypothesis
+    { F.ffiWorkspaceBytes = 64
+    , F.ffiSampleA = \p -> do
+        fillRandom ga (p `plusPtr` 0) 32       -- draw, discard for symmetry
+        copyBytes (p `plusPtr` 0) fixBuf 32    -- overwrite with fixed
+        fillRandom ga (p `plusPtr` 32) 32      -- output region: random pad
+    , F.ffiSampleB = \p -> do
+        fillRandom gb (p `plusPtr` 0) 32
+        fillRandom gb (p `plusPtr` 32) 32
+    , F.ffiTarget = \p ->
+        h_byinv_fr_invert p (p `plusPtr` 32)
+    }
+
 -- driver ---------------------------------------------------------------------
 
 cfg :: C.Config
@@ -230,13 +279,18 @@ runAll meter = do
   runCase meter cfgSign
     "negative: fastcrypto::secp256r1 sign (WindowedScalarMultiplier)"
     signHyp
+  byHyp <- negBYInvFr ga gb
+  runCase meter cfgSign
+    "negative: halo2curves BYInverter::invert bn254 Fr (no black_box)"
+    byHyp
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
   putStrLn "ppad-censor demo-ffi: dudect-style fix-vs-random \
-           \against rust 32-byte inequality witnesses and \
-           \fastcrypto secp256r1 sign"
+           \against rust 32-byte inequality witnesses, \
+           \fastcrypto secp256r1 sign, and halo2curves BY \
+           \inverter (black_box stripped)"
   putStrLn $ "cfg:     " ++ show cfg
   putStrLn $ "cfgSign: " ++ show cfgSign
   -- Try each PMU meter in turn. instructions_retired catches

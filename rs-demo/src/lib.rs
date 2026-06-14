@@ -1,4 +1,4 @@
-// FFI targets exercised by censor-demo-ffi. Two groups of
+// FFI targets exercised by censor-demo-ffi. Three groups of
 // functions:
 //
 //   * 32-byte inequality witnesses -- a controlled CT / leaky
@@ -6,14 +6,22 @@
 //   * a fastcrypto::secp256r1 sign bridge -- exercises the
 //     production sign path whose underlying scalar mul goes
 //     through the table-indexed WindowedScalarMultiplier::mul.
+//   * a Bernstein-Yang scalar inverter for bn254 Fr, vendored
+//     from halo2curves with the `core::hint::black_box(mask)`
+//     guard removed from `cond_add`/`cond_neg`. The source is
+//     semantically constant-time, but on x86-64 LLVM collapses
+//     the masked-add into a secret-dependent branch -- see
+//     `byinv.rs` for the substratum write-up.
 //
-// Both groups live in one crate so the Haskell side links a single
-// staticlib and the Rust std runtime symbols (rust_eh_personality,
-// ARGV_INIT_ARRAY, EMPTY_PANIC, ...) appear exactly once at link
-// time -- ld.gold on Linux rejects duplicate definitions that
-// Apple's ld silently accepts.
+// All groups live in one crate so the Haskell side links a
+// single staticlib and the Rust std runtime symbols
+// (rust_eh_personality, ARGV_INIT_ARRAY, EMPTY_PANIC, ...)
+// appear exactly once at link time -- ld.gold on Linux rejects
+// duplicate definitions that Apple's ld silently accepts.
 //
 // std is linked in; the per-call code paths don't touch it.
+
+mod byinv;
 
 /// Constant-time 32-byte inequality witness.
 ///
@@ -140,4 +148,33 @@ pub unsafe extern "C" fn h_secp256r1_sign(
     let kp = &*kp;
     let m = slice::from_raw_parts(msg, msg_len);
     let _ = kp.sign(m);
+}
+
+// Bernstein-Yang Fr inverter bridge ------------------------------
+//
+// `byinv::invert_fr_le` runs the Bernstein-Yang outer loop on the
+// supplied 32-byte little-endian bn254 Fr scalar and writes the
+// 32-byte result. The invertibility flag is discarded; the timed
+// call always walks the full fixed-count outer loop.
+//
+// On aarch64 the compiled code is branch-free in the secret. On
+// x86-64 the optimizer inserts a secret-dependent conditional
+// jump inside `cond_add` -- this is the leak censor is meant to
+// reject under PMU.
+
+/// Invert a bn254 Fr scalar in place: read 32 little-endian
+/// bytes from `input`, write 32 little-endian bytes to `output`.
+///
+/// # Safety
+///
+/// `input` and `output` must each point to at least 32 bytes
+/// of readable / writable memory.
+#[no_mangle]
+pub unsafe extern "C" fn h_byinv_fr_invert(
+    input: *const u8,
+    output: *mut u8,
+) {
+    let inp: &[u8; 32] = &*(input as *const [u8; 32]);
+    let outp: &mut [u8; 32] = &mut *(output as *mut [u8; 32]);
+    byinv::invert_fr_le(inp, outp);
 }

@@ -11,6 +11,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "df2bc98edb29834757befc3e71e9ca646690948e" }
+subtle = "2.6"
 
 [profile.release]
 opt-level = 3
