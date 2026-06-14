@@ -31,6 +31,9 @@ module Censor (
     -- * Result
   , Result(..)
 
+    -- * Errors
+  , CensorError(..)
+
     -- * Running
   , runCT
 
@@ -42,7 +45,7 @@ module Censor (
   , withCounter
   ) where
 
-import Control.Monad (replicateM)
+import Control.Exception (Exception, throwIO)
 import Data.List (sort)
 import Data.Word (Word64)
 import qualified Numeric.Eproc.Paired as EP
@@ -91,6 +94,16 @@ data Result
     -- ^ no leak detected within budget
   deriving Show
 
+-- | Errors thrown by 'runCT' when calibration fails.
+data CensorError =
+    WarmupZeroDuration
+    -- ^ warmup observed only zero-duration measurements: the meter
+    --   cannot resolve the target under the current 'cfgBatch'.
+    --   Raise the batch size so the target runs in an inner loop.
+  deriving (Eq, Show)
+
+instance Exception CensorError
+
 -- | Run a constant-time test.
 --
 --   Phases:
@@ -105,9 +118,7 @@ runCT :: Meter -> Config -> Hypothesis a -> IO Result
 runCT meter cfg hyp = do
   !bound <- warmup meter cfg hyp
   case bound of
-    0 -> error
-      "Censor.runCT: warmup yielded zero-duration measurements. \
-      \Increase Config.cfgBatch so the target runs in inner loops."
+    0 -> throwIO WarmupZeroDuration
     _ -> pure ()
   let !lo    = 0 :: Double
       !hi    = fromIntegral bound :: Double
@@ -124,15 +135,15 @@ runCT meter cfg hyp = do
                 if even n
                   then do
                     !a  <- sampleA hyp
-                    !x  <- runOne meter (cfgBatch cfg) (target hyp a)
+                    !x  <- measure meter (cfgBatch cfg) (target hyp a)
                     !b  <- sampleB hyp
-                    !y  <- runOne meter (cfgBatch cfg) (target hyp b)
+                    !y  <- measure meter (cfgBatch cfg) (target hyp b)
                     pure (x, y)
                   else do
                     !b  <- sampleB hyp
-                    !y  <- runOne meter (cfgBatch cfg) (target hyp b)
+                    !y  <- measure meter (cfgBatch cfg) (target hyp b)
                     !a  <- sampleA hyp
-                    !x  <- runOne meter (cfgBatch cfg) (target hyp a)
+                    !x  <- measure meter (cfgBatch cfg) (target hyp a)
                     pure (x, y)
               let !tac = clip bound ta
                   !tbc = clip bound tb
@@ -149,19 +160,27 @@ clip :: Word64 -> Word64 -> Word64
 clip !lim !x = if x > lim then lim else x
 {-# INLINE clip #-}
 
-runOne :: Meter -> Int -> IO () -> IO Word64
-runOne (Meter m) !k !act = m k act
-{-# INLINE runOne #-}
-
+-- alternates A/B order per pair, matching runCT's main loop, so the
+-- p99 estimate doesn't inherit order-induced drift from collecting one
+-- class then the other.
 warmup :: Meter -> Config -> Hypothesis a -> IO Word64
 warmup meter Config{..} hyp = do
-  tas <- replicateM cfgWarmup $ do
-    !a <- sampleA hyp
-    runOne meter cfgBatch (target hyp a)
-  tbs <- replicateM cfgWarmup $ do
-    !b <- sampleB hyp
-    runOne meter cfgBatch (target hyp b)
-  let !sorted = sort (tas ++ tbs)
+  let go !i !acc
+        | i >= cfgWarmup = pure acc
+        | even i = do
+            !a <- sampleA hyp
+            !x <- measure meter cfgBatch (target hyp a)
+            !b <- sampleB hyp
+            !y <- measure meter cfgBatch (target hyp b)
+            go (i + 1) (x : y : acc)
+        | otherwise = do
+            !b <- sampleB hyp
+            !y <- measure meter cfgBatch (target hyp b)
+            !a <- sampleA hyp
+            !x <- measure meter cfgBatch (target hyp a)
+            go (i + 1) (x : y : acc)
+  ts <- go 0 []
+  let !sorted = sort ts
       !m      = length sorted
       !idx    = max 0 (min (m - 1) ((m * 99) `div` 100))
       !p99    = case drop idx sorted of
