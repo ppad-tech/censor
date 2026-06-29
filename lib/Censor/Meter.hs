@@ -73,6 +73,11 @@ newtype Meter = Meter
 --   Backed by @GHC.Clock.getMonotonicTimeNSec@, which dispatches to
 --   @mach_absolute_time@ on Darwin and @clock_gettime(CLOCK_MONOTONIC)@
 --   on Linux.
+--
+--   Resolution caveat: on Apple Silicon the user-mode monotonic
+--   counter ticks at roughly 24 MHz (~42 ns per tick), so
+--   sub-microsecond targets need batching (see 'Censor.cfgBatch').
+--   On Linux x86 the underlying counter is typically cycle-resolved.
 wallClock :: Meter
 wallClock = Meter measureWall
 

@@ -13,7 +13,9 @@ test, and either rejects (a leak is detected) or exhausts its budget.
 The statistical layer is anytime-valid: type-I error is controlled at
 `alpha` regardless of when sampling stops, so the driver halts as soon
 as the wealth process crosses threshold rather than running a fixed
-budget every time.
+budget every time. (The "wealth process" is a notional bankroll that
+bets on the data and grows only when the null is wrong; see
+[ppad-eproc][eproc] for the mechanics.)
 
 ## Usage
 
@@ -31,11 +33,21 @@ let hyp = C.Hypothesis
 result <- C.runCT C.wallClock C.defaultConfig hyp
 
 case result of
-  C.Reject n w -> putStrLn $
+  C.Reject n w nc -> putStrLn $
     "leak detected after " ++ show n ++ " sample pairs"
-  C.Pass n w -> putStrLn $
-    "no leak detected within budget (" ++ show n ++ " samples)"
+    ++ " (" ++ show nc ++ " readings clipped)"
+  C.Pass n w nc -> putStrLn $
+    "no leak detected within budget (" ++ show n ++ " samples,"
+    ++ " " ++ show nc ++ " readings clipped)"
 ```
+
+`Reject` and `Pass` both carry a clip count: the number of per-pair
+meter readings that exceeded the warmup-estimated upper bound and
+were truncated before being fed to the test. Clipping preserves the
+type-I error guarantee but reduces power against tail-shifting
+leaks, so a clip count that is a substantial fraction of `2 *
+samples` indicates the warmup bound was too tight. Raise `cfgWarmup`,
+enlarge `cfgBatch`, or treat the run with suspicion.
 
 On Linux, `withCounter` swaps the wall-clock meter for a hardware
 performance counter, which is deterministic and immune to the
@@ -187,6 +199,7 @@ $ cabal repl ppad-censor
 
 to get a REPL for the main library.
 
+[eproc]: https://git.ppad.tech/eproc
 [nixos]: https://nixos.org/
 [flake]: https://nixos.org/manual/nix/unstable/command-ref/new-cli/nix3-flake.html
 [const]: https://www.chosenplaintext.ca/articles/beginners-guide-constant-time-cryptography.html

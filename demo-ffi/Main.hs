@@ -261,10 +261,12 @@ runCase meter c name fh = do
   hFlush stdout
   result <- F.withFFIHypothesis fh $ \h -> C.runCT meter c h
   case result of
-    C.Reject n w -> putStrLn $
+    C.Reject n w nc -> putStrLn $
       "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
-    C.Pass   n w -> putStrLn $
+      ++ ", clipped=" ++ show nc
+    C.Pass   n w nc -> putStrLn $
       "  PASS    after " ++ show n ++ " pairs, logW=" ++ show w
+      ++ ", clipped=" ++ show nc
   hFlush stdout
 
 runAll :: C.Meter -> IO ()

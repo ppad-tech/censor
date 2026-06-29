@@ -483,10 +483,12 @@ runCaseWith meter c name mkH = do
   h <- mkH
   r <- C.runCT meter c h
   case r of
-    C.Reject n w -> putStrLn $
+    C.Reject n w nc -> putStrLn $
       "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
-    C.Pass   n w -> putStrLn $
+      ++ ", clipped=" ++ show nc
+    C.Pass   n w nc -> putStrLn $
       "  PASS    after " ++ show n ++ " pairs, logW=" ++ show w
+      ++ ", clipped=" ++ show nc
   hFlush stdout
 
 -- run every case under the given meter.
