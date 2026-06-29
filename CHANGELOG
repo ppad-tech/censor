@@ -1,6 +1,12 @@
 # Changelog
 
 - Unreleased
+  * Bump to ppad-eproc 0.2. The driver now surfaces e-process
+    config validation failures as 'InvalidEprocConfig', a new
+    'CensorError' constructor wrapping the upstream 'ConfigError'.
+    The 'Double' field of 'Pass' and 'Reject' tracks the supremum
+    log-wealth (matching the upstream change), not the value at
+    the stopping time.
   * Add 'Censor.FFI', a buffer-allocating helper for testing
     foreign-function targets (C, Rust, Go via cgo, etc.) under the
     same sequential CT driver. A single pinned workspace is allocated

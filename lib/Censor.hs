@@ -49,7 +49,7 @@ import Control.Exception (Exception, throwIO)
 import Data.List (sort)
 import Data.Word (Word64)
 import qualified Numeric.Eproc.Paired as EP
-import Numeric.Eproc.Paired (Bettor(Newton))
+import Numeric.Eproc.Paired (Bettor(Newton), ConfigError)
 
 import Censor.Meter
 
@@ -87,9 +87,12 @@ defaultConfig = Config
   }
 
 -- | Test outcome.
+--
+--   The reported log-wealth is the supremum observed over the run,
+--   not the value at the stopping time.
 data Result
   = Reject {-# UNPACK #-} !Int {-# UNPACK #-} !Double
-    -- ^ leak detected: sample pairs consumed, final log-wealth
+    -- ^ leak detected: sample pairs consumed, peak log-wealth
   | Pass   {-# UNPACK #-} !Int {-# UNPACK #-} !Double
     -- ^ no leak detected within budget
   deriving Show
@@ -100,6 +103,9 @@ data CensorError =
     -- ^ warmup observed only zero-duration measurements: the meter
     --   cannot resolve the target under the current 'cfgBatch'.
     --   Raise the batch size so the target runs in an inner loop.
+  | InvalidEprocConfig !ConfigError
+    -- ^ the underlying e-process rejected the test configuration
+    --   derived from 'cfgAlpha' and the warmup-estimated bound.
   deriving (Eq, Show)
 
 instance Exception CensorError
@@ -120,10 +126,12 @@ runCT meter cfg hyp = do
   case bound of
     0 -> throwIO WarmupZeroDuration
     _ -> pure ()
-  let !lo    = 0 :: Double
-      !hi    = fromIntegral bound :: Double
-      !epCfg = EP.config lo hi (cfgAlpha cfg) Newton
-      go !n !st
+  let !lo = 0 :: Double
+      !hi = fromIntegral bound :: Double
+  !epCfg <- case EP.config lo hi (cfgAlpha cfg) Newton of
+    Left  e -> throwIO (InvalidEprocConfig e)
+    Right c -> pure c
+  let go !n !st
         | n >= cfgBudget cfg =
             pure $! Pass n (EP.log_wealth st)
         | otherwise = case EP.decide epCfg st of

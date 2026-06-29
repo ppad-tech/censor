@@ -114,8 +114,12 @@ calibrationTests = testGroup "calibration" [
       r <- try (C.runCT (constMeter 0) c noopHyp)
              :: IO (Either C.CensorError C.Result)
       case r of
-        Left C.WarmupZeroDuration -> pure ()
-        Right _ -> assertFailure "expected WarmupZeroDuration"
+        Left C.WarmupZeroDuration   -> pure ()
+        Left (C.InvalidEprocConfig e) -> assertFailure $
+          "expected WarmupZeroDuration, got InvalidEprocConfig "
+          ++ show e
+        Right _                     -> assertFailure
+          "expected WarmupZeroDuration"
   ]
 
 -- deterministic A/B divergence via a meter that reports state the
