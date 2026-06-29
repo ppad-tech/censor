@@ -4,6 +4,7 @@ module Main where
 
 import Control.Exception (try)
 import Control.Monad (replicateM_)
+import qualified Data.Bits as B
 import Data.IORef
 import Data.Word (Word64)
 import qualified Censor as C
@@ -19,6 +20,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , deterministicLeakTests
   , offByOneTests
   , clipCountTests
+  , smokeCalibrationTests
   ]
 
 -- Test config tuned for fast feedback: less strict alpha and small
@@ -229,6 +231,97 @@ offByOneTests = testGroup "budget/decide off-by-one" [
           "off-by-one regression: tight budget passed at n="
           ++ show n ++ " logW=" ++ show w
   ]
+
+-- a tripwire calibration tier: run runCT a few hundred times under
+-- a true-H_0 synthetic meter and assert the empirical rejection rate
+-- stays well below a generous bound. Catches gross wiring regressions
+-- (rejection rate exploding to 0.5+) but does *not* validate the
+-- alpha guarantee in any rigorous sense — that's what censor-validate
+-- is for. N is deliberately small so the suite stays fast.
+data Class = ClassA | ClassB
+
+mkSynthMeter
+  :: IO Word64 -> IO Word64 -> IO (C.Meter, C.Hypothesis Class)
+mkSynthMeter nextA nextB = do
+  ref <- newIORef ClassA
+  let meter = C.Meter $ \k act -> do
+        let go 0 = pure ()
+            go i = act >> go (i - 1)
+        go k
+        c <- readIORef ref
+        case c of
+          ClassA -> nextA
+          ClassB -> nextB
+      hyp = C.Hypothesis
+        { C.target  = writeIORef ref
+        , C.sampleA = pure ClassA
+        , C.sampleB = pure ClassB
+        }
+  pure (meter, hyp)
+
+splitmix :: IORef Word64 -> IO Word64
+splitmix ref = atomicModifyIORef' ref $ \s ->
+  let !s' = s + 0x9E3779B97F4A7C15
+      !z0 = (s' `B.xor` (s' `B.shiftR` 30)) * 0xBF58476D1CE4E5B9
+      !z1 = (z0 `B.xor` (z0 `B.shiftR` 27)) * 0x94D049BB133111EB
+      !z2 =  z1 `B.xor` (z1 `B.shiftR` 31)
+  in  (s', z2)
+
+uniformInRange :: IORef Word64 -> Word64 -> Word64 -> IO Word64
+uniformInRange ref lo hi = do
+  w <- splitmix ref
+  pure $! lo + (w `mod` (hi - lo + 1))
+
+countRejects :: Int -> IO C.Result -> IO Int
+countRejects = go 0
+  where
+    go !acc 0  _   = pure acc
+    go !acc !n act = do
+      r <- act
+      let !inc = case r of
+            C.Reject{} -> 1
+            C.Pass{}   -> 0
+      go (acc + inc) (n - 1) act
+
+smokeCalibrationTests :: TestTree
+smokeCalibrationTests = testGroup "smoke calibration" [
+    -- two H_0 fixtures, alpha = 0.1, N = 200, loose bound: a true
+    -- 0.1-FPR test would produce ~20 +/- ~10 rejections; a broken
+    -- driver flips this to 100+ rejections. The 0.30 bound is a
+    -- regression tripwire, not a real calibration check.
+    testCase "sym-uniform H_0 stays under 30%" $
+      assertCalibrated symUniformTrial
+
+  , testCase "asym-uniform-equal-mean H_0 stays under 30%" $
+      assertCalibrated asymUniformTrial
+  ]
+  where
+    cfg = C.defaultConfig
+      { C.cfgAlpha  = 0.1
+      , C.cfgBudget = 1000
+      , C.cfgWarmup = 50
+      , C.cfgBatch  = 1
+      }
+    symUniformTrial = do
+      ra <- newIORef 0x5EED01
+      rb <- newIORef 0x5EED02
+      (m, h) <- mkSynthMeter (uniformInRange ra 0 200)
+                             (uniformInRange rb 0 200)
+      C.runCT m cfg h
+    asymUniformTrial = do
+      ra <- newIORef 0x5EED03
+      rb <- newIORef 0x5EED04
+      (m, h) <- mkSynthMeter (uniformInRange ra 0 200)
+                             (uniformInRange rb 50 150)
+      C.runCT m cfg h
+    assertCalibrated trial = do
+      let n = 200
+      rejects <- countRejects n trial
+      let rate = fromIntegral rejects / (fromIntegral n :: Double)
+      assertBool ("smoke calibration regressed: " ++ show rejects
+                  ++ "/" ++ show n ++ " rejections (rate "
+                  ++ show rate ++ ")")
+                 (rate <= 0.30)
 
 -- meter that returns small readings during the warmup window and
 -- large readings thereafter. With cfgWarmup = 10 the meter sees

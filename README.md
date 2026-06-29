@@ -182,6 +182,74 @@ proportional to the inner-loop count:
 
 You should compile with the `llvm` flag for maximum performance.
 
+## Empirical calibration
+
+The framework's pitch — type-I error controlled at `alpha`, anytime
+— is a statistical claim, not a code-correctness one. The
+`censor-validate` executable runs the driver against synthetic
+meters with known H_0 / H_1 distributions, counts rejections across
+N independent trials per cell, and reports Wilson 95% binomial CIs
+against each cell's alpha bound. It also produces a power table
+characterising detection rate vs effect size.
+
+```
+$ cabal run -f+validate censor-validate -- 10000 --csv runs/v0.1.csv
+```
+
+The first positional argument is the trial count per cell (default
+10000); `--csv path` dumps a machine-readable copy of the report for
+cross-release diffing.
+
+A cell is **PASS** when its CI's upper bound is comfortably below
+its alpha (rejection rate is within budget), **FAIL** when the
+lower bound exceeds alpha (a real statistical violation), and
+**INCONCLUSIVE** when the CI straddles alpha (more trials needed).
+The cell grid uses a Bonferroni-adjusted family confidence so that
+a family-wide PASS is meaningful. Cells at very tight alpha levels
+(`1e-4`, `1e-6`) and the power table are reported but not gated —
+their value is characterisation, not assertion.
+
+This is a pre-release calibration check, not a per-commit gate; a
+full run takes 5–10 minutes. The default test suite carries a
+lightweight smoke tier that catches gross wiring regressions only.
+
+### Baseline
+
+`etc/validate/baseline.csv` is the captured baseline from N=10000
+on master. Headline: zero rejections across all 48 cells (32
+calibration + 2 edge + 14 power-H_0). At `alpha = 1e-2`, all 8
+gated calibration scenarios PASS; at `alpha = 1e-3` they sit at
+INCONCLUSIVE because the Bonferroni-adjusted Wilson upper at 0
+rejections in 10000 trials is `0.00108`, marginally above `1e-3`.
+N would need to climb to ~15000 to push the upper bound below
+`1e-3`. Zero rejections is itself overwhelming evidence the alpha
+guarantee holds in practice; the INCONCLUSIVE label is a property
+of conservative gating, not of the framework.
+
+### Power
+
+The power-H_1 cells inject a positive shift to class B and measure
+detection rate. The headline finding from the baseline:
+
+  * **Symmetric uniform `[0, 200]`**: shift of 5 (2.5% of noise
+    range) is detected at 100% with `cfgBudget = 10000`; not
+    detected at `cfgBudget = 1000`. Shifts of 10 and 50 detect at
+    100% from `cfgBudget = 1000`.
+  * **Heavy-tailed (95% uniform `[50, 150]` + 5% uniform
+    `[5000, 10000]`)**: 0% detection at all tested shifts up to 50,
+    at both budgets.
+
+The second result is a real limitation. A heavy tail inflates the
+warmup `p99`, so the bound `2 * p99` becomes huge, the bettor's
+`lambda_max` shrinks proportionally, and even consistent
+mean-shifts in the bulk of the distribution struggle to grow the
+wealth process. The framework remains *calibrated* (no false
+positives) under heavy tails but loses *power*. Users testing
+targets with heavy-tailed timing distributions should expect
+limited sensitivity unless `cfgBudget` is much larger or the
+underlying meter has tighter tails (e.g. instructions-retired
+under PMU is deterministic).
+
 ## Development
 
 You'll require [Nix][nixos] with [flake][flake] support enabled. Enter
