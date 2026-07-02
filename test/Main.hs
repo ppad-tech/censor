@@ -323,28 +323,37 @@ smokeCalibrationTests = testGroup "smoke calibration" [
                   ++ show rate ++ ")")
                  (rate <= 0.30)
 
--- meter that returns small readings during the warmup window and
--- large readings thereafter. With cfgWarmup = 10 the meter sees
--- 10 * 2 = 20 calls before the main loop starts; the bound becomes
--- 2 * p99(small) and every main-loop reading clips.
+-- clip count rises when |ta - tb| exceeds the warmup-derived bound.
+-- fixture: target writes its input to an IORef, meter reads it;
+-- class A always writes 100, class B writes 200 during warmup (|d|
+-- = 100, so bound ~= 200) and 1000000 during the main loop (|d| ~=
+-- 999900, well above the bound).
 clipCountTests :: TestTree
 clipCountTests = testGroup "clip counts" [
-    testCase "clip count rises when main-loop readings exceed bound" $ do
+    testCase "clip count rises when |d| exceeds bound" $ do
+      ref <- newIORef (0 :: Word64)
       ctr <- newIORef (0 :: Int)
-      let meter = C.Meter $ \k act ->
+      let leakMeter = C.Meter $ \k act ->
             let go 0 = pure ()
                 go i = act >> go (i - 1)
-            in do
-              go k
-              n <- atomicModifyIORef' ctr $ \i -> (i + 1, i)
-              pure $ if n < 20 then 100 else 1000
+            in  go k >> readIORef ref
+          warmupPairs = 20
+          hyp = C.Hypothesis
+            { C.target  = writeIORef ref
+            , C.sampleA = pure 100
+            , C.sampleB = do
+                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
+                pure $! if n < warmupPairs
+                          then 200
+                          else 1000000
+            }
           c = C.defaultConfig
             { C.cfgAlpha  = 1.0e-3
             , C.cfgBudget = 50
-            , C.cfgWarmup = 10  -- 10 pairs * 2 classes = 20 meter calls
+            , C.cfgWarmup = warmupPairs
             , C.cfgBatch  = 1
             }
-      r <- C.runCT meter c noopHyp
+      r <- C.runCT leakMeter c hyp
       let nc = case r of
             C.Pass _ _ x   -> x
             C.Reject _ _ x -> x

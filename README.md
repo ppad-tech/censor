@@ -35,19 +35,20 @@ result <- C.runCT C.wallClock C.defaultConfig hyp
 case result of
   C.Reject n w nc -> putStrLn $
     "leak detected after " ++ show n ++ " sample pairs"
-    ++ " (" ++ show nc ++ " readings clipped)"
+    ++ " (" ++ show nc ++ " pairs clipped)"
   C.Pass n w nc -> putStrLn $
     "no leak detected within budget (" ++ show n ++ " samples,"
-    ++ " " ++ show nc ++ " readings clipped)"
+    ++ " " ++ show nc ++ " pairs clipped)"
 ```
 
-`Reject` and `Pass` both carry a clip count: the number of per-pair
-meter readings that exceeded the warmup-estimated upper bound and
-were truncated before being fed to the test. Clipping preserves the
-type-I error guarantee but reduces power against tail-shifting
-leaks, so a clip count that is a substantial fraction of `2 *
-samples` indicates the warmup bound was too tight. Raise `cfgWarmup`,
-enlarge `cfgBatch`, or treat the run with suspicion.
+`Reject` and `Pass` both carry a clip count: the number of pairs
+whose absolute difference `|d| = |ta - tb|` exceeded the
+warmup-estimated upper bound and was truncated before being fed to
+the test. Clipping preserves the type-I error guarantee but reduces
+power against tail-shifting leaks, so a clip count that is a
+substantial fraction of `samples` indicates the warmup bound was
+too tight. Raise `cfgWarmup`, enlarge `cfgBatch`, or treat the run
+with suspicion.
 
 On Linux, `withCounter` swaps the wall-clock meter for a hardware
 performance counter, which is deterministic and immune to the
@@ -216,8 +217,8 @@ lightweight smoke tier that catches gross wiring regressions only.
 ### Baseline
 
 `etc/validate/baseline.csv` is the captured baseline from N=10000
-on master. Headline: zero rejections across all 48 cells (32
-calibration + 2 edge + 14 power-H_0). At `alpha = 1e-2`, all 8
+on master. Headline: zero rejections across all 58 cells (36
+calibration + 2 edge + 20 power-H_0). At `alpha = 1e-2`, all 9
 gated calibration scenarios PASS; at `alpha = 1e-3` they sit at
 INCONCLUSIVE because the Bonferroni-adjusted Wilson upper at 0
 rejections in 10000 trials is `0.00108`, marginally above `1e-3`.
@@ -229,26 +230,32 @@ of conservative gating, not of the framework.
 ### Power
 
 The power-H_1 cells inject a positive shift to class B and measure
-detection rate. The headline finding from the baseline:
+detection rate. Headline findings from the baseline:
 
   * **Symmetric uniform `[0, 200]`**: shift of 5 (2.5% of noise
     range) is detected at 100% with `cfgBudget = 10000`; not
     detected at `cfgBudget = 1000`. Shifts of 10 and 50 detect at
     100% from `cfgBudget = 1000`.
+  * **Narrow-jitter (baseline 10000, noise `±10`)**: shift of 1
+    (10% of noise) is detected at 100% from `cfgBudget = 1000`.
+    This scenario is the regime where the driver's decision to bet
+    on the clipped paired difference `d = ta - tb` (rather than on
+    the clipped per-class readings) earns its keep — `lambda_max`
+    scales with noise magnitude (~20) instead of baseline magnitude
+    (~10000), a ~500x boost in per-pair wealth growth.
   * **Heavy-tailed (95% uniform `[50, 150]` + 5% uniform
     `[5000, 10000]`)**: 0% detection at all tested shifts up to 50,
     at both budgets.
 
-The second result is a real limitation. A heavy tail inflates the
-warmup `p99`, so the bound `2 * p99` becomes huge, the bettor's
-`lambda_max` shrinks proportionally, and even consistent
-mean-shifts in the bulk of the distribution struggle to grow the
-wealth process. The framework remains *calibrated* (no false
-positives) under heavy tails but loses *power*. Users testing
-targets with heavy-tailed timing distributions should expect
-limited sensitivity unless `cfgBudget` is much larger or the
-underlying meter has tighter tails (e.g. instructions-retired
-under PMU is deterministic).
+The last result is a real limitation. A heavy tail inflates the
+warmup `p99(|d|)`, the bettor's `lambda_max` shrinks proportionally,
+and the variance from tail events swamps consistent mean-shifts in
+the bulk of the distribution. The framework remains *calibrated*
+(no false positives) under heavy tails but loses *power*. Users
+testing targets with heavy-tailed timing distributions should
+expect limited sensitivity unless `cfgBudget` is much larger or the
+underlying meter has tighter tails (e.g. instructions-retired under
+PMU is deterministic and tail-free).
 
 ## Development
 

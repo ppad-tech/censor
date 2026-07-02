@@ -250,6 +250,19 @@ scRegimeChange !seed = Scenario "regime-change" $ \cfg -> do
           else uniformInt rng 0  200
   pure (draw ra, draw rb)
 
+-- High baseline with narrow i.i.d. jitter per class. Concretely
+-- readings sit at 10000 +/- 10; @|d|@ stays on the noise scale (~20)
+-- while readings themselves stay on the baseline scale (~10000).
+-- This is the regime where betting on the clipped difference (rather
+-- than on the clipped readings) pays off dramatically: @lambda_max@
+-- is set by @|d|@ and stays ~500x higher than it would be if it
+-- scaled with reading magnitude.
+scNarrowJitter :: Word64 -> Scenario
+scNarrowJitter !seed = Scenario "narrow-jitter" $ \_ -> do
+  ra <- mkRng seed
+  rb <- mkRng (seed + 1)
+  pure (uniformInt ra 9990 10010, uniformInt rb 9990 10010)
+
 -- All H_0 calibration scenarios.
 h0Scenarios :: [Scenario]
 h0Scenarios =
@@ -261,6 +274,7 @@ h0Scenarios =
   , scNearBound         0x5EED05
   , scAllClipping       0x5EED06
   , scRegimeChange      0x5EED07
+  , scNarrowJitter      0x5EED08
   ]
 
 -- A power scenario adds a positive shift to class B (so
@@ -276,10 +290,14 @@ addShift !base !shift = base
 
 -- H_1 scenarios for the power table. Pick a couple of base
 -- distributions and sweep the shift / budget grid against them.
+-- narrow-jitter is included specifically to exhibit the bet-on-|d|
+-- power gain: under bet-on-readings the ~500x smaller lambda_max
+-- would leave every one of these cells at 0% detection.
 powerBases :: [Scenario]
 powerBases =
-  [ scSymUniform 0xB055ED01
-  , scHeavyTail  0xB055ED02
+  [ scSymUniform    0xB055ED01
+  , scHeavyTail     0xB055ED02
+  , scNarrowJitter  0xB055ED03
   ]
 
 powerShifts :: [Word64]

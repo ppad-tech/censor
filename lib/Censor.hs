@@ -17,7 +17,7 @@
 --
 -- The wealth process is a nonnegative supermartingale under the null
 -- (a notional bankroll that bets on the data and grows only when the
--- null is wrong; see "Numeric.Eproc.Paired" for the details). The
+-- null is wrong; see "Numeric.Eproc.Bounded" for the details). The
 -- test is valid under optional stopping: 'runCT' halts as soon as
 -- the wealth process crosses the threshold @2 \/ alpha@, with type-I
 -- error controlled at @alpha@ regardless of when sampling stops.
@@ -48,11 +48,12 @@ module Censor (
   ) where
 
 import Control.Exception (Exception, throwIO)
+import Control.Monad (unless)
 import qualified Data.Bits as B
 import Data.List (sort)
 import Data.Word (Word64)
-import qualified Numeric.Eproc.Paired as EP
-import Numeric.Eproc.Paired (Bettor(Newton), ConfigError)
+import qualified Numeric.Eproc.Bounded as EP
+import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
 
 import Censor.Meter
 
@@ -62,13 +63,13 @@ import Censor.Meter
 --   * @sampleA@, @sampleB@: independent samplers for two input
 --     classes (typically a \"fixed\" class and a \"random\" class).
 --
---   The null asserts that the paired difference of (clipped, batched)
---   measurements of @target a@ and @target b@ has conditional mean
---   zero — informally, that the two classes run for equally long on
---   average. The test is sensitive to first-moment timing leaks
---   (data-dependent branches and memory traffic typically show up
---   here) but cannot distinguish distributions that agree in mean
---   and differ only in higher moments.
+--   The null asserts that the paired difference of measurements of
+--   @target a@ and @target b@ has conditional mean zero — informally,
+--   that the two classes run for equally long on average. The test
+--   is sensitive to first-moment timing leaks (data-dependent
+--   branches and memory traffic typically show up here) but cannot
+--   distinguish distributions that agree in mean and differ only in
+--   higher moments.
 data Hypothesis a = Hypothesis
   { target  :: !(a -> IO ())
   , sampleA :: !(IO a)
@@ -80,17 +81,17 @@ data Config = Config
   { cfgAlpha  :: !Double  -- ^ significance level
   , cfgBudget :: !Int     -- ^ max sample pairs to consume
   , cfgBatch  :: !Int     -- ^ target repetitions per timed region
-  , cfgWarmup :: !Int     -- ^ warmup samples per class. The clip
-                          --   bound is set from the @~p99@ of
-                          --   @2 * cfgWarmup@ readings; at small
+  , cfgWarmup :: !Int     -- ^ warmup pairs. The clip bound is set
+                          --   from the @~p99@ of @cfgWarmup@ per-pair
+                          --   absolute differences @|d|@; at small
                           --   warmup sizes the order-statistic
                           --   discretisation degenerates to the
                           --   sample maximum (specifically, any
-                          --   @cfgWarmup <= 50@ picks the max).
+                          --   @cfgWarmup <= 100@ picks the max).
   } deriving Show
 
 -- | Defaults: @alpha = 1e-6@, budget @100000@ pairs, batch 1 (no
---   inner repetition), warmup 200 per class.
+--   inner repetition), warmup 200 pairs.
 defaultConfig :: Config
 defaultConfig = Config
   { cfgAlpha  = 1.0e-6
@@ -103,22 +104,22 @@ defaultConfig = Config
 --
 --   Both constructors carry the number of sample pairs consumed, the
 --   peak (supremum-so-far) log-wealth of the underlying e-process,
---   and a clip count: the number of per-pair readings that exceeded
---   the warmup-derived upper bound and were truncated before being
---   fed to the test. A clip count that is a substantial fraction of
---   @2 * samples@ indicates the warmup bound was too tight; raise
---   'cfgWarmup', enlarge 'cfgBatch', or treat the run with
+--   and a clip count: the number of pairs whose absolute difference
+--   @|d|@ exceeded the warmup-derived upper bound and were truncated
+--   before being fed to the test. A clip count that is a substantial
+--   fraction of @samples@ indicates the warmup bound was too tight;
+--   raise 'cfgWarmup', enlarge 'cfgBatch', or treat the run with
 --   suspicion (clipping reduces power against tail-shifting leaks).
 data Result
   = Reject
       {-# UNPACK #-} !Int     -- ^ sample pairs consumed
       {-# UNPACK #-} !Double  -- ^ peak log-wealth
-      {-# UNPACK #-} !Int     -- ^ readings clipped to the bound
+      {-# UNPACK #-} !Int     -- ^ pairs whose @|d|@ was clipped
     -- ^ leak detected.
   | Pass
       {-# UNPACK #-} !Int     -- ^ sample pairs consumed
       {-# UNPACK #-} !Double  -- ^ peak log-wealth
-      {-# UNPACK #-} !Int     -- ^ readings clipped to the bound
+      {-# UNPACK #-} !Int     -- ^ pairs whose @|d|@ was clipped
     -- ^ no leak detected within budget.
   deriving Show
 
@@ -128,6 +129,10 @@ data CensorError =
     -- ^ warmup observed only zero-duration measurements: the meter
     --   cannot resolve the target under the current 'cfgBatch'.
     --   Raise the batch size so the target runs in an inner loop.
+    --   (Zero /differences/ across all warmup pairs are OK — that
+    --   just means the target is deterministic in @|d|@ for the
+    --   sampled inputs, which is the expected happy path under a
+    --   PMU meter on truly CT code.)
   | InvalidConfig !String
     -- ^ a 'Config' field was outside its admissible range. The
     --   'String' names which field and why.
@@ -145,39 +150,44 @@ instance Exception CensorError
 --
 --   Phases:
 --
---   1. /Warmup/ — take @cfgWarmup@ measurements from each class to
---      estimate an upper bound on per-call timings.
+--   1. /Warmup/ — take @cfgWarmup@ paired measurements to estimate
+--      an upper bound @c@ on the magnitude of the per-pair difference
+--      @|d| = |ta - tb|@. The subsequent e-process bets on @d@
+--      clipped to @[-c, c]@.
 --   2. /Main/ — for each pair, choose A-first or B-first uniformly
---      at random, sample and measure both classes, and stream the
---      pair to the e-process test. Halt as soon as the wealth
---      process crosses threshold, or when the budget is exhausted.
+--      at random, sample and measure both classes, compute
+--      @d = ta - tb@, clip to @[-c, c]@, and stream to the e-process
+--      test. Halt as soon as the wealth process crosses threshold,
+--      or when the budget is exhausted.
+--
+--   Because the order bit is randomised per pair, @d@ is
+--   conditionally symmetric about zero under H_0 (not just conditional
+--   mean zero); symmetric clipping is odd and preserves the null.
+--   Betting on @d@ directly — rather than on the raw per-class
+--   readings — lets @lambda_max@ scale with the noise magnitude
+--   @p99(|d|)@ rather than with the target's baseline runtime
+--   @p99(t)@, which for narrow-noise heavy-baseline targets can be
+--   orders of magnitude better for power at the same alpha.
 runCT :: Meter -> Config -> Hypothesis a -> IO Result
 runCT meter cfg hyp = do
   validateConfig cfg
-  !bound <- warmup meter cfg hyp
-  case bound of
-    0 -> throwIO WarmupZeroDuration
-    _ -> pure ()
-  let !lo = 0 :: Double
-      !hi = fromIntegral bound :: Double
-  !epCfg <- case EP.config lo hi (cfgAlpha cfg) Newton of
+  (!c, !anyNonzero) <- warmup meter cfg hyp
+  unless anyNonzero $ throwIO WarmupZeroDuration
+  !epCfg <- case EP.config 0 (negate c) c (cfgAlpha cfg) Newton of
     Left  e -> throwIO (InvalidEprocConfig e)
-    Right c -> pure c
+    Right x -> pure x
   let go !n !st !rng !nclip
         | n >= cfgBudget cfg =
             pure $! Pass n (EP.log_wealth st) nclip
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!ta, !tb) <- runPair meter cfg hyp flipOrder
-            let !taClip = ta > bound
-                !tbClip = tb > bound
-                !tac    = clip bound ta
-                !tbc    = clip bound tb
-                !st'    = EP.update epCfg st
-                            (fromIntegral tac, fromIntegral tbc)
-                !nclip' = nclip
-                          + (if taClip then 1 else 0)
-                          + (if tbClip then 1 else 0)
+            let !d      = fromIntegral ta - fromIntegral tb :: Double
+                !da     = abs d
+                !dClip  = if da > c then signum d * c else d
+                !clipped = da > c
+                !st'    = EP.update epCfg st dClip
+                !nclip' = if clipped then nclip + 1 else nclip
                 !n'     = n + 1
             case EP.decide epCfg st' of
               EP.Reject ->
@@ -218,10 +228,6 @@ runPair meter cfg hyp flipOrder
       pure (x, y)
 {-# INLINE runPair #-}
 
-clip :: Word64 -> Word64 -> Word64
-clip !lim !x = if x > lim then lim else x
-{-# INLINE clip #-}
-
 -- The order-bit PRNG. A deterministic splitmix64 stream is fine for
 -- the conditional-null guarantee: what matters is that the per-pair
 -- order bit is conditionally independent of past measurements, and
@@ -247,29 +253,48 @@ warmupSeed, mainSeed :: Word64
 warmupSeed = 0xCAFEBABEDEADBEEF
 mainSeed   = 0xDEADBEEFCAFEBABE
 
--- Warmup also randomises per-pair order, matching runCT's main loop
--- so the p99 estimate doesn't inherit a parity-locked nuisance bias.
-warmup :: Meter -> Config -> Hypothesis a -> IO Word64
+-- Warmup collects per-pair @|d|@ (for the bound estimate) and a
+-- boolean flag tracking whether any nonzero reading was ever
+-- observed (for the meter-broken diagnosis). The order-bit
+-- randomisation matches runCT's main loop so the p99 estimate
+-- doesn't inherit a parity-locked nuisance bias.
+--
+-- Returns @(c, anyNonzero)@ where @c = max 1 (2 * p99(|d|))@ is the
+-- clipping bound and @anyNonzero@ is True iff at least one warmup
+-- reading was nonzero. If @anyNonzero@ is False the meter is broken
+-- (returning 0 for everything) and the caller throws
+-- 'WarmupZeroDuration'. All-zero /differences/ with nonzero readings
+-- are the PMU-on-truly-CT happy path — we fall back to @c = 1@ and
+-- let the main loop proceed; under continued zero differences the
+-- wealth process stays flat and the run passes at budget.
+warmup :: Meter -> Config -> Hypothesis a -> IO (Double, Bool)
 warmup meter cfg hyp = do
-  let go !i !rng !acc
-        | i >= cfgWarmup cfg = pure acc
+  let go !i !rng !acc !nz
+        | i >= cfgWarmup cfg = pure (acc, nz)
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!x, !y) <- runPair meter cfg hyp flipOrder
-            go (i + 1) rng' (x : y : acc)
-  ts <- go 0 warmupSeed []
-  let !sorted = sort ts
+            let !dx = fromIntegral x :: Double
+                !dy = fromIntegral y :: Double
+                !da = abs (dx - dy)
+                !nz' = nz || x /= 0 || y /= 0
+            go (i + 1) rng' (da : acc) nz'
+  (diffs, anyNonzero) <- go 0 warmupSeed [] False
+  let !sorted = sort diffs
       !m      = length sorted
       !idx    = max 0 (min (m - 1) ((m * 99) `div` 100))
       !p99    = case drop idx sorted of
                   (x : _) -> x
                   []      -> 0
-  -- "p99" is fuzzy: at default cfgWarmup = 200 (m = 400) idx = 396,
-  -- so we take the 397th of 400 readings (empirical rank ~99.25%).
-  -- At cfgWarmup <= 50 (m <= 100) idx lands at m - 1, so p99
+  -- "p99" is fuzzy: at default cfgWarmup = 200 (m = 200) idx = 198,
+  -- so we take the 199th of 200 differences (empirical rank ~99.5%).
+  -- At cfgWarmup <= 100 (m <= 100) idx lands at m - 1, so p99
   -- degenerates to the sample max — surfaced in the cfgWarmup
   -- docstring.
   --
   -- 2x the order statistic gives headroom for occasional outliers;
-  -- observations above are clipped during the main pass.
-  pure $! 2 * p99
+  -- observations above are clipped during the main pass. The
+  -- @max 1@ floor keeps @c > 0@ so the underlying e-process config
+  -- accepts it even when warmup differences are identically zero
+  -- (PMU on truly CT code).
+  pure (max 1 (2 * p99), anyNonzero)
