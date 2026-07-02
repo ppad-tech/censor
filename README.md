@@ -240,14 +240,40 @@ a family-wide PASS is meaningful. Cells at very tight alpha levels
 their value is characterisation, not assertion.
 
 This is a pre-release calibration check, not a per-commit gate; a
-full run takes 5–10 minutes. The default test suite carries a
-lightweight smoke tier that catches gross wiring regressions only.
+full run at the current battery size takes roughly an hour under
+the K=4 hedge. The default test suite carries a lightweight smoke
+tier that catches gross wiring regressions only.
+
+### Hedged e-process composition
+
+The driver internally runs a four-way convex-hedge mixture of
+anytime-valid e-processes, all consuming the same per-pair
+difference `d = ta - tb`:
+
+  * **Sign** — a two-sided Bernoulli test at `p_0 = 1/2` on
+    `sign d` (ties skipped). No bounds, no clipping. Detects any
+    distributional asymmetry, including equal-mean shape leaks and
+    heavy-tail bulk shifts where the mean signal is swamped by tail
+    variance.
+  * **Magnitude at c, 4c, 16c** — three two-sided bounded-mean
+    tests on `d` clipped to progressively wider intervals. The
+    tight bound (`c`, from warmup `p99(|d|)`) gives the largest
+    `lambda_max` and dominates against small consistent bulk
+    shifts; the wider bounds preserve signal from rare-outlier
+    leaks (e.g. a rarely-taken data-dependent branch) that the
+    tight clip would truncate away.
+
+Uniform weights over the four components; threshold at
+`log(8/alpha)` (the `+log 4` over the single-component
+`log(2/alpha)` is the price of hedging). Rejection latches on the
+supremum of the mixture's log-wealth, not on the components'
+individual suprema.
 
 ### Baseline
 
 `etc/validate/baseline.csv` is the captured baseline from N=10000
-on master. Headline: zero rejections across all 58 cells (36
-calibration + 2 edge + 20 power-H_0). At `alpha = 1e-2`, all 9
+on master. Headline: zero rejections across all 62 cells (36
+calibration + 2 edge + 24 power-H_0). At `alpha = 1e-2`, all 9
 gated calibration scenarios PASS; at `alpha = 1e-3` they sit at
 INCONCLUSIVE because the Bonferroni-adjusted Wilson upper at 0
 rejections in 10000 trials is `0.00108`, marginally above `1e-3`.
@@ -262,29 +288,33 @@ The power-H_1 cells inject a positive shift to class B and measure
 detection rate. Headline findings from the baseline:
 
   * **Symmetric uniform `[0, 200]`**: shift of 5 (2.5% of noise
-    range) is detected at 100% with `cfgBudget = 10000`; not
-    detected at `cfgBudget = 1000`. Shifts of 10 and 50 detect at
-    100% from `cfgBudget = 1000`.
+    range) detects at 100% with `cfgBudget = 10000`; not detected
+    at `cfgBudget = 1000`. Shift of 50 detects at 100% from
+    `cfgBudget = 1000`.
   * **Narrow-jitter (baseline 10000, noise `±10`)**: shift of 1
-    (10% of noise) is detected at 100% from `cfgBudget = 1000`.
-    This scenario is the regime where the driver's decision to bet
-    on the clipped paired difference `d = ta - tb` (rather than on
-    the clipped per-class readings) earns its keep — `lambda_max`
-    scales with noise magnitude (~20) instead of baseline magnitude
-    (~10000), a ~500x boost in per-pair wealth growth.
+    (10% of noise) detects at 100% from `cfgBudget = 1000`. This
+    scenario is the regime where betting on the clipped paired
+    difference `d = ta - tb` (rather than on the clipped per-class
+    readings) earns its keep — `lambda_max` scales with noise
+    magnitude (~20) instead of baseline magnitude (~10000), a
+    ~500x boost in per-pair wealth growth.
   * **Heavy-tailed (95% uniform `[50, 150]` + 5% uniform
-    `[5000, 10000]`)**: 0% detection at all tested shifts up to 50,
-    at both budgets.
+    `[5000, 10000]`)**: shifts of 5, 10, and 50 all detect at 100%
+    with `cfgBudget = 10000`; shift of 50 detects even at
+    `cfgBudget = 1000`. The sign component is what closes this
+    gap — a bulk shift moves `P(d > 0)` off `1/2` regardless of
+    tail variance, so the sign test grows wealth cleanly even
+    while the magnitude components are drowning in tail noise.
+    Shift of 1 remains undetected at these budgets (0.2% of tail
+    range; below the noise floor at any statistic).
 
-The last result is a real limitation. A heavy tail inflates the
-warmup `p99(|d|)`, the bettor's `lambda_max` shrinks proportionally,
-and the variance from tail events swamps consistent mean-shifts in
-the bulk of the distribution. The framework remains *calibrated*
-(no false positives) under heavy tails but loses *power*. Users
-testing targets with heavy-tailed timing distributions should
-expect limited sensitivity unless `cfgBudget` is much larger or the
-underlying meter has tighter tails (e.g. instructions-retired under
-PMU is deterministic and tail-free).
+The hedge composition brings a ~10-15% threshold overhead vs a
+single component (from `log(2/alpha)` to `log(8/alpha)`), which
+shows up as a small regression at marginal detection points — e.g.
+sym-uniform shift=10 at `cfgBudget = 1000` fell from 100% (under
+the previous single-component design) to 0% (under the hedge). The
+tradeoff is qualitative: we now detect leak shapes that were
+undetectable at any budget under the single-component design.
 
 ## Development
 

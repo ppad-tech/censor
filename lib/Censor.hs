@@ -57,7 +57,8 @@ import qualified Data.Bits as B
 import Data.List (sort)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import qualified Numeric.Eproc.Bounded as EP
+import qualified Numeric.Eproc.Bernoulli.TwoSided as EPSign
+import qualified Numeric.Eproc.Bounded as EPMagn
 import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
 
 import Censor.Meter
@@ -68,13 +69,16 @@ import Censor.Meter
 --   * @sampleA@, @sampleB@: independent samplers for two input
 --     classes (typically a \"fixed\" class and a \"random\" class).
 --
---   The null asserts that the paired difference of measurements of
---   @target a@ and @target b@ has conditional mean zero — informally,
---   that the two classes run for equally long on average. The test
---   is sensitive to first-moment timing leaks (data-dependent
---   branches and memory traffic typically show up here) but cannot
---   distinguish distributions that agree in mean and differ only in
---   higher moments.
+--   The null asserts that the paired difference @d = ta - tb@ is
+--   conditionally symmetric about zero — a strictly stronger
+--   statement than conditional mean zero, and the one that the
+--   randomised A\/B order actually delivers. The driver tests it
+--   via a four-way convex-hedge mixture of anytime-valid
+--   e-processes (a sign test at @p_0 = 1\/2@ plus three
+--   bounded-mean tests on @d@ clipped to @c@, @4c@, and @16c@),
+--   so the alternative class detected is the union: first-moment
+--   shifts, equal-mean shape or tail leaks, and rare-outlier leaks
+--   all move at least one component off the null.
 data Hypothesis a = Hypothesis
   { target  :: !(a -> IO ())
   , sampleA :: !(IO a)
@@ -191,28 +195,25 @@ runCT meter cfg hyp = do
   (!wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
   (!c, !anyNonzero) <- warmup meter cfg hyp wSeed
   unless anyNonzero $ throwIO WarmupZeroDuration
-  !epCfg <- case EP.config 0 (negate c) c (cfgAlpha cfg) Newton of
+  !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c of
     Left  e -> throwIO (InvalidEprocConfig e)
     Right x -> pure x
-  let go !n !st !rng !nclip
+  let !thresh = hcThresh hcfg
+      go !n !st !rng !nclip
         | n >= cfgBudget cfg =
-            pure $! Pass n (EP.log_wealth_sup st) nclip
+            pure $! Pass n (hsSupLogMix st) nclip
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!ta, !tb) <- runPair meter cfg hyp flipOrder
-            let !d      = fromIntegral ta - fromIntegral tb :: Double
-                !da     = abs d
-                !dClip  = if da > c then signum d * c else d
-                !clipped = da > c
-                !st'    = EP.update epCfg st dClip
-                !nclip' = if clipped then nclip + 1 else nclip
-                !n'     = n + 1
-            case EP.decide epCfg st' of
-              EP.Reject ->
-                pure $! Reject n' (EP.log_wealth_sup st') nclip'
-              EP.Continue ->
-                go n' st' rng' nclip'
-  go 0 (EP.initial epCfg) mSeed 0
+            let !d       = fromIntegral ta - fromIntegral tb :: Double
+                !clipped = abs d > c
+                !st'     = updateHedge hcfg st d
+                !nclip'  = if clipped then nclip + 1 else nclip
+                !n'      = n + 1
+            if hsSupLogMix st' >= thresh
+              then pure $! Reject n' (hsSupLogMix st') nclip'
+              else go n' st' rng' nclip'
+  go 0 (initialHedge hcfg) mSeed 0
 
 -- | Convert a 'Hypothesis' into its /A\/A diagnostic/ form: 'sampleB'
 --   is replaced by 'sampleA', so the driver measures the same class
@@ -270,6 +271,119 @@ runPair meter cfg hyp flipOrder
       !y <- measure meter (cfgBatch cfg) (target hyp b)
       pure (x, y)
 {-# INLINE runPair #-}
+
+-- The K=4 hedge composition ------------------------------------------------
+
+-- Four e-processes running on the same per-pair @d@, combined via
+-- an outer convex hedge with uniform weights:
+--
+--   * /sign/: a two-sided Bernoulli test at @p_0 = 1\/2@ on
+--     @sign d@ (ties skipped, valid because non-tie steps are
+--     conditionally fair under symmetric @d@). No bounds, no
+--     warmup calibration; unbeatable against equal-mean shape
+--     leaks and heavy-tail scenarios where a small bulk shift
+--     moves @P(d > 0)@ off @1\/2@ but variance from the tail
+--     swamps the magnitude signal.
+--
+--   * /magn(c), magn(4c), magn(16c)/: three two-sided bounded-mean
+--     tests on @d@ clipped to progressively wider intervals. The
+--     tight bound gives the largest @lambda_max@ and dominates
+--     against small consistent bulk shifts; the wider bounds
+--     de-fragilize the single warmup-derived @c@ against
+--     rare-outlier leaks (a rarely-taken data-dependent branch
+--     showing up as occasional slow paths).
+--
+-- Each component is itself an e-process @E^i_t@ with
+-- @E[E^i_0] = 1@; their arithmetic mean @M_t = (1\/K) sum_i E^i_t@
+-- is again an e-process with @E[M_0] = 1@, and Ville gives
+-- @P(sup_t M_t >= 1\/alpha) <= alpha@. In terms of the
+-- @log_wealth = log(K^+ + K^-)@ each component exposes, that
+-- rejects when @sup_t log(sum_i (K^{i,+}_t + K^{i,-}_t))@ crosses
+-- @log(2K\/alpha) = log(8\/alpha)@ for @K = 4@.
+--
+-- The latch must be on the mixture's supremum, /not/ on the
+-- per-component suprema summed — the latter would use suprema from
+-- different times and can be much larger than the mixture ever
+-- actually reached, silently inflating the effective alpha.
+
+data HedgeCfg = HedgeCfg
+  { hcSign   :: !EPSign.Config
+  , hcMagn1  :: !EPMagn.Config
+  , hcMagn2  :: !EPMagn.Config
+  , hcMagn3  :: !EPMagn.Config
+  , hcC1     :: {-# UNPACK #-} !Double  -- tight clip level (base c)
+  , hcC2     :: {-# UNPACK #-} !Double  -- 4c
+  , hcC3     :: {-# UNPACK #-} !Double  -- 16c
+  , hcThresh :: {-# UNPACK #-} !Double  -- log(8 / alpha)
+  }
+
+data HedgeState = HedgeState
+  { hsSign      :: !EPSign.State
+  , hsMagn1     :: !EPMagn.State
+  , hsMagn2     :: !EPMagn.State
+  , hsMagn3     :: !EPMagn.State
+  , hsSupLogMix :: {-# UNPACK #-} !Double
+    -- ^ supremum-so-far of @log(sum_i K^i_t)@.
+  }
+
+mkHedgeCfg :: Double -> Double -> Either ConfigError HedgeCfg
+mkHedgeCfg !alpha !c = do
+  let !c2 = 4  * c
+      !c3 = 16 * c
+  !sc <- EPSign.config 0.5 alpha Newton
+  !m1 <- EPMagn.config 0 (negate c)  c  alpha Newton
+  !m2 <- EPMagn.config 0 (negate c2) c2 alpha Newton
+  !m3 <- EPMagn.config 0 (negate c3) c3 alpha Newton
+  pure HedgeCfg
+    { hcSign   = sc
+    , hcMagn1  = m1
+    , hcMagn2  = m2
+    , hcMagn3  = m3
+    , hcC1     = c
+    , hcC2     = c2
+    , hcC3     = c3
+    , hcThresh = log (8 / alpha)
+    }
+
+initialHedge :: HedgeCfg -> HedgeState
+initialHedge HedgeCfg{..} = HedgeState
+  { hsSign      = EPSign.initial hcSign
+  , hsMagn1     = EPMagn.initial hcMagn1
+  , hsMagn2     = EPMagn.initial hcMagn2
+  , hsMagn3     = EPMagn.initial hcMagn3
+  , hsSupLogMix = log 8
+    -- ^ each component starts at @log(K^+ + K^-) = log 2@, sum of
+    --   four exp's = 8.
+  }
+
+updateHedge :: HedgeCfg -> HedgeState -> Double -> HedgeState
+updateHedge HedgeCfg{..} HedgeState{..} !d =
+  let !s'  = if d == 0
+             then hsSign
+             else EPSign.update hcSign hsSign (d > 0)
+      !m1' = EPMagn.update hcMagn1 hsMagn1 (clipD hcC1 d)
+      !m2' = EPMagn.update hcMagn2 hsMagn2 (clipD hcC2 d)
+      !m3' = EPMagn.update hcMagn3 hsMagn3 (clipD hcC3 d)
+      !logMix = logSumExp4
+        (EPSign.log_wealth s')
+        (EPMagn.log_wealth m1')
+        (EPMagn.log_wealth m2')
+        (EPMagn.log_wealth m3')
+      !supMix = max hsSupLogMix logMix
+  in  HedgeState s' m1' m2' m3' supMix
+
+clipD :: Double -> Double -> Double
+clipD !lim !x
+  | abs x > lim = if x > 0 then lim else negate lim
+  | otherwise   = x
+{-# INLINE clipD #-}
+
+logSumExp4 :: Double -> Double -> Double -> Double -> Double
+logSumExp4 !a !b !c !d =
+  let !m = max (max a b) (max c d)
+  in  m + log ( exp (a - m) + exp (b - m)
+              + exp (c - m) + exp (d - m) )
+{-# INLINE logSumExp4 #-}
 
 -- The order-bit PRNG. Deterministic splitmix64 from a resolved
 -- seed. The conditional-null guarantee needs the per-pair order bit
