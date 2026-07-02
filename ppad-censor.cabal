@@ -1,7 +1,7 @@
 cabal-version:      3.0
 name:               ppad-censor
 version:            0.1.0
-synopsis:           Sequential constant-time testing for Haskell.
+synopsis:           Anytime-valid sequential constant-time testing.
 license:            MIT
 license-file:       LICENSE
 author:             Jared Tobin
