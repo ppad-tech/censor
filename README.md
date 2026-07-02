@@ -161,31 +161,34 @@ Haddocks (API documentation, etc.) are hosted at
 
 ## Performance
 
-The framework's per-pair overhead is small enough that the cost of a
-constant-time test is dominated by the target itself for any
-microsecond-or-slower target.
+The K=4 hedge runs four e-processes per pair plus a log-sum-exp
+composition, so the per-pair driver cost is a few times the single-
+e-process baseline. For any target that itself takes a microsecond
+or longer per call, that overhead is dominated by the target and is
+functionally invisible; for sub-microsecond noop targets it shows
+up as ~150 nanoseconds per pair.
 
-Current benchmark figures on an M4 Silicon MacBook Air look like
-(use `cabal bench` to run the benchmark suite):
+Current benchmark figures on an M4 Silicon MacBook Air (use
+`cabal bench` to reproduce):
 
 ```
   benchmarking runCT (noop target, const meter, batch=1)/budget=1000
-  time                 30.49 μs   (30.38 μs .. 30.65 μs)
+  time                 147.8 μs   (147.3 μs .. 148.3 μs)
                        1.000 R²   (1.000 R² .. 1.000 R²)
-  mean                 30.67 μs   (30.52 μs .. 30.86 μs)
-  std dev              411.9 ns   (350.4 ns .. 482.1 ns)
+  mean                 148.0 μs   (147.6 μs .. 148.4 μs)
+  std dev              1.236 μs   (968.0 ns .. 1.667 μs)
 
   benchmarking runCT (noop target, const meter, batch=1)/budget=10000
-  time                 289.3 μs   (288.8 μs .. 290.1 μs)
+  time                 1.451 ms   (1.448 ms .. 1.455 ms)
                        1.000 R²   (1.000 R² .. 1.000 R²)
-  mean                 289.5 μs   (289.1 μs .. 290.1 μs)
-  std dev              1.171 μs   (714.0 ns .. 1.946 μs)
+  mean                 1.448 ms   (1.446 ms .. 1.452 ms)
+  std dev              10.61 μs   (7.455 μs .. 17.21 μs)
 
   benchmarking runCT (noop target, const meter, batch=1)/budget=100000
-  time                 2.856 ms   (2.850 ms .. 2.864 ms)
-                       1.000 R²   (1.000 R² .. 1.000 R²)
-  mean                 2.862 ms   (2.859 ms .. 2.866 ms)
-  std dev              9.399 μs   (7.838 μs .. 11.80 μs)
+  time                 14.52 ms   (14.44 ms .. 14.67 ms)
+                       1.000 R²   (0.999 R² .. 1.000 R²)
+  mean                 14.49 ms   (14.46 ms .. 14.55 ms)
+  std dev              94.30 μs   (40.16 μs .. 183.2 μs)
 ```
 
 Per-pair allocation is linear in budget but independent of batch
@@ -196,18 +199,18 @@ proportional to the inner-loop count:
   runCT (noop target, const meter, batch=1)
 
     Case            Allocated  GCs
-    budget=100         59,656    0
-    budget=1000       167,656    0
-    budget=10000    1,247,656    0
-    budget=100000  12,047,656    2
+    budget=100         67,112    0
+    budget=1000       491,912    0
+    budget=10000    4,739,912    1
+    budget=100000  47,219,912   11
 
   runCT (noop target, const meter, budget=1000)
 
     Case        Allocated  GCs
-    batch=1       167,656    0
-    batch=10      167,656    0
-    batch=100     167,656    0
-    batch=1000    167,656    0
+    batch=1       491,912    0
+    batch=10      491,912    0
+    batch=100     491,912    0
+    batch=1000    491,912    0
 ```
 
 You should compile with the `llvm` flag for maximum performance.

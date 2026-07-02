@@ -15,12 +15,18 @@
 -- through an anytime-valid two-sample test, and either rejects (a
 -- leak is detected) or exhausts its budget.
 --
--- The wealth process is a nonnegative supermartingale under the null
--- (a notional bankroll that bets on the data and grows only when the
--- null is wrong; see "Numeric.Eproc.Bounded" for the details). The
+-- Internally the test is a four-way convex-hedge mixture of
+-- e-processes — a sign test at @p_0 = 1\/2@ on @sign d@ plus three
+-- bounded-mean tests on @d@ clipped to progressively wider intervals
+-- (see 'runCT' for the shape). Each component's wealth process is a
+-- nonnegative supermartingale under the null (a notional bankroll
+-- that bets on the data and grows only when the null is wrong; see
+-- "Numeric.Eproc.Bounded" for the mechanics). The mixture itself is
+-- an e-process by the same convex-combination argument, and the
 -- test is valid under optional stopping: 'runCT' halts as soon as
--- the wealth process crosses the threshold @2 \/ alpha@, with type-I
--- error controlled at @alpha@ regardless of when sampling stops.
+-- the mixture's log-wealth supremum crosses @log(8 \/ alpha)@, with
+-- type-I error controlled at @alpha@ regardless of when sampling
+-- stops.
 
 module Censor (
     -- * Hypothesis
@@ -124,13 +130,18 @@ defaultConfig = Config
 -- | Test outcome.
 --
 --   Both constructors carry the number of sample pairs consumed, the
---   peak (supremum-so-far) log-wealth of the underlying e-process,
---   and a clip count: the number of pairs whose absolute difference
---   @|d|@ exceeded the warmup-derived upper bound and were truncated
---   before being fed to the test. A clip count that is a substantial
---   fraction of @samples@ indicates the warmup bound was too tight;
---   raise 'cfgWarmup', enlarge 'cfgBatch', or treat the run with
---   suspicion (clipping reduces power against tail-shifting leaks).
+--   peak (supremum-so-far) log-wealth of the /mixture/
+--   @log(sum_i K^i)@ across the four hedged e-processes, and a clip
+--   count: the number of pairs whose absolute difference @|d|@
+--   exceeded the tight (@c@) warmup-derived upper bound. The peak
+--   log-wealth starts at @log 8@ (each of the four components
+--   starts at @log(K^+ + K^-) = log 2@); rejection is at
+--   @log(8 \/ alpha)@. A clip count that is a substantial fraction
+--   of @samples@ indicates the warmup bound was too tight for the
+--   tight component; raise 'cfgWarmup', enlarge 'cfgBatch', or
+--   treat the run with suspicion (the wider (@4c@, @16c@) magnitude
+--   components in the hedge still see the pre-clip @d@, but their
+--   @lambda_max@ is proportionally smaller).
 data Result
   = Reject
       {-# UNPACK #-} !Int     -- ^ sample pairs consumed
@@ -193,8 +204,8 @@ runCT :: Meter -> Config -> Hypothesis a -> IO Result
 runCT meter cfg hyp = do
   validateConfig cfg
   (!wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
-  (!c, !anyNonzero) <- warmup meter cfg hyp wSeed
-  unless anyNonzero $ throwIO WarmupZeroDuration
+  (!c, !meterResolves) <- warmup meter cfg hyp wSeed
+  unless meterResolves $ throwIO WarmupZeroDuration
   !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c of
     Left  e -> throwIO (InvalidEprocConfig e)
     Right x -> pure x
@@ -420,48 +431,59 @@ resolveSeeds mseed = do
       (_ , !w2) = splitMix s1
   pure (w1, w2)
 
--- Warmup collects per-pair @|d|@ (for the bound estimate) and a
--- boolean flag tracking whether any nonzero reading was ever
--- observed (for the meter-broken diagnosis). The order-bit
--- randomisation matches runCT's main loop so the p99 estimate
--- doesn't inherit a parity-locked nuisance bias.
+-- Warmup collects per-pair @|d|@ (for the bound estimate) and the
+-- flat list of per-class readings (for the meter-resolution
+-- diagnosis). The order-bit randomisation matches runCT's main
+-- loop so the p99 estimate doesn't inherit a parity-locked nuisance
+-- bias.
 --
--- Returns @(c, anyNonzero)@ where @c = max 1 (2 * p99(|d|))@ is the
--- clipping bound and @anyNonzero@ is True iff at least one warmup
--- reading was nonzero. If @anyNonzero@ is False the meter is broken
--- (returning 0 for everything) and the caller throws
--- 'WarmupZeroDuration'. All-zero /differences/ with nonzero readings
--- are the PMU-on-truly-CT happy path — we fall back to @c = 1@ and
--- let the main loop proceed; under continued zero differences the
--- wealth process stays flat and the run passes at budget.
+-- Returns @(c, meterResolves)@ where @c = max 1 (2 * p99(|d|))@ is
+-- the clipping bound and @meterResolves@ is True iff
+-- @p99(readings) > 0@ (i.e., the meter is producing nonzero readings
+-- often enough that at least the upper tail is resolved). If
+-- @meterResolves@ is False the meter's quantum is swallowing at
+-- least 99% of per-target timings and the caller throws
+-- 'WarmupZeroDuration' with the "raise cfgBatch" hint. All-zero
+-- /differences/ with well-resolved readings are the PMU-on-truly-CT
+-- happy path — we fall back to @c = 1@ and let the main loop
+-- proceed; under continued zero differences the wealth process
+-- stays flat and the run passes at budget.
 warmup :: Meter -> Config -> Hypothesis a -> Word64 -> IO (Double, Bool)
 warmup meter cfg hyp seed = do
-  let go !i !rng !acc !nz
-        | i >= cfgWarmup cfg = pure (acc, nz)
+  let go !i !rng !accD !accR
+        | i >= cfgWarmup cfg = pure (accD, accR)
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!x, !y) <- runPair meter cfg hyp flipOrder
             let !dx = fromIntegral x :: Double
                 !dy = fromIntegral y :: Double
                 !da = abs (dx - dy)
-                !nz' = nz || x /= 0 || y /= 0
-            go (i + 1) rng' (da : acc) nz'
-  (diffs, anyNonzero) <- go 0 seed [] False
-  let !sorted = sort diffs
-      !m      = length sorted
-      !idx    = max 0 (min (m - 1) ((m * 99) `div` 100))
-      !p99    = case drop idx sorted of
-                  (x : _) -> x
-                  []      -> 0
-  -- "p99" is fuzzy: at default cfgWarmup = 200 (m = 200) idx = 198,
-  -- so we take the 199th of 200 differences (empirical rank ~99.5%).
-  -- At cfgWarmup <= 100 (m <= 100) idx lands at m - 1, so p99
+            go (i + 1) rng' (da : accD) (x : y : accR)
+  (diffs, readings) <- go 0 seed [] []
+  let !p99d = orderStat99 diffs
+      !p99r = orderStat99 readings
+  -- "p99" is fuzzy: at default cfgWarmup = 200 (m = 200 diffs, m'
+  -- = 400 readings) idx lands at ~99.5% empirical rank. At small
+  -- warmup sizes (cfgWarmup <= 100 for diffs) idx = m - 1, so p99
   -- degenerates to the sample max — surfaced in the cfgWarmup
   -- docstring.
   --
-  -- 2x the order statistic gives headroom for occasional outliers;
-  -- observations above are clipped during the main pass. The
-  -- @max 1@ floor keeps @c > 0@ so the underlying e-process config
-  -- accepts it even when warmup differences are identically zero
-  -- (PMU on truly CT code).
-  pure (max 1 (2 * p99), anyNonzero)
+  -- 2x the order statistic on |d| gives headroom for occasional
+  -- outliers; observations above are clipped during the main pass.
+  -- The @max 1@ floor keeps @c > 0@ so the e-process configs accept
+  -- it even when warmup differences are identically zero (PMU on
+  -- truly CT code).
+  pure (max 1 (2 * p99d), p99r > 0)
+
+-- Empirical @~p99@ order statistic. Sorts and picks index
+-- @(m * 99) \/ 100@; degenerates to the sample max at small @m@
+-- (documented on 'cfgWarmup').
+orderStat99 :: Ord a => Num a => [a] -> a
+orderStat99 xs =
+  let !sorted = sort xs
+      !m      = length sorted
+      !idx    = max 0 (min (m - 1) ((m * 99) `div` 100))
+  in  case drop idx sorted of
+        (x : _) -> x
+        []      -> 0
+{-# INLINE orderStat99 #-}

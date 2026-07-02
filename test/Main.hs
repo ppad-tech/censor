@@ -21,6 +21,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , offByOneTests
   , clipCountTests
   , aaDiagnosticTests
+  , signOnlyLeakTests
   , smokeCalibrationTests
   ]
 
@@ -231,6 +232,44 @@ offByOneTests = testGroup "budget/decide off-by-one" [
         C.Pass n w _   -> assertFailure $
           "off-by-one regression: tight budget passed at n="
           ++ show n ++ " logW=" ++ show w
+  ]
+
+-- An equal-mean shape leak that /only/ the sign component of the
+-- hedge can detect. Class A returns 97 with probability 1/4 and 101
+-- with probability 3/4 (so E[ta] = 100), class B returns 100
+-- constantly. Then d = ta - tb has mean 0 (magnitude components
+-- can't grow wealth) but P(d > 0) = 3/4 (sign component grows fast).
+-- Guards the sign-component wiring per-commit; the equivalent
+-- coverage in censor-validate takes an hour.
+signOnlyLeakTests :: TestTree
+signOnlyLeakTests = testGroup "sign-only leak" [
+    testCase "equal-mean shape leak is rejected by the hedge" $ do
+      ref <- newIORef (0 :: Word64)
+      ctr <- newIORef (0 :: Int)
+      let leakMeter = C.Meter $ \k act ->
+            let go 0 = pure ()
+                go i = act >> go (i - 1)
+            in  go k >> readIORef ref
+          hyp = C.Hypothesis
+            { C.target  = writeIORef ref
+            , C.sampleA = do
+                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
+                pure $! if n `mod` 4 == 0 then 97 else 101
+            , C.sampleB = pure 100
+            }
+          c = C.defaultConfig
+            { C.cfgAlpha  = 1.0e-3
+            , C.cfgBudget = 5000
+            , C.cfgWarmup = 100
+            , C.cfgBatch  = 1
+            , C.cfgSeed   = Just 0xC0FFEE
+            }
+      r <- C.runCT leakMeter c hyp
+      case r of
+        C.Reject _ _ _ -> pure ()
+        C.Pass n w _   -> assertFailure $
+          "shape leak not detected; passed n=" ++ show n
+          ++ " logW=" ++ show w
   ]
 
 -- toAA collapses a leaky hypothesis into H_0 by construction —

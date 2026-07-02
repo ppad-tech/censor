@@ -63,7 +63,7 @@ library
       Censor.Meter
   build-depends:
       base >= 4.9 && < 5
-    , ppad-eproc >= 0.2 && < 0.3
+    , ppad-eproc >= 0.3 && < 0.4
 
 test-suite censor-tests
   type:                exitcode-stdio-1.0

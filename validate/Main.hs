@@ -263,6 +263,42 @@ scNarrowJitter !seed = Scenario "narrow-jitter" $ \_ -> do
   rb <- mkRng (seed + 1)
   pure (uniformInt ra 9990 10010, uniformInt rb 9990 10010)
 
+-- Rare-outlier H_0: both classes are 99% uniform[50,150] + 1%
+-- uniform[900,1100]. Independent draws, identical distributions,
+-- so the null holds. Included to verify that the multi-clip hedge
+-- doesn't spuriously reject under fat-tailed-but-symmetric structure
+-- (symmetric clipping preserves symmetry across all three magnitude
+-- components, so it shouldn't).
+scRareOutlier :: Word64 -> Scenario
+scRareOutlier !seed = Scenario "rare-outlier" $ \_ -> do
+  ra <- mkRng seed
+  rb <- mkRng (seed + 1)
+  let draw rng = do
+        u <- nextW64 rng
+        if u `mod` 100 == 0
+          then uniformInt rng 900 1100
+          else uniformInt rng 50  150
+  pure (draw ra, draw rb)
+
+-- Rare-outlier H_1: class A is pure bulk (uniform[50,150]); class B
+-- is 99% bulk + 1% spike (uniform[900,1100]). Both classes match in
+-- bulk, so the sign test and tight-clip magnitude see almost no
+-- signal (the 1% spikes shift @P(d > 0)@ by ~0.005 and get clipped
+-- away at bound @c@ by @magn(c)@). Only @magn(16c)@ preserves the
+-- spike signal — this is the scenario that exercises the multi-clip
+-- rationale for the hedge.
+scRareOutlierAsym :: Word64 -> Scenario
+scRareOutlierAsym !seed = Scenario "rare-outlier-asym" $ \_ -> do
+  ra <- mkRng seed
+  rb <- mkRng (seed + 1)
+  let drawA = uniformInt ra 50 150
+      drawB = do
+        u <- nextW64 rb
+        if u `mod` 100 == 0
+          then uniformInt rb 900 1100
+          else uniformInt rb 50  150
+  pure (drawA, drawB)
+
 -- All H_0 calibration scenarios.
 h0Scenarios :: [Scenario]
 h0Scenarios =
@@ -275,6 +311,7 @@ h0Scenarios =
   , scAllClipping       0x5EED06
   , scRegimeChange      0x5EED07
   , scNarrowJitter      0x5EED08
+  , scRareOutlier       0x5EED09
   ]
 
 -- A power scenario adds a positive shift to class B (so
@@ -364,12 +401,22 @@ edgeCaseCells =
     sc = scSymUniform 0xED6E01
 
 powerCells :: [Cell]
-powerCells =
-  [ Cell (addShift base shift) (baseCfg budget 1 1e-3) Nothing
-  | base   <- powerBases
-  , shift  <- powerShifts
-  , budget <- powerBudgets
-  ]
+powerCells = shiftedCells ++ asymCells
+  where
+    shiftedCells =
+      [ Cell (addShift base shift) (baseCfg budget 1 1e-3) Nothing
+      | base   <- powerBases
+      , shift  <- powerShifts
+      , budget <- powerBudgets
+      ]
+    -- The rare-outlier asymmetric H_1 encodes its leak in the tail
+    -- (spike rate), not in a scalar shift, so it doesn't ride
+    -- 'addShift'. Just two budget cells.
+    asymCells =
+      [ Cell (scRareOutlierAsym 0xB055ED04) (baseCfg budget 1 1e-3)
+             Nothing
+      | budget <- powerBudgets
+      ]
 
 -- runner ---------------------------------------------------------------------
 
