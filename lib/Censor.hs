@@ -196,7 +196,7 @@ runCT meter cfg hyp = do
     Right x -> pure x
   let go !n !st !rng !nclip
         | n >= cfgBudget cfg =
-            pure $! Pass n (EP.log_wealth st) nclip
+            pure $! Pass n (EP.log_wealth_sup st) nclip
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!ta, !tb) <- runPair meter cfg hyp flipOrder
@@ -209,7 +209,7 @@ runCT meter cfg hyp = do
                 !n'     = n + 1
             case EP.decide epCfg st' of
               EP.Reject ->
-                pure $! Reject n' (EP.log_wealth st') nclip'
+                pure $! Reject n' (EP.log_wealth_sup st') nclip'
               EP.Continue ->
                 go n' st' rng' nclip'
   go 0 (EP.initial epCfg) mSeed 0
