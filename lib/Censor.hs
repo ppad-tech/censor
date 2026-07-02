@@ -80,7 +80,13 @@ data Config = Config
   { cfgAlpha  :: !Double  -- ^ significance level
   , cfgBudget :: !Int     -- ^ max sample pairs to consume
   , cfgBatch  :: !Int     -- ^ target repetitions per timed region
-  , cfgWarmup :: !Int     -- ^ warmup samples per class
+  , cfgWarmup :: !Int     -- ^ warmup samples per class. The clip
+                          --   bound is set from the @~p99@ of
+                          --   @2 * cfgWarmup@ readings; at small
+                          --   warmup sizes the order-statistic
+                          --   discretisation degenerates to the
+                          --   sample maximum (specifically, any
+                          --   @cfgWarmup <= 50@ picks the max).
   } deriving Show
 
 -- | Defaults: @alpha = 1e-6@, budget @100000@ pairs, batch 1 (no
@@ -258,6 +264,12 @@ warmup meter cfg hyp = do
       !p99    = case drop idx sorted of
                   (x : _) -> x
                   []      -> 0
-  -- 2x the 99th percentile gives generous headroom for occasional
-  -- outliers; observations above are clipped during the main pass.
+  -- "p99" is fuzzy: at default cfgWarmup = 200 (m = 400) idx = 396,
+  -- so we take the 397th of 400 readings (empirical rank ~99.25%).
+  -- At cfgWarmup <= 50 (m <= 100) idx lands at m - 1, so p99
+  -- degenerates to the sample max — surfaced in the cfgWarmup
+  -- docstring.
+  --
+  -- 2x the order statistic gives headroom for occasional outliers;
+  -- observations above are clipped during the main pass.
   pure $! 2 * p99
