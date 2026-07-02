@@ -483,9 +483,24 @@ runCaseWith meter c name mkH = do
   h <- mkH
   r <- C.runCT meter c h
   case r of
-    C.Reject n w nc -> putStrLn $
-      "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
-      ++ ", clipped=" ++ show nc
+    C.Reject n w nc -> do
+      putStrLn $
+        "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
+        ++ ", clipped=" ++ show nc
+      -- A/A diagnostic: sampleA vs sampleA should always Pass. A
+      -- Reject here indicts the harness (unbalanced allocation, RTS
+      -- state, etc.) rather than the target, and the main result
+      -- above is not informative until the asymmetry is fixed.
+      putStrLn "    (running A/A diagnostic to attribute the reject...)"
+      hFlush stdout
+      hAA <- mkH
+      rAA <- C.runAA meter c hAA
+      case rAA of
+        C.Reject nA _ _ -> putStrLn $
+          "    A/A ALSO REJECT after " ++ show nA
+          ++ " — harness asymmetry, not a target leak"
+        C.Pass{} -> putStrLn
+          "    A/A PASS — target leak confirmed"
     C.Pass   n w nc -> putStrLn $
       "  PASS    after " ++ show n ++ " pairs, logW=" ++ show w
       ++ ", clipped=" ++ show nc
