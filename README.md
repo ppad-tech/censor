@@ -50,6 +50,35 @@ substantial fraction of `samples` indicates the warmup bound was
 too tight. Raise `cfgWarmup`, enlarge `cfgBatch`, or treat the run
 with suspicion.
 
+### A/A diagnostic
+
+Before trusting a `Reject` on a new hypothesis, run the A/A
+diagnostic to rule out harness asymmetry:
+
+```haskell
+result <- C.runAA meter C.defaultConfig hyp
+-- or, composably:
+result <- C.runCT meter C.defaultConfig (C.toAA hyp)
+```
+
+`toAA` replaces `sampleB` with `sampleA`, so both classes measure
+the same distribution — the A/A hypothesis is H_0 by construction
+and should always `Pass`. A `Reject` verdict on `toAA` indicts the
+*harness* (unbalanced allocation between the samplers, RTS state
+leaking between calls, unfair sample order) rather than a leak in
+the target; the real-hypothesis result is not informative until the
+asymmetry is fixed.
+
+### Reproducibility
+
+`cfgSeed :: Maybe Word64` in `Config` controls the per-pair A/B
+order-bit PRNG. The default `Nothing` draws fresh entropy from the
+monotonic clock per run, so the conditional independence of the
+order bit from any periodic ambient noise (timer interrupts,
+scheduler quanta) is a fact rather than an assumption. Pin
+`cfgSeed = Just s` when you want reproducible runs — for a CI
+tripwire, a debugging session, or a validation baseline.
+
 On Linux, `withCounter` swaps the wall-clock meter for a hardware
 performance counter, which is deterministic and immune to the
 frequency-scaling, cache, and scheduling noise that limits wall-clock

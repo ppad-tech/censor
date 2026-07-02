@@ -322,6 +322,10 @@ baseCfg !budget !batch !alpha = C.defaultConfig
   , C.cfgBudget = budget
   , C.cfgBatch  = batch
   , C.cfgWarmup = 200
+  , C.cfgSeed   = Just 0xBA5E11EDBA5E11ED
+    -- Pin the order-bit seed so the baseline CSV is reproducible
+    -- across runs. Production use of censor should leave cfgSeed at
+    -- the default 'Nothing' (fresh entropy per run).
   }
 
 -- Gated cells: alphas where it is feasible to PASS at our N. A

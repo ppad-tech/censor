@@ -20,6 +20,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , deterministicLeakTests
   , offByOneTests
   , clipCountTests
+  , aaDiagnosticTests
   , smokeCalibrationTests
   ]
 
@@ -230,6 +231,25 @@ offByOneTests = testGroup "budget/decide off-by-one" [
         C.Pass n w _   -> assertFailure $
           "off-by-one regression: tight budget passed at n="
           ++ show n ++ " logW=" ++ show w
+  ]
+
+-- toAA collapses a leaky hypothesis into H_0 by construction —
+-- sampleB is replaced by sampleA, so both classes measure the same
+-- distribution. A hypothesis that Rejects under runCT should Pass
+-- under runAA.
+aaDiagnosticTests :: TestTree
+aaDiagnosticTests = testGroup "A/A diagnostic" [
+    testCase "runAA passes a hypothesis that runCT would reject" $ do
+      (hyp, meter) <- leakHyp
+      -- Fixed seed to keep the test deterministic; the leak fixture
+      -- itself is deterministic in outcome regardless of order.
+      let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
+      r <- C.runAA meter c hyp
+      case r of
+        C.Pass _ _ _ -> pure ()
+        C.Reject n w _ -> assertFailure $
+          "A/A diagnostic falsely rejected at n=" ++ show n
+          ++ " logW=" ++ show w
   ]
 
 -- a tripwire calibration tier: run runCT a few hundred times under

@@ -39,6 +39,10 @@ module Censor (
     -- * Running
   , runCT
 
+    -- * A/A diagnostic
+  , toAA
+  , runAA
+
     -- * Measurement (re-exports)
   , Meter(..)
   , wallClock
@@ -52,6 +56,7 @@ import Control.Monad (unless)
 import qualified Data.Bits as B
 import Data.List (sort)
 import Data.Word (Word64)
+import GHC.Clock (getMonotonicTimeNSec)
 import qualified Numeric.Eproc.Bounded as EP
 import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
 
@@ -88,16 +93,28 @@ data Config = Config
                           --   discretisation degenerates to the
                           --   sample maximum (specifically, any
                           --   @cfgWarmup <= 100@ picks the max).
+  , cfgSeed   :: !(Maybe Word64)
+                          -- ^ seed for the per-pair A\/B order bit.
+                          --   'Nothing' (the default) draws fresh
+                          --   entropy per run, so the conditional
+                          --   independence of the order bit from
+                          --   any periodic ambient noise (timer
+                          --   interrupts, scheduler quanta) is a
+                          --   fact rather than an assumption.
+                          --   @Just s@ pins the seed for
+                          --   reproducibility.
   } deriving Show
 
 -- | Defaults: @alpha = 1e-6@, budget @100000@ pairs, batch 1 (no
---   inner repetition), warmup 200 pairs.
+--   inner repetition), warmup 200 pairs, order-bit seed drawn from
+--   entropy per run.
 defaultConfig :: Config
 defaultConfig = Config
   { cfgAlpha  = 1.0e-6
   , cfgBudget = 100000
   , cfgBatch  = 1
   , cfgWarmup = 200
+  , cfgSeed   = Nothing
   }
 
 -- | Test outcome.
@@ -171,7 +188,8 @@ instance Exception CensorError
 runCT :: Meter -> Config -> Hypothesis a -> IO Result
 runCT meter cfg hyp = do
   validateConfig cfg
-  (!c, !anyNonzero) <- warmup meter cfg hyp
+  (!wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
+  (!c, !anyNonzero) <- warmup meter cfg hyp wSeed
   unless anyNonzero $ throwIO WarmupZeroDuration
   !epCfg <- case EP.config 0 (negate c) c (cfgAlpha cfg) Newton of
     Left  e -> throwIO (InvalidEprocConfig e)
@@ -194,7 +212,32 @@ runCT meter cfg hyp = do
                 pure $! Reject n' (EP.log_wealth st') nclip'
               EP.Continue ->
                 go n' st' rng' nclip'
-  go 0 (EP.initial epCfg) mainSeed 0
+  go 0 (EP.initial epCfg) mSeed 0
+
+-- | Convert a 'Hypothesis' into its /A\/A diagnostic/ form: 'sampleB'
+--   is replaced by 'sampleA', so the driver measures the same class
+--   twice per pair.
+--
+--   Under a correctly-wired harness the A\/A hypothesis is by
+--   construction H_0 (identical distributions), so 'runCT' should
+--   always return 'Pass'. A 'Reject' verdict on 'toAA' indicts the
+--   /harness/ — asymmetric allocation between the samplers,
+--   time-of-day drift picked up by an unbalanced sample order, RTS
+--   state leaking between calls — rather than a leak in the target.
+--
+--   The typical usage is to run this before trusting a 'Reject' from
+--   a new hypothesis: if the A\/A form also rejects, the harness
+--   itself is at fault and the real-hypothesis result is not
+--   informative until the asymmetry is fixed.
+toAA :: Hypothesis a -> Hypothesis a
+toAA h = h { sampleB = sampleA h }
+{-# INLINE toAA #-}
+
+-- | Run the A\/A diagnostic. Equivalent to @'runCT' meter cfg
+--   ('toAA' hyp)@; should always 'Pass' if the harness is
+--   symmetric.
+runAA :: Meter -> Config -> Hypothesis a -> IO Result
+runAA meter cfg hyp = runCT meter cfg (toAA hyp)
 
 -- internal
 
@@ -228,11 +271,12 @@ runPair meter cfg hyp flipOrder
       pure (x, y)
 {-# INLINE runPair #-}
 
--- The order-bit PRNG. A deterministic splitmix64 stream is fine for
--- the conditional-null guarantee: what matters is that the per-pair
--- order bit is conditionally independent of past measurements, and
--- a PRNG seeded with a fixed constant depends only on the call
--- counter, never on the observed timings.
+-- The order-bit PRNG. Deterministic splitmix64 from a resolved
+-- seed. The conditional-null guarantee needs the per-pair order bit
+-- to be independent of the target's timing distribution; the seed
+-- itself only needs to be independent of that distribution too,
+-- which fresh entropy (default) or a user-supplied constant both
+-- satisfy.
 
 splitMix :: Word64 -> (Word64, Word64)
 splitMix !s =
@@ -249,9 +293,18 @@ nextOrderBit !s =
   in  (s', B.testBit w 0)
 {-# INLINE nextOrderBit #-}
 
-warmupSeed, mainSeed :: Word64
-warmupSeed = 0xCAFEBABEDEADBEEF
-mainSeed   = 0xDEADBEEFCAFEBABE
+-- Resolve the (warmup, main) seed pair. From a user-supplied
+-- constant we splitmix once to derive each slot; from entropy
+-- (Nothing) we take the current monotonic time and splitmix twice
+-- to decorrelate low-order bits from wall clock resolution.
+resolveSeeds :: Maybe Word64 -> IO (Word64, Word64)
+resolveSeeds mseed = do
+  !base <- case mseed of
+    Just s  -> pure s
+    Nothing -> getMonotonicTimeNSec
+  let (!s1, !w1) = splitMix base
+      (_ , !w2) = splitMix s1
+  pure (w1, w2)
 
 -- Warmup collects per-pair @|d|@ (for the bound estimate) and a
 -- boolean flag tracking whether any nonzero reading was ever
@@ -267,8 +320,8 @@ mainSeed   = 0xDEADBEEFCAFEBABE
 -- are the PMU-on-truly-CT happy path — we fall back to @c = 1@ and
 -- let the main loop proceed; under continued zero differences the
 -- wealth process stays flat and the run passes at budget.
-warmup :: Meter -> Config -> Hypothesis a -> IO (Double, Bool)
-warmup meter cfg hyp = do
+warmup :: Meter -> Config -> Hypothesis a -> Word64 -> IO (Double, Bool)
+warmup meter cfg hyp seed = do
   let go !i !rng !acc !nz
         | i >= cfgWarmup cfg = pure (acc, nz)
         | otherwise = do
@@ -279,7 +332,7 @@ warmup meter cfg hyp = do
                 !da = abs (dx - dy)
                 !nz' = nz || x /= 0 || y /= 0
             go (i + 1) rng' (da : acc) nz'
-  (diffs, anyNonzero) <- go 0 warmupSeed [] False
+  (diffs, anyNonzero) <- go 0 seed [] False
   let !sorted = sort diffs
       !m      = length sorted
       !idx    = max 0 (min (m - 1) ((m * 99) `div` 100))
