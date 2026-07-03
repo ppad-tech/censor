@@ -91,8 +91,10 @@ result <- C.runCT C.wallClock C.defaultConfig hyp
 ```
 
 (`Censor.Rng` provides the splitmix64 generator — `mkRng`,
-`nextWord` — that samplers typically build on: deterministic under
-a fixed seed, cheap, and allocation-light.)
+`nextWord`, `randomBytes` — that samplers typically build on:
+deterministic under a fixed seed, cheap, and allocation-light.
+`randomBytes` returns a strict, fully-forced `ByteString`, so a
+sampler can hand its result straight to the driver.)
 
 `Reject` and `Pass` carry the same run report: pairs consumed
 (`resPairs`), the mixture's peak log-wealth (`resPeakLogW`),

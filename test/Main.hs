@@ -4,6 +4,7 @@ module Main where
 
 import Control.Exception (try)
 import Control.Monad (replicateM_)
+import qualified Data.ByteString as BS
 import Data.IORef
 import Data.Word (Word8, Word64)
 import qualified Censor as C
@@ -27,6 +28,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , signOnlyLeakTests
   , fixVsRandomTests
   , rngTests
+  , randomBytesTests
   , fillRandomTests
   , smokeCalibrationTests
   ]
@@ -417,6 +419,42 @@ rngTests = testGroup "Censor.Rng" [
       w1 <- C.nextWord g1
       w2 <- C.nextWord g2
       assertBool "streams coincide" (w1 /= w2)
+  ]
+
+randomBytesTests :: TestTree
+randomBytesTests = testGroup "Censor.Rng.randomBytes" [
+    testCase "lengths, including ragged, empty, and negative" $ do
+      g <- C.mkRng 0xABCD
+      mapM_
+        (\n -> do
+            bs <- C.randomBytes g n
+            BS.length bs @?= max 0 n)
+        [-1, 0, 1, 7, 8, 13, 32]
+
+  , testCase "deterministic under a fixed seed" $ do
+      g1 <- C.mkRng 0xABCD
+      g2 <- C.mkRng 0xABCD
+      b1 <- C.randomBytes g1 33
+      b2 <- C.randomBytes g2 33
+      b1 @?= b2
+      assertBool "expected nonzero bytes" (BS.any (/= 0) b1)
+
+  , testCase "agrees with fillRandom on the same stream" $ do
+      let n = 13
+      g1 <- C.mkRng 0xABCD
+      bs <- C.randomBytes g1 n
+      g2 <- C.mkRng 0xABCD
+      ws <- allocaBytes n $ \p -> do
+        F.fillRandom g2 p n
+        peekArray n p
+      BS.unpack bs @?= ws
+
+  , testCase "a shorter draw is a prefix of a longer one" $ do
+      g1 <- C.mkRng 0xABCD
+      g2 <- C.mkRng 0xABCD
+      short <- C.randomBytes g1 13
+      long  <- C.randomBytes g2 32
+      short @?= BS.take 13 long
   ]
 
 fillRandomTests :: TestTree

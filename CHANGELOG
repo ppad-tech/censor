@@ -19,8 +19,11 @@
     asymmetry, or pervasive harness asymmetry).
   * Add 'Censor.Rng', the splitmix64 sampler PRNG previously
     hand-rolled by every executable, re-exported from 'Censor'.
-  * Add 'Censor.FFI.fillRandom' for filling foreign workspaces
-    with sampler randomness.
+    Alongside the generator it provides 'randomBytes' (draw a
+    strict, fully-forced pseudorandom ByteString, suitable for
+    returning directly from a sampler; also re-exported from
+    'Censor') and 'fillRandom' for filling foreign workspaces
+    with sampler randomness (re-exported from 'Censor.FFI').
   * The demo executables take the meter as a command-line
     argument (wall | instructions | branches | cycles),
     defaulting to wall-clock, instead of silently falling back
