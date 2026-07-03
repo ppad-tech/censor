@@ -23,13 +23,21 @@ module Censor.Rng (
   , mkRng
   , nextWord
 
+    -- * Byte fills
+  , randomBytes
+  , fillRandom
+
     -- * Pure step
   , splitMix
   ) where
 
 import qualified Data.Bits as B
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BI
 import Data.IORef
-import Data.Word (Word64)
+import Data.Word (Word8, Word64)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (pokeByteOff)
 
 -- | splitmix64 state threaded through an 'IORef'.
 newtype Rng = Rng (IORef Word64)
@@ -54,3 +62,39 @@ splitMix !s =
       !z2 =  z1 `B.xor` (z1 `B.shiftR` 31)
   in  (s', z2)
 {-# INLINE splitMix #-}
+
+-- | Draw @n@ pseudorandom bytes as a strict 'BS.ByteString'.
+--
+--   The result is a fresh, fully-materialised heap value -- no
+--   thunks for the meter to pay inside the timed region -- so a
+--   sampler can return it directly.
+randomBytes :: Rng -> Int -> IO BS.ByteString
+randomBytes !g !n
+  | n <= 0    = pure BS.empty
+  | otherwise = BI.create n $ \p -> fillRandom g p n
+
+-- | Fill @n@ bytes at the pointer with pseudorandom bytes drawn
+--   from the generator.
+fillRandom :: Rng -> Ptr Word8 -> Int -> IO ()
+fillRandom !g !dst !n = go 0
+  where
+    go !i
+      | i >= n    = pure ()
+      | otherwise = do
+          !w <- nextWord g
+          let !left  = n - i
+              !chunk = if left > 8 then 8 else left
+          writeWord dst i w chunk
+          go (i + chunk)
+
+-- write the low @lim@ bytes of a 'Word64', little-endian, at the
+-- given offset.
+writeWord :: Ptr Word8 -> Int -> Word64 -> Int -> IO ()
+writeWord !dst !off !w !lim = go 0
+  where
+    go !j
+      | j >= lim  = pure ()
+      | otherwise = do
+          let !byte = fromIntegral (w `B.shiftR` (8 * j)) :: Word8
+          pokeByteOff dst (off + j) byte
+          go (j + 1)

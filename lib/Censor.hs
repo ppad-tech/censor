@@ -65,6 +65,7 @@ module Censor (
   , Rng
   , mkRng
   , nextWord
+  , randomBytes
   ) where
 
 import Control.Exception (Exception, throwIO)
@@ -78,7 +79,7 @@ import qualified Numeric.Eproc.Bounded as EPMagn
 import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
 
 import Censor.Meter
-import Censor.Rng (Rng, mkRng, nextWord, splitMix)
+import Censor.Rng (Rng, mkRng, nextWord, randomBytes, splitMix)
 
 -- | A constant-time hypothesis.
 --

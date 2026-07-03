@@ -26,10 +26,10 @@
 module Main where
 
 import Control.Exception (evaluate, try)
-import Control.Monad (replicateM, replicateM_)
+import Control.Monad (replicateM_)
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
-import Data.Word (Word8, Word32, Word64)
+import Data.Word (Word32, Word64)
 import qualified System.Environment as Env
 import System.Exit (die)
 import System.IO (hFlush, hSetBuffering, stdout, BufferMode(..))
@@ -64,26 +64,11 @@ randomMont g = do
   !w <- randomWider g
   evaluate (MS.to w)
 
--- a random n-byte ByteString in NF. used to build keys, nonces,
--- messages, AAD, plaintexts for the cryptographic hypotheses.
--- constructed at sample time, outside the timed region; replicateM
--- is justified -- it builds a fixed-length list of pre-forced
--- Word64s, immediately flattened into a strict ByteString that
--- 'evaluate' fully forces.
-randomBytes :: C.Rng -> Int -> IO BS.ByteString
-randomBytes g n = do
-  let !nws = (n + 7) `quot` 8
-  ws <- replicateM nws (C.nextWord g)
-  evaluate $! BS.take n $ BS.pack
-    [ fromIntegral (w `B.shiftR` (8 * i)) :: Word8
-    | w <- ws, i <- [0 .. 7 :: Int]
-    ]
-
 random32 :: C.Rng -> IO BS.ByteString
-random32 g = randomBytes g 32
+random32 g = C.randomBytes g 32
 
 random12 :: C.Rng -> IO BS.ByteString
-random12 g = randomBytes g 12
+random12 g = C.randomBytes g 12
 
 -- every hypothesis seeds its own generator with this, so the pinned
 -- secret (the stream's first draw) is reproducible across runs.
@@ -208,7 +193,7 @@ posAEADEncrypt = do
     (\key -> do
         !nonce <- random12 g
         !aad   <- random32 g
-        !pt    <- randomBytes g 256
+        !pt    <- C.randomBytes g 256
         pure (key, nonce, aad, pt))
 
 -- positive control: AEAD-ChaCha20-Poly1305 decrypt on a valid
@@ -225,7 +210,7 @@ posAEADDecrypt = do
   let mkSample !key = do
         !nonce <- random12 g
         !aad   <- random32 g
-        !pt    <- randomBytes g 256
+        !pt    <- C.randomBytes g 256
         case AEAD.encrypt aad key nonce pt of
           Left _ -> error
             "censor-demo: AEAD encrypt failed during sample setup"
@@ -255,7 +240,7 @@ posHMACSHA256 = do
         pure ())
     (random32 g)
     (\key -> do
-        !msg <- randomBytes g 256
+        !msg <- C.randomBytes g 256
         pure (key, msg))
 
 -- positive control: HMAC-SHA512 with a secret key. Same structure
@@ -269,7 +254,7 @@ posHMACSHA512 = do
         pure ())
     (random32 g)
     (\key -> do
-        !msg <- randomBytes g 256
+        !msg <- C.randomBytes g 256
         pure (key, msg))
 
 -- positive control: constant-time MAC equality. The == on 'MAC'
@@ -297,10 +282,10 @@ posMACEq = do
         -- same-object-vs-distinct-objects asymmetry, rather than
         -- the equal-vs-unequal walk under test.
         !k    <- random32 g
-        !m    <- randomBytes g 256
+        !m    <- C.randomBytes g 256
         !tagX <- evaluate $! SHA256.hmac k m
         !_    <- random32 g
-        !_    <- randomBytes g 256
+        !_    <- C.randomBytes g 256
         !tagY <- evaluate $! SHA256.hmac k m
         pure (tagX, tagY)
     , C.sampleB = do
@@ -308,10 +293,10 @@ posMACEq = do
         -- negligible probability, so '==' walks all bytes and
         -- returns False.
         !k1   <- random32 g
-        !m1   <- randomBytes g 256
+        !m1   <- C.randomBytes g 256
         !tag1 <- evaluate $! SHA256.hmac k1 m1
         !k2   <- random32 g
-        !m2   <- randomBytes g 256
+        !m2   <- C.randomBytes g 256
         !tag2 <- evaluate $! SHA256.hmac k2 m2
         pure (tag1, tag2)
     }
@@ -324,7 +309,7 @@ posBIP32Derive :: IO (C.Hypothesis (BIP32.HDKey, Word32))
 posBIP32Derive = do
   g <- C.mkRng fixedSeed
   let sampleHD = do
-        !seed <- randomBytes g 64
+        !seed <- C.randomBytes g 64
         case BIP32.master seed of
           Just h  -> evaluate h
           Nothing -> error
