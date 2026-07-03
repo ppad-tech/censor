@@ -21,12 +21,14 @@
 -- (see 'runCT' for the shape). Each component's wealth process is a
 -- nonnegative supermartingale under the null (a notional bankroll
 -- that bets on the data and grows only when the null is wrong; see
--- "Numeric.Eproc.Bounded" for the mechanics). The mixture itself is
--- an e-process by the same convex-combination argument, and the
--- test is valid under optional stopping: 'runCT' halts as soon as
--- the mixture's log-wealth supremum crosses @log(8 \/ alpha)@, with
--- type-I error controlled at @alpha@ regardless of when sampling
--- stops.
+-- "Numeric.Eproc.Bounded" for the mechanics). The convex
+-- combination is delegated to "Numeric.Eproc.Mixture": the mixture
+-- is itself an e-process, and the test is valid under optional
+-- stopping — 'runCT' halts as soon as the mixture e-value crosses
+-- @1 \/ alpha@, with type-I error controlled at @alpha@ regardless
+-- of when sampling stops. Alongside the verdict, the driver
+-- reports the mixture's anytime-valid p-value and per-component
+-- peak evidence on the calibrated e-value scale.
 
 module Censor (
     -- * Hypothesis
@@ -76,6 +78,8 @@ import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import qualified Numeric.Eproc.Bernoulli.TwoSided as EPSign
 import qualified Numeric.Eproc.Bounded as EPMagn
+import qualified Numeric.Eproc.ConfSeq as EPCS
+import qualified Numeric.Eproc.Mixture as EPMix
 import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
 
 import Censor.Meter
@@ -185,15 +189,20 @@ defaultConfig = Config
 --   no leak was detected within budget. Both constructors carry the
 --   same run report.
 --
---   The peak log-wealth of the /mixture/ starts at @log 8@ (each of
---   the four hedged components starts at @log(K^+ + K^-) = log 2@);
---   rejection is at @log(8 \/ alpha)@. A clip count that is a
---   substantial fraction of 'resPairs' indicates the warmup bound
---   'resBound' was too tight for the tight component; raise
---   'cfgWarmup', enlarge 'cfgBatch', or treat the run with suspicion
---   (the wider (@4c@, @16c@) magnitude components in the hedge still
---   see the pre-clip @d@, but their @lambda_max@ is proportionally
---   smaller).
+--   All evidence fields are reported on the calibrated log e-value
+--   scale: a fresh run sits at @0@, and the mixture rejects when
+--   its supremum-so-far ('resPeakLogW') crosses @log(1 \/ alpha)@.
+--   'resPValue' is the same evidence expressed as an anytime-valid
+--   p-value: monotone nonincreasing, valid at any data-dependent
+--   stopping time, and at or below @alpha@ exactly when the verdict
+--   is 'Reject'.
+--
+--   A clip count that is a substantial fraction of 'resPairs'
+--   indicates the warmup bound 'resBound' was too tight for the
+--   tight component; raise 'cfgWarmup', enlarge 'cfgBatch', or
+--   treat the run with suspicion (the wider (@4c@, @16c@) magnitude
+--   components in the hedge still see the pre-clip @d@, but their
+--   @lambda_max@ is proportionally smaller).
 --
 --   The per-component peaks identify which evidence channel drove a
 --   rejection: 'resPeakSign' growing points at a distributional
@@ -207,8 +216,28 @@ data Result
       { resPairs      :: {-# UNPACK #-} !Int
         -- ^ sample pairs consumed.
       , resPeakLogW   :: {-# UNPACK #-} !Double
-        -- ^ peak (supremum-so-far) log-wealth of the mixture,
-        --   @sup_t log(sum_i K^i_t)@.
+        -- ^ peak (supremum-so-far) log e-value of the mixture;
+        --   starts at @0@, crosses @log(1 \/ alpha)@ on rejection.
+      , resPValue     :: {-# UNPACK #-} !Double
+        -- ^ the anytime-valid p-value @min 1 (exp -resPeakLogW)@;
+        --   at or below @cfgAlpha@ iff the verdict is 'Reject'.
+      , resEffect     :: !(Double, Double)
+        -- ^ anytime-valid @1 - cfgAlpha@ confidence interval for
+        --   the mean of @d@ clipped to @[-16c, 16c]@, in meter
+        --   units per batch (divide by 'cfgBatch' for per-call).
+        --   Covers zero on a truly constant-time target; brackets
+        --   the shift magnitude of the clipped difference on a
+        --   leaky one. Valid at the data-dependent stopping time,
+        --   so it may be wide when a strong leak halts the run
+        --   early. On long runs the evidence can pin the mean
+        --   below the estimation grid's resolution (the grid is
+        --   exhausted; see 'Numeric.Eproc.ConfSeq.interval'); the
+        --   interval reported is then the last resolvable one --
+        --   at most a few grid steps wide, and still covering the
+        --   true mean under the same time-uniform guarantee, since
+        --   the sequence's intervals are nested. The interval's
+        --   coverage and the verdict's type-I control are separate
+        --   marginal guarantees, each at 'cfgAlpha'.
       , resClipped    :: {-# UNPACK #-} !Int
         -- ^ pairs whose @|d|@ exceeded 'resBound' and was clipped
         --   before reaching the tight magnitude component.
@@ -216,17 +245,19 @@ data Result
         -- ^ the tight clip bound @c@ estimated during warmup
         --   (@max 1 (2 * p99(|d|))@).
       , resPeakSign   :: {-# UNPACK #-} !Double
-        -- ^ peak log-wealth of the sign component.
+        -- ^ peak log e-value of the sign component.
       , resPeakMagn   :: {-# UNPACK #-} !Double
-        -- ^ peak log-wealth of the magnitude component at @c@.
+        -- ^ peak log e-value of the magnitude component at @c@.
       , resPeakMagn4  :: {-# UNPACK #-} !Double
-        -- ^ peak log-wealth of the magnitude component at @4c@.
+        -- ^ peak log e-value of the magnitude component at @4c@.
       , resPeakMagn16 :: {-# UNPACK #-} !Double
-        -- ^ peak log-wealth of the magnitude component at @16c@.
+        -- ^ peak log e-value of the magnitude component at @16c@.
       }
   | Pass
       { resPairs      :: {-# UNPACK #-} !Int
       , resPeakLogW   :: {-# UNPACK #-} !Double
+      , resPValue     :: {-# UNPACK #-} !Double
+      , resEffect     :: !(Double, Double)
       , resClipped    :: {-# UNPACK #-} !Int
       , resBound      :: {-# UNPACK #-} !Double
       , resPeakSign   :: {-# UNPACK #-} !Double
@@ -273,6 +304,12 @@ instance Exception CensorError
 --      test. Halt as soon as the wealth process crosses threshold,
 --      or when the budget is exhausted.
 --
+--   The main phase also feeds @d@ clipped to the widest hedge
+--   interval @[-16c, 16c]@ into an anytime-valid confidence
+--   sequence ("Numeric.Eproc.ConfSeq") for its mean, reported as
+--   'resEffect': the effect size of a detected leak, in meter
+--   units. Warmup pairs are excluded (they fix the bounds).
+--
 --   Because the order bit is randomised per pair, @d@ is
 --   conditionally symmetric about zero under H_0 (not just conditional
 --   mean zero); symmetric clipping is odd and preserves the null.
@@ -290,25 +327,45 @@ runCT meter cfg hyp = do
   !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c of
     Left  e -> throwIO (InvalidEprocConfig e)
     Right x -> pure x
-  let !thresh = hcThresh hcfg
-      finish ctor !n !st !nclip = ctor
-        n (hsSupLogMix st) nclip c
-        (hsSupSign st) (hsSupMagn1 st) (hsSupMagn2 st) (hsSupMagn3 st)
-      go !n !st !rng !nclip
+  !cscfg <- case EPCS.config (negate (hcC3 hcfg)) (hcC3 hcfg)
+                   (cfgAlpha cfg) effectGrid of
+    Left  e -> throwIO (InvalidEprocConfig e)
+    Right x -> pure x
+  let !mixc = hcMix hcfg
+      finish ctor !n !st !iv !nclip = ctor
+        n (EPMix.log_evalue_sup mixc (hsMix st))
+        (EPMix.p_value mixc (hsMix st))
+        iv
+        nclip c
+        (EPSign.log_evalue_sup (hsSign st))
+        (EPMagn.log_evalue_sup (hsMagn1 st))
+        (EPMagn.log_evalue_sup (hsMagn2 st))
+        (EPMagn.log_evalue_sup (hsMagn3 st))
+      -- the effect interval is latched: once the evidence pins the
+      -- mean below the grid's resolution the survivor set empties,
+      -- and the last resolvable interval (nested within all earlier
+      -- ones, so still covered by the time-uniform guarantee) is
+      -- what finish reports.
+      go !n !st !cs !iv !rng !nclip
         | n >= cfgBudget cfg =
-            pure $! finish Pass n st nclip
+            pure $! finish Pass n st iv nclip
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!ta, !tb) <- runPair meter cfg hyp flipOrder
             let !d       = fromIntegral ta - fromIntegral tb :: Double
                 !clipped = abs d > c
                 !st'     = updateHedge hcfg st d
+                !cs'     = EPCS.update cscfg cs (clipD (hcC3 hcfg) d)
+                !iv'     = case EPCS.interval cscfg cs' of
+                             Just x  -> x
+                             Nothing -> iv
                 !nclip'  = if clipped then nclip + 1 else nclip
                 !n'      = n + 1
-            if hsSupLogMix st' >= thresh
-              then pure $! finish Reject n' st' nclip'
-              else go n' st' rng' nclip'
-  go 0 (initialHedge hcfg) mSeed 0
+            case EPMix.decide mixc (hsMix st') of
+              EPMix.Reject -> pure $! finish Reject n' st' iv' nclip'
+              _            -> go n' st' cs' iv' rng' nclip'
+      !iv0 = (negate (hcC3 hcfg), hcC3 hcfg)
+  go 0 (initialHedge hcfg) (EPCS.initial cscfg) iv0 mSeed 0
 
 -- | Convert a 'Hypothesis' into its /A\/A diagnostic/ form: 'sampleB'
 --   is replaced by 'sampleA', so the driver measures the same class
@@ -419,7 +476,7 @@ runPair meter cfg hyp flipOrder
 -- The K=4 hedge composition ------------------------------------------------
 
 -- Four e-processes running on the same per-pair @d@, combined via
--- an outer convex hedge with uniform weights:
+-- "Numeric.Eproc.Mixture" (a uniform convex hedge):
 --
 --   * /sign/: a two-sided Bernoulli test at @p_0 = 1\/2@ on
 --     @sign d@ (ties skipped, valid because non-tie steps are
@@ -437,45 +494,32 @@ runPair meter cfg hyp flipOrder
 --     rare-outlier leaks (a rarely-taken data-dependent branch
 --     showing up as occasional slow paths).
 --
--- Each component is itself an e-process @E^i_t@ with
--- @E[E^i_0] = 1@; their arithmetic mean @M_t = (1\/K) sum_i E^i_t@
--- is again an e-process with @E[M_0] = 1@, and Ville gives
--- @P(sup_t M_t >= 1\/alpha) <= alpha@. In terms of the
--- @log_wealth = log(K^+ + K^-)@ each component exposes, that
--- rejects when @sup_t log(sum_i (K^{i,+}_t + K^{i,-}_t))@ crosses
--- @log(2K\/alpha) = log(8\/alpha)@ for @K = 4@.
---
--- The latch must be on the mixture's supremum, /not/ on the
--- per-component suprema summed — the latter would use suprema from
--- different times and can be much larger than the mixture ever
--- actually reached, silently inflating the effective alpha.
+-- The driver steps each component itself (they are heterogeneous)
+-- and feeds the vector of their calibrated log e-values to
+-- 'EPMix.update' once per pair, upholding the mixture's lockstep
+-- precondition: on a tie the sign component's e-value is simply
+-- unchanged, which is still its current value at that step. The
+-- mixture owns the rejection latch (the supremum of the /mixture's/
+-- log e-value, never per-component suprema, which peak at different
+-- times) and the threshold @log(K \/ alpha)@ on the component sum.
 
 data HedgeCfg = HedgeCfg
-  { hcSign   :: !EPSign.Config
-  , hcMagn1  :: !EPMagn.Config
-  , hcMagn2  :: !EPMagn.Config
-  , hcMagn3  :: !EPMagn.Config
-  , hcC1     :: {-# UNPACK #-} !Double  -- tight clip level (base c)
-  , hcC2     :: {-# UNPACK #-} !Double  -- 4c
-  , hcC3     :: {-# UNPACK #-} !Double  -- 16c
-  , hcThresh :: {-# UNPACK #-} !Double  -- log(8 / alpha)
+  { hcSign  :: !EPSign.Config
+  , hcMagn1 :: !EPMagn.Config
+  , hcMagn2 :: !EPMagn.Config
+  , hcMagn3 :: !EPMagn.Config
+  , hcMix   :: !EPMix.Config
+  , hcC1    :: {-# UNPACK #-} !Double  -- tight clip level (base c)
+  , hcC2    :: {-# UNPACK #-} !Double  -- 4c
+  , hcC3    :: {-# UNPACK #-} !Double  -- 16c
   }
 
 data HedgeState = HedgeState
-  { hsSign      :: !EPSign.State
-  , hsMagn1     :: !EPMagn.State
-  , hsMagn2     :: !EPMagn.State
-  , hsMagn3     :: !EPMagn.State
-  , hsSupLogMix :: {-# UNPACK #-} !Double
-    -- ^ supremum-so-far of @log(sum_i K^i_t)@.
-  , hsSupSign   :: {-# UNPACK #-} !Double
-    -- ^ supremum-so-far of the sign component's log-wealth.
-  , hsSupMagn1  :: {-# UNPACK #-} !Double
-    -- ^ ditto, magnitude at @c@.
-  , hsSupMagn2  :: {-# UNPACK #-} !Double
-    -- ^ ditto, magnitude at @4c@.
-  , hsSupMagn3  :: {-# UNPACK #-} !Double
-    -- ^ ditto, magnitude at @16c@.
+  { hsSign  :: !EPSign.State
+  , hsMagn1 :: !EPMagn.State
+  , hsMagn2 :: !EPMagn.State
+  , hsMagn3 :: !EPMagn.State
+  , hsMix   :: !EPMix.State
   }
 
 mkHedgeCfg :: Double -> Double -> Either ConfigError HedgeCfg
@@ -486,30 +530,25 @@ mkHedgeCfg !alpha !c = do
   !m1 <- EPMagn.config 0 (negate c)  c  alpha Newton
   !m2 <- EPMagn.config 0 (negate c2) c2 alpha Newton
   !m3 <- EPMagn.config 0 (negate c3) c3 alpha Newton
+  !mx <- EPMix.config 4 alpha
   pure HedgeCfg
-    { hcSign   = sc
-    , hcMagn1  = m1
-    , hcMagn2  = m2
-    , hcMagn3  = m3
-    , hcC1     = c
-    , hcC2     = c2
-    , hcC3     = c3
-    , hcThresh = log (8 / alpha)
+    { hcSign  = sc
+    , hcMagn1 = m1
+    , hcMagn2 = m2
+    , hcMagn3 = m3
+    , hcMix   = mx
+    , hcC1    = c
+    , hcC2    = c2
+    , hcC3    = c3
     }
 
 initialHedge :: HedgeCfg -> HedgeState
 initialHedge HedgeCfg{..} = HedgeState
-  { hsSign      = EPSign.initial hcSign
-  , hsMagn1     = EPMagn.initial hcMagn1
-  , hsMagn2     = EPMagn.initial hcMagn2
-  , hsMagn3     = EPMagn.initial hcMagn3
-  , hsSupLogMix = log 8
-    -- ^ each component starts at @log(K^+ + K^-) = log 2@, sum of
-    --   four exp's = 8.
-  , hsSupSign   = log 2
-  , hsSupMagn1  = log 2
-  , hsSupMagn2  = log 2
-  , hsSupMagn3  = log 2
+  { hsSign  = EPSign.initial hcSign
+  , hsMagn1 = EPMagn.initial hcMagn1
+  , hsMagn2 = EPMagn.initial hcMagn2
+  , hsMagn3 = EPMagn.initial hcMagn3
+  , hsMix   = EPMix.initial hcMix
   }
 
 updateHedge :: HedgeCfg -> HedgeState -> Double -> HedgeState
@@ -520,21 +559,18 @@ updateHedge HedgeCfg{..} HedgeState{..} !d =
       !m1' = EPMagn.update hcMagn1 hsMagn1 (clipD hcC1 d)
       !m2' = EPMagn.update hcMagn2 hsMagn2 (clipD hcC2 d)
       !m3' = EPMagn.update hcMagn3 hsMagn3 (clipD hcC3 d)
-      !lwS = EPSign.log_wealth s'
-      !lw1 = EPMagn.log_wealth m1'
-      !lw2 = EPMagn.log_wealth m2'
-      !lw3 = EPMagn.log_wealth m3'
-      !logMix = logSumExp4 lwS lw1 lw2 lw3
+      !x'  = EPMix.update hcMix hsMix
+               [ EPSign.log_evalue s'
+               , EPMagn.log_evalue m1'
+               , EPMagn.log_evalue m2'
+               , EPMagn.log_evalue m3'
+               ]
   in  HedgeState
-        { hsSign      = s'
-        , hsMagn1     = m1'
-        , hsMagn2     = m2'
-        , hsMagn3     = m3'
-        , hsSupLogMix = max hsSupLogMix logMix
-        , hsSupSign   = max hsSupSign lwS
-        , hsSupMagn1  = max hsSupMagn1 lw1
-        , hsSupMagn2  = max hsSupMagn2 lw2
-        , hsSupMagn3  = max hsSupMagn3 lw3
+        { hsSign  = s'
+        , hsMagn1 = m1'
+        , hsMagn2 = m2'
+        , hsMagn3 = m3'
+        , hsMix   = x'
         }
 
 clipD :: Double -> Double -> Double
@@ -543,12 +579,15 @@ clipD !lim !x
   | otherwise   = x
 {-# INLINE clipD #-}
 
-logSumExp4 :: Double -> Double -> Double -> Double -> Double
-logSumExp4 !a !b !c !d =
-  let !m = max (max a b) (max c d)
-  in  m + log ( exp (a - m) + exp (b - m)
-              + exp (c - m) + exp (d - m) )
-{-# INLINE logSumExp4 #-}
+-- The effect-estimation grid: interior candidate means over
+-- @[-16c, 16c]@ for the confidence sequence behind 'resEffect'.
+-- 300 candidates resolve the interval endpoints to ~0.1c,
+-- comparable to the shift scale the tight magnitude component can
+-- detect; the per-pair update cost is O(live candidates), falls as
+-- evidence rejects candidates, and sits outside the timed region
+-- (and is order-symmetric), so measurement hygiene is unaffected.
+effectGrid :: Int
+effectGrid = 300
 
 -- The order-bit PRNG. Deterministic splitmix64 (from "Censor.Rng")
 -- threaded from a resolved seed. The conditional-null guarantee

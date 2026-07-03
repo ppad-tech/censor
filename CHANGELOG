@@ -1,6 +1,27 @@
 # Changelog
 
 - Unreleased
+  * Bump to ppad-eproc 0.4. The K=4 hedge's convex combination,
+    rejection latch, and threshold are now delegated to
+    Numeric.Eproc.Mixture; decisions are unchanged.
+  * Evidence in 'Result' is now reported on the calibrated log
+    e-value scale: 'resPeakLogW' and the per-component peaks start
+    at 0, and the mixture rejects when 'resPeakLogW' crosses
+    log(1/alpha). (Previously the fields carried raw log-wealths
+    starting at log 8 and log 2 respectively.)
+  * Add 'resPValue', the mixture's anytime-valid p-value: monotone
+    nonincreasing, valid at any data-dependent stopping time, and
+    at or below 'cfgAlpha' exactly when the verdict is 'Reject'.
+  * Add 'resEffect', an anytime-valid 1 - alpha confidence interval
+    (Numeric.Eproc.ConfSeq: the Waudby-Smith--Ramdas hedged-capital
+    construction) for the mean of d clipped to [-16c, 16c], in
+    meter units per batch: the effect size of a detected leak, or a
+    bound on any undetected one. If the evidence pins the mean
+    below the estimation grid's resolution, the last resolvable
+    interval is reported; nesting keeps it covered by the same
+    time-uniform guarantee.
+  * The demo executables print the anytime-valid p-value and the
+    effect interval for every case.
   * 'Result' constructors now carry named fields: 'resPairs',
     'resPeakLogW', and 'resClipped' replace the positional
     fields, joined by the warmup-derived clip bound ('resBound')

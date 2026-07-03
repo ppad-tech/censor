@@ -97,17 +97,39 @@ deterministic under a fixed seed, cheap, and allocation-light.
 sampler can hand its result straight to the driver.)
 
 `Reject` and `Pass` carry the same run report: pairs consumed
-(`resPairs`), the mixture's peak log-wealth (`resPeakLogW`),
-per-component peak log-wealths (`resPeakSign`, `resPeakMagn`,
-`resPeakMagn4`, `resPeakMagn16`), the warmup-estimated clip bound
-(`resBound`), and a clip count (`resClipped`): the number of pairs
-whose absolute difference `|d| = |ta - tb|` exceeded the bound and
-was truncated before being fed to the tight magnitude component.
-Clipping preserves the type-I error guarantee but reduces power
-against tail-shifting leaks, so a clip count that is a substantial
-fraction of `resPairs` indicates the warmup bound was too tight.
-Raise `cfgWarmup`, enlarge `cfgBatch`, or treat the run with
-suspicion.
+(`resPairs`), the mixture's peak log e-value (`resPeakLogW`; starts
+at 0, crosses `log(1/alpha)` on rejection), the anytime-valid
+p-value (`resPValue`; at or below `cfgAlpha` exactly when the
+verdict is `Reject`, and valid at any data-dependent stopping
+time), an effect-size interval (`resEffect`, below), per-component
+peak log e-values (`resPeakSign`, `resPeakMagn`, `resPeakMagn4`,
+`resPeakMagn16`), the warmup-estimated clip bound (`resBound`), and
+a clip count (`resClipped`): the number of pairs whose absolute
+difference `|d| = |ta - tb|` exceeded the bound and was truncated
+before being fed to the tight magnitude component. Clipping
+preserves the type-I error guarantee but reduces power against
+tail-shifting leaks, so a clip count that is a substantial fraction
+of `resPairs` indicates the warmup bound was too tight. Raise
+`cfgWarmup`, enlarge `cfgBatch`, or treat the run with suspicion.
+
+### Effect size
+
+`resEffect` is an anytime-valid `1 - alpha` confidence interval
+(the hedged-capital construction of Waudby-Smith & Ramdas, via
+`Numeric.Eproc.ConfSeq`) for the mean of `d` clipped to the widest
+hedge interval `[-16c, 16c]`, in meter units per batch. On a truly
+constant-time target it covers zero; on a `Pass` at full budget it
+bounds the size of any undetected effect ("no leak found, and the
+mean effect is within ±X"). On a `Reject` it covers the true
+(clipped) shift but may still straddle zero: detection is more
+sample-efficient than estimation, so a strong leak halts the run
+before the interval tightens. On long runs the evidence can pin
+the mean below the estimation grid's resolution; the reported
+interval is then the last resolvable one — a few grid steps wide,
+still covering the true mean, since the sequence's intervals are
+nested and the coverage guarantee is time-uniform. Coverage of the
+interval and type-I control of the verdict are separate marginal
+guarantees, each at `cfgAlpha`.
 
 ### A/A diagnostic
 
@@ -244,56 +266,53 @@ Haddocks (API documentation, etc.) are hosted at
 
 ## Performance
 
-The K=4 hedge runs four e-processes per pair plus a log-sum-exp
-composition, so the per-pair driver cost is a few times the single-
-e-process baseline. For any target that itself takes a microsecond
-or longer per call, that overhead is dominated by the target and is
-functionally invisible; for sub-microsecond noop targets it shows
-up as ~150 nanoseconds per pair.
+The K=4 hedge runs four e-processes per pair plus the mixture
+composition, and the effect-size confidence sequence updates its
+live candidate grid every pair. The estimator dominates the driver
+cost early — O(live candidates) per pair, ~300 at the start — and
+amortizes down as evidence rejects candidates, so the per-pair
+driver cost falls from ~1 μs over short runs toward ~250 ns over
+long ones. For any target that itself takes a microsecond or
+longer per call the overhead is dominated by the target; for
+sub-microsecond targets, raise `cfgBatch` (which the wall-clock
+quantum demands anyway).
 
 Current benchmark figures on an M4 Silicon MacBook Air (use
 `cabal bench` to reproduce):
 
 ```
   benchmarking runCT (noop target, const meter, batch=1)/budget=1000
-  time                 147.8 μs   (147.3 μs .. 148.3 μs)
-                       1.000 R²   (1.000 R² .. 1.000 R²)
-  mean                 148.0 μs   (147.6 μs .. 148.4 μs)
-  std dev              1.236 μs   (968.0 ns .. 1.667 μs)
+  time                 1.094 ms   (1.079 ms .. 1.112 ms)
 
   benchmarking runCT (noop target, const meter, batch=1)/budget=10000
-  time                 1.451 ms   (1.448 ms .. 1.455 ms)
-                       1.000 R²   (1.000 R² .. 1.000 R²)
-  mean                 1.448 ms   (1.446 ms .. 1.452 ms)
-  std dev              10.61 μs   (7.455 μs .. 17.21 μs)
+  time                 3.700 ms   (3.675 ms .. 3.726 ms)
 
   benchmarking runCT (noop target, const meter, batch=1)/budget=100000
-  time                 14.52 ms   (14.44 ms .. 14.67 ms)
-                       1.000 R²   (0.999 R² .. 1.000 R²)
-  mean                 14.49 ms   (14.46 ms .. 14.55 ms)
-  std dev              94.30 μs   (40.16 μs .. 183.2 μs)
+  time                 25.40 ms   (25.14 ms .. 25.61 ms)
 ```
 
-Per-pair allocation is linear in budget but independent of batch
-size, attesting that the driver does not accumulate any state
-proportional to the inner-loop count:
+Per-pair allocation is independent of batch size, attesting that
+the driver does not accumulate any state proportional to the
+inner-loop count. It is front-loaded rather than linear in budget:
+the estimator's live-candidate list is rebuilt each pair and
+shrinks as candidates are rejected:
 
 ```
   runCT (noop target, const meter, batch=1)
 
     Case            Allocated  GCs
-    budget=100         67,112    0
-    budget=1000       491,912    0
-    budget=10000    4,739,912    1
-    budget=100000  47,219,912   11
+    budget=100      1,708,008    0
+    budget=1000     4,827,208    1
+    budget=10000   15,123,368    3
+    budget=100000  91,979,168   22
 
   runCT (noop target, const meter, budget=1000)
 
     Case        Allocated  GCs
-    batch=1       491,912    0
-    batch=10      491,912    0
-    batch=100     491,912    0
-    batch=1000    491,912    0
+    batch=1     4,827,208    1
+    batch=10    4,827,208    1
+    batch=100   4,827,208    1
+    batch=1000  4,827,208    1
 ```
 
 You should compile with the `llvm` flag for maximum performance.
@@ -349,15 +368,17 @@ difference `d = ta - tb`:
     leaks (e.g. a rarely-taken data-dependent branch) that the
     tight clip would truncate away.
 
-Uniform weights over the four components; threshold at
-`log(8/alpha)` (the `+log 4` over the single-component
-`log(2/alpha)` is the price of hedging). Rejection latches on the
-supremum of the mixture's log-wealth, not on the components'
-individual suprema. Each component's own peak log-wealth is
-surfaced in the `Result` for diagnosis — a rejection driven by the
-sign component points at a shape or bulk-shift leak, one driven by
-the wide magnitude components at rare outliers — but the peaks are
-attained at possibly different times and never gate the verdict.
+The convex combination itself is delegated to
+`Numeric.Eproc.Mixture`: uniform weights over the four components,
+rejecting when the mixture e-value crosses `1/alpha` (the `+log 4`
+on the log scale over a single component is the price of hedging).
+Rejection latches on the supremum of the mixture's log e-value, not
+on the components' individual suprema. Each component's own peak
+log e-value is surfaced in the `Result` for diagnosis — a rejection
+driven by the sign component points at a shape or bulk-shift leak,
+one driven by the wide magnitude components at rare outliers — but
+the peaks are attained at possibly different times and never gate
+the verdict.
 
 ### Baseline
 
@@ -399,7 +420,7 @@ detection rate. Headline findings from the baseline:
     range; below the noise floor at any statistic).
 
 The hedge composition brings a ~10-15% threshold overhead vs a
-single component (from `log(2/alpha)` to `log(8/alpha)`), which
+single component (`+log 4` on the rejection threshold), which
 shows up as a small regression at marginal detection points — e.g.
 sym-uniform shift=10 at `cfgBudget = 1000` fell from 100% (under
 the previous single-component design) to 0% (under the hedge). The
