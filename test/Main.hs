@@ -21,6 +21,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , calibrationTests
   , configValidationTests
   , deterministicLeakTests
+  , evidenceTests
   , offByOneTests
   , clipCountTests
   , aaDiagnosticTests
@@ -133,8 +134,8 @@ flatMeterTests = testGroup "flat meter" [
         C.Reject{} -> assertFailure "flat meter unexpectedly rejected"
 
     -- zero warmup differences floor the clip bound at 1, and a flat
-    -- wealth process leaves every peak at its starting value: log 2
-    -- per component, log 8 for the mixture.
+    -- wealth process leaves every peak at its calibrated floor: a
+    -- log e-value of 0, for components and mixture alike.
   , testCase "flat meter report: unit bound, floor peaks" $ do
       let c = C.defaultConfig
             { C.cfgBudget = 200
@@ -144,11 +145,11 @@ flatMeterTests = testGroup "flat meter" [
       r <- C.runCT (constMeter 100) c noopHyp
       C.resBound r @?= 1
       assertBool "mixture peak below floor"
-        (C.resPeakLogW r >= log 8 - 1e-9)
+        (C.resPeakLogW r >= negate 1e-9)
       let !minPeak = min (min (C.resPeakSign r) (C.resPeakMagn r))
                          (min (C.resPeakMagn4 r) (C.resPeakMagn16 r))
       assertBool "component peak below floor"
-        (minPeak >= log 2 - 1e-9)
+        (minPeak >= negate 1e-9)
   ]
 
 calibrationTests :: TestTree
@@ -233,6 +234,46 @@ deterministicLeakTests = testGroup "deterministic leak" [
           assertFailure $
             "deterministic divergence not detected; passed n="
             ++ show n ++ " logW=" ++ show w
+  ]
+
+-- resPValue is the mixture evidence recast as an anytime-valid
+-- p-value: at or below alpha iff the verdict is Reject. resEffect
+-- is an anytime-valid confidence interval for the mean clipped
+-- difference: it covers the true mean at the stopping time (0 for
+-- CT fixtures, the deterministic delta for the leak fixture).
+-- Exclusion of 0 at a rejection stopping time is deliberately NOT
+-- asserted: detection is more sample-efficient than estimation, so
+-- a fast reject legitimately halts while the interval still
+-- straddles zero.
+evidenceTests :: TestTree
+evidenceTests = testGroup "calibrated evidence" [
+    testCase "leak fixture: p <= alpha, effect covers true delta" $ do
+      (hyp, meter) <- leakHyp
+      let c = leakCfg { C.cfgSeed = Just 0xE71DE0 }
+      r <- C.runCT meter c hyp
+      case r of
+        C.Reject{} -> do
+          assertBool "Reject but resPValue > alpha"
+            (C.resPValue r <= C.cfgAlpha c)
+          -- the fixture's difference is d = -100, every pair.
+          let (lo, hi) = C.resEffect r
+          assertBool "interval misses the true mean -100"
+            (lo <= -100 && -100 <= hi)
+        C.Pass{} -> assertFailure "leak fixture failed to reject"
+
+  , testCase "flat fixture: p = 1, effect covers zero" $ do
+      let c = C.defaultConfig
+            { C.cfgBudget = 500
+            , C.cfgWarmup = 20
+            , C.cfgBatch  = 1
+            }
+      r <- C.runCT (constMeter 100) c noopHyp
+      case r of
+        C.Pass{} -> do
+          C.resPValue r @?= 1
+          let (lo, hi) = C.resEffect r
+          assertBool "interval misses zero" (lo <= 0 && 0 <= hi)
+        C.Reject{} -> assertFailure "flat meter unexpectedly rejected"
   ]
 
 -- regression for the off-by-one: a threshold crossing on the final

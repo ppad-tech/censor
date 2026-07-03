@@ -241,13 +241,17 @@ renderResult r = do
         C.Reject{} -> "REJECT after "
         C.Pass{}   -> "PASS    after "
   putStrLn $ "  " ++ verdict ++ show (C.resPairs r)
-    ++ " pairs, logW=" ++ show (C.resPeakLogW r)
+    ++ " pairs, logE=" ++ show (C.resPeakLogW r)
     ++ ", clipped=" ++ show (C.resClipped r)
     ++ ", bound=" ++ show (C.resBound r)
-  printf "    peaks: sign=%.2f magn(c)=%.2f magn(4c)=%.2f \
-         \magn(16c)=%.2f\n"
+  printf "    evidence: p=%.3g  peaks: sign=%.2f magn(c)=%.2f \
+         \magn(4c)=%.2f magn(16c)=%.2f\n"
+    (C.resPValue r)
     (C.resPeakSign r) (C.resPeakMagn r)
     (C.resPeakMagn4 r) (C.resPeakMagn16 r)
+  let (elo, ehi) = C.resEffect r
+  printf "    effect: mean clipped d in [%.1f, %.1f] per batch\n"
+    elo ehi
 
 renderAttribution :: C.Attribution -> String
 renderAttribution att = case att of
