@@ -45,9 +45,11 @@ module Censor (
     -- * Running
   , runCT
 
-    -- * A/A diagnostic
+    -- * A\/A and B\/B diagnostics
   , toAA
   , runAA
+  , toBB
+  , runBB
 
     -- * Measurement (re-exports)
   , Meter(..)
@@ -237,10 +239,10 @@ runCT meter cfg hyp = do
 --   time-of-day drift picked up by an unbalanced sample order, RTS
 --   state leaking between calls — rather than a leak in the target.
 --
---   The typical usage is to run this before trusting a 'Reject' from
---   a new hypothesis: if the A\/A form also rejects, the harness
---   itself is at fault and the real-hypothesis result is not
---   informative until the asymmetry is fixed.
+--   A\/A only exercises 'sampleA', so asymmetries specific to
+--   'sampleB' (a heavier allocation path, RTS state that only its
+--   fresh objects trigger) slip through. Pair 'runAA' with 'runBB'
+--   for a full attribution.
 toAA :: Hypothesis a -> Hypothesis a
 toAA h = h { sampleB = sampleA h }
 {-# INLINE toAA #-}
@@ -250,6 +252,20 @@ toAA h = h { sampleB = sampleA h }
 --   symmetric.
 runAA :: Meter -> Config -> Hypothesis a -> IO Result
 runAA meter cfg hyp = runCT meter cfg (toAA hyp)
+
+-- | Convert a 'Hypothesis' into its /B\/B diagnostic/ form:
+--   'sampleA' is replaced by 'sampleB'. Symmetric companion to
+--   'toAA' — a 'Reject' verdict here indicts an asymmetry specific
+--   to 'sampleB' rather than the target.
+toBB :: Hypothesis a -> Hypothesis a
+toBB h = h { sampleA = sampleB h }
+{-# INLINE toBB #-}
+
+-- | Run the B\/B diagnostic. Equivalent to @'runCT' meter cfg
+--   ('toBB' hyp)@; should always 'Pass' if the harness is
+--   symmetric.
+runBB :: Meter -> Config -> Hypothesis a -> IO Result
+runBB meter cfg hyp = runCT meter cfg (toBB hyp)
 
 -- internal
 

@@ -272,12 +272,12 @@ signOnlyLeakTests = testGroup "sign-only leak" [
           ++ " logW=" ++ show w
   ]
 
--- toAA collapses a leaky hypothesis into H_0 by construction —
--- sampleB is replaced by sampleA, so both classes measure the same
--- distribution. A hypothesis that Rejects under runCT should Pass
--- under runAA.
+-- toAA / toBB collapse a leaky hypothesis into H_0 by construction —
+-- either sampleB is replaced by sampleA or vice versa, so both
+-- classes measure the same distribution. A hypothesis that Rejects
+-- under runCT should Pass under both runAA and runBB.
 aaDiagnosticTests :: TestTree
-aaDiagnosticTests = testGroup "A/A diagnostic" [
+aaDiagnosticTests = testGroup "A/A and B/B diagnostics" [
     testCase "runAA passes a hypothesis that runCT would reject" $ do
       (hyp, meter) <- leakHyp
       -- Fixed seed to keep the test deterministic; the leak fixture
@@ -288,6 +288,16 @@ aaDiagnosticTests = testGroup "A/A diagnostic" [
         C.Pass _ _ _ -> pure ()
         C.Reject n w _ -> assertFailure $
           "A/A diagnostic falsely rejected at n=" ++ show n
+          ++ " logW=" ++ show w
+
+  , testCase "runBB passes a hypothesis that runCT would reject" $ do
+      (hyp, meter) <- leakHyp
+      let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
+      r <- C.runBB meter c hyp
+      case r of
+        C.Pass _ _ _ -> pure ()
+        C.Reject n w _ -> assertFailure $
+          "B/B diagnostic falsely rejected at n=" ++ show n
           ++ " logW=" ++ show w
   ]
 

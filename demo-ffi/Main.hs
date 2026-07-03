@@ -87,9 +87,6 @@ foreign import ccall unsafe "censor_naive_neq32"
 foreign import ccall unsafe "h_secp256r1_keypair_from_bytes"
   h_kp_from_bytes :: Ptr Word8 -> IO (Ptr ())
 
-foreign import ccall unsafe "h_secp256r1_keypair_free"
-  h_kp_free       :: Ptr () -> IO ()
-
 foreign import ccall unsafe "h_secp256r1_sign"
   h_sign          :: Ptr () -> Ptr Word8 -> CSize -> IO ()
 
@@ -163,30 +160,40 @@ negNaiveNeq32 ga gb = F.FFIHypothesis
 --
 --   [keypair_ptr (8B) | msg (32B)]   = 40B total
 --
--- class A pins a single keypair built once at hypothesis setup;
--- class B builds a fresh keypair every pair (leaked -- accepted
--- for a one-shot demo, ~3 MB peak at the default budget). The
--- timed call runs only the dereference + sign; secret-key
--- construction and message generation happen in the sampler,
--- outside the timed region.
+-- both classes share a single keypair built once at hypothesis
+-- setup, and the leak is driven by the message alone. RFC 6979
+-- makes the nonce k = F(sk, H(msg)), and the leaking
+-- WindowedScalarMultiplier is indexed by k's bits — so pinning the
+-- message in class A pins k, which pins the table walk; class B
+-- draws a random message per pair, giving a random k and a random
+-- table walk. If the class A sampler drew a fresh message the
+-- distribution of leaking indices would match class B and the test
+-- would have zero power by construction (a real bug we shipped in
+-- an earlier version).
 --
--- the underlying scalar mul uses fastcrypto's WindowedScalar-
--- Multiplier (table-indexed on the secret scalar's bits) so per-
--- call timing is expected to leak across the two classes; censor
--- should reject this decisively under PMU.
+-- Sharing the keypair also eliminates the per-pair keypair Box
+-- allocation the previous class B path incurred, tightening the
+-- harness symmetry.
+--
+-- censor should reject this decisively under PMU.
 negFastcryptoSign
   :: Rng -> Rng -> IO F.FFIHypothesis
-negFastcryptoSign ga gb = do
-  gFix  <- mkRng fixedSeed
-  fixKp <- mkKeyPair gFix
+negFastcryptoSign _ga gb = do
+  gFix    <- mkRng fixedSeed
+  sharedKp <- mkKeyPair gFix
+  -- Build the fixed message on the heap the same way random
+  -- messages are built, then freeze; using a top-level CAF would
+  -- be reached by different code and could show up as an
+  -- instruction-count difference under PMU.
+  fixMsgPtr <- mallocBytes 32
+  fillRandom gFix fixMsgPtr 32
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = 8 + 32
     , F.ffiSampleA = \p -> do
-        poke (castPtr p) fixKp
-        fillRandom ga (p `plusPtr` 8) 32
+        poke (castPtr p) sharedKp
+        copyBytes (p `plusPtr` 8) fixMsgPtr 32
     , F.ffiSampleB = \p -> do
-        kp <- mkKeyPair gb
-        poke (castPtr p) kp
+        poke (castPtr p) sharedKp
         fillRandom gb (p `plusPtr` 8) 32
     , F.ffiTarget = \p -> do
         kp <- peek (castPtr p) :: IO (Ptr ())
@@ -265,19 +272,28 @@ runCase meter c name fh = do
       putStrLn $
         "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
         ++ ", clipped=" ++ show nc
-      -- A/A diagnostic: sampleA vs sampleA should always Pass. A
-      -- Reject here indicts the harness (unbalanced allocation, RTS
-      -- state, etc.) rather than the target, and the main result
-      -- above is not informative until the asymmetry is fixed.
-      putStrLn "    (running A/A diagnostic to attribute the reject...)"
+      -- A/A and B/B diagnostics: each collapses one sampler onto
+      -- itself and should always Pass under a symmetric harness. A
+      -- Reject on either indicts an asymmetry specific to that
+      -- sampler rather than a target leak. Running both attributes
+      -- the reject to (a) target, (b) sampleA-specific harness bug,
+      -- or (c) sampleB-specific harness bug.
+      putStrLn "    (running A/A and B/B diagnostics to attribute the reject...)"
       hFlush stdout
       rAA <- F.withFFIHypothesis fh $ \h -> C.runAA meter c h
-      case rAA of
-        C.Reject nA _ _ -> putStrLn $
-          "    A/A ALSO REJECT after " ++ show nA
-          ++ " — harness asymmetry, not a target leak"
-        C.Pass{} -> putStrLn
-          "    A/A PASS — target leak confirmed"
+      rBB <- F.withFFIHypothesis fh $ \h -> C.runBB meter c h
+      case (rAA, rBB) of
+        (C.Pass{}, C.Pass{}) -> putStrLn
+          "    A/A and B/B both PASS — target leak confirmed"
+        (C.Reject nA _ _, C.Pass{}) -> putStrLn $
+          "    A/A REJECT after " ++ show nA
+          ++ " — sampleA asymmetry, not a target leak"
+        (C.Pass{}, C.Reject nB _ _) -> putStrLn $
+          "    B/B REJECT after " ++ show nB
+          ++ " — sampleB asymmetry, not a target leak"
+        (C.Reject nA _ _, C.Reject nB _ _) -> putStrLn $
+          "    A/A and B/B both REJECT (nA=" ++ show nA
+          ++ ", nB=" ++ show nB ++ ") — pervasive harness asymmetry"
     C.Pass   n w nc -> putStrLn $
       "  PASS    after " ++ show n ++ " pairs, logW=" ++ show w
       ++ ", clipped=" ++ show nc

@@ -487,20 +487,28 @@ runCaseWith meter c name mkH = do
       putStrLn $
         "  REJECT after " ++ show n ++ " pairs, logW=" ++ show w
         ++ ", clipped=" ++ show nc
-      -- A/A diagnostic: sampleA vs sampleA should always Pass. A
-      -- Reject here indicts the harness (unbalanced allocation, RTS
-      -- state, etc.) rather than the target, and the main result
-      -- above is not informative until the asymmetry is fixed.
-      putStrLn "    (running A/A diagnostic to attribute the reject...)"
+      -- A/A and B/B diagnostics: each collapses one sampler onto
+      -- itself and should always Pass under a symmetric harness. A
+      -- Reject on either indicts an asymmetry specific to that
+      -- sampler rather than a target leak.
+      putStrLn "    (running A/A and B/B diagnostics to attribute the reject...)"
       hFlush stdout
       hAA <- mkH
       rAA <- C.runAA meter c hAA
-      case rAA of
-        C.Reject nA _ _ -> putStrLn $
-          "    A/A ALSO REJECT after " ++ show nA
-          ++ " — harness asymmetry, not a target leak"
-        C.Pass{} -> putStrLn
-          "    A/A PASS — target leak confirmed"
+      hBB <- mkH
+      rBB <- C.runBB meter c hBB
+      case (rAA, rBB) of
+        (C.Pass{}, C.Pass{}) -> putStrLn
+          "    A/A and B/B both PASS — target leak confirmed"
+        (C.Reject nA _ _, C.Pass{}) -> putStrLn $
+          "    A/A REJECT after " ++ show nA
+          ++ " — sampleA asymmetry, not a target leak"
+        (C.Pass{}, C.Reject nB _ _) -> putStrLn $
+          "    B/B REJECT after " ++ show nB
+          ++ " — sampleB asymmetry, not a target leak"
+        (C.Reject nA _ _, C.Reject nB _ _) -> putStrLn $
+          "    A/A and B/B both REJECT (nA=" ++ show nA
+          ++ ", nB=" ++ show nB ++ ") — pervasive harness asymmetry"
     C.Pass   n w nc -> putStrLn $
       "  PASS    after " ++ show n ++ " pairs, logW=" ++ show w
       ++ ", clipped=" ++ show nc
