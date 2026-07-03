@@ -31,6 +31,7 @@
 module Censor (
     -- * Hypothesis
     Hypothesis(..)
+  , fixVsRandom
 
     -- * Configuration
   , Config(..)
@@ -50,6 +51,8 @@ module Censor (
   , runAA
   , toBB
   , runBB
+  , Attribution(..)
+  , attribute
 
     -- * Measurement (re-exports)
   , Meter(..)
@@ -57,6 +60,11 @@ module Censor (
   , Counter(..)
   , MeterError(..)
   , withCounter
+
+    -- * Sampler support (re-exports)
+  , Rng
+  , mkRng
+  , nextWord
   ) where
 
 import Control.Exception (Exception, throwIO)
@@ -70,6 +78,7 @@ import qualified Numeric.Eproc.Bounded as EPMagn
 import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
 
 import Censor.Meter
+import Censor.Rng (Rng, mkRng, nextWord, splitMix)
 
 -- | A constant-time hypothesis.
 --
@@ -92,6 +101,48 @@ data Hypothesis a = Hypothesis
   , sampleA :: !(IO a)
   , sampleB :: !(IO a)
   }
+
+-- | Construct a dudect-style /fix-vs-random/ 'Hypothesis' from a
+--   target, a secret sampler, and a completion function building a
+--   full input around a secret.
+--
+--   The fixed secret is drawn once from the sampler at construction
+--   time, so it is an ordinary heap value reached by the same code
+--   path as the random class (never a shared top-level constant).
+--   Class A draws and discards a fresh secret before returning the
+--   fixed one, keeping the two samplers symmetric in allocation
+--   count, size, and order; class B keeps its draw. The completion
+--   function runs identically in both classes, so per-pair public
+--   inputs (messages, nonces, associated data) stay fresh on both
+--   sides.
+--
+--   The sampler and completion must return values in normal form;
+--   'fixVsRandom' balances allocation between the classes but cannot
+--   force what they left lazy.
+--
+--   For a whole-input fix-vs-random hypothesis, pass 'pure' as the
+--   completion:
+--
+--   > hyp <- fixVsRandom
+--   >   (\x -> () <$ evaluate (inv x))   -- target
+--   >   (randomMont g)                   -- secret sampler
+--   >   pure                             -- input is just the secret
+fixVsRandom
+  :: (a -> IO ())   -- ^ target
+  -> IO s           -- ^ secret sampler
+  -> (s -> IO a)    -- ^ complete an input around a secret
+  -> IO (Hypothesis a)
+fixVsRandom tgt sec embed = do
+  !fix <- sec
+  pure Hypothesis
+    { target  = tgt
+    , sampleA = do
+        !_ <- sec        -- draw and discard: balance class B
+        embed fix
+    , sampleB = do
+        !s <- sec
+        embed s
+    }
 
 -- | Driver configuration.
 data Config = Config
@@ -129,32 +180,59 @@ defaultConfig = Config
   , cfgSeed   = Nothing
   }
 
--- | Test outcome.
+-- | Test outcome. 'Reject' means a leak was detected; 'Pass' means
+--   no leak was detected within budget. Both constructors carry the
+--   same run report.
 --
---   Both constructors carry the number of sample pairs consumed, the
---   peak (supremum-so-far) log-wealth of the /mixture/
---   @log(sum_i K^i)@ across the four hedged e-processes, and a clip
---   count: the number of pairs whose absolute difference @|d|@
---   exceeded the tight (@c@) warmup-derived upper bound. The peak
---   log-wealth starts at @log 8@ (each of the four components
---   starts at @log(K^+ + K^-) = log 2@); rejection is at
---   @log(8 \/ alpha)@. A clip count that is a substantial fraction
---   of @samples@ indicates the warmup bound was too tight for the
---   tight component; raise 'cfgWarmup', enlarge 'cfgBatch', or
---   treat the run with suspicion (the wider (@4c@, @16c@) magnitude
---   components in the hedge still see the pre-clip @d@, but their
---   @lambda_max@ is proportionally smaller).
+--   The peak log-wealth of the /mixture/ starts at @log 8@ (each of
+--   the four hedged components starts at @log(K^+ + K^-) = log 2@);
+--   rejection is at @log(8 \/ alpha)@. A clip count that is a
+--   substantial fraction of 'resPairs' indicates the warmup bound
+--   'resBound' was too tight for the tight component; raise
+--   'cfgWarmup', enlarge 'cfgBatch', or treat the run with suspicion
+--   (the wider (@4c@, @16c@) magnitude components in the hedge still
+--   see the pre-clip @d@, but their @lambda_max@ is proportionally
+--   smaller).
+--
+--   The per-component peaks identify which evidence channel drove a
+--   rejection: 'resPeakSign' growing points at a distributional
+--   asymmetry (bulk shift or shape leak), 'resPeakMagn' at a small
+--   consistent shift, 'resPeakMagn16' at rare large outliers. Each
+--   is a supremum over its own (possibly different) time, so the
+--   peaks are diagnostic only -- rejection latches on the mixture's
+--   supremum, never on per-component peaks.
 data Result
   = Reject
-      {-# UNPACK #-} !Int     -- ^ sample pairs consumed
-      {-# UNPACK #-} !Double  -- ^ peak log-wealth
-      {-# UNPACK #-} !Int     -- ^ pairs whose @|d|@ was clipped
-    -- ^ leak detected.
+      { resPairs      :: {-# UNPACK #-} !Int
+        -- ^ sample pairs consumed.
+      , resPeakLogW   :: {-# UNPACK #-} !Double
+        -- ^ peak (supremum-so-far) log-wealth of the mixture,
+        --   @sup_t log(sum_i K^i_t)@.
+      , resClipped    :: {-# UNPACK #-} !Int
+        -- ^ pairs whose @|d|@ exceeded 'resBound' and was clipped
+        --   before reaching the tight magnitude component.
+      , resBound      :: {-# UNPACK #-} !Double
+        -- ^ the tight clip bound @c@ estimated during warmup
+        --   (@max 1 (2 * p99(|d|))@).
+      , resPeakSign   :: {-# UNPACK #-} !Double
+        -- ^ peak log-wealth of the sign component.
+      , resPeakMagn   :: {-# UNPACK #-} !Double
+        -- ^ peak log-wealth of the magnitude component at @c@.
+      , resPeakMagn4  :: {-# UNPACK #-} !Double
+        -- ^ peak log-wealth of the magnitude component at @4c@.
+      , resPeakMagn16 :: {-# UNPACK #-} !Double
+        -- ^ peak log-wealth of the magnitude component at @16c@.
+      }
   | Pass
-      {-# UNPACK #-} !Int     -- ^ sample pairs consumed
-      {-# UNPACK #-} !Double  -- ^ peak log-wealth
-      {-# UNPACK #-} !Int     -- ^ pairs whose @|d|@ was clipped
-    -- ^ no leak detected within budget.
+      { resPairs      :: {-# UNPACK #-} !Int
+      , resPeakLogW   :: {-# UNPACK #-} !Double
+      , resClipped    :: {-# UNPACK #-} !Int
+      , resBound      :: {-# UNPACK #-} !Double
+      , resPeakSign   :: {-# UNPACK #-} !Double
+      , resPeakMagn   :: {-# UNPACK #-} !Double
+      , resPeakMagn4  :: {-# UNPACK #-} !Double
+      , resPeakMagn16 :: {-# UNPACK #-} !Double
+      }
   deriving Show
 
 -- | Errors thrown by 'runCT' when calibration or configuration fails.
@@ -212,9 +290,12 @@ runCT meter cfg hyp = do
     Left  e -> throwIO (InvalidEprocConfig e)
     Right x -> pure x
   let !thresh = hcThresh hcfg
+      finish ctor !n !st !nclip = ctor
+        n (hsSupLogMix st) nclip c
+        (hsSupSign st) (hsSupMagn1 st) (hsSupMagn2 st) (hsSupMagn3 st)
       go !n !st !rng !nclip
         | n >= cfgBudget cfg =
-            pure $! Pass n (hsSupLogMix st) nclip
+            pure $! finish Pass n st nclip
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!ta, !tb) <- runPair meter cfg hyp flipOrder
@@ -224,7 +305,7 @@ runCT meter cfg hyp = do
                 !nclip'  = if clipped then nclip + 1 else nclip
                 !n'      = n + 1
             if hsSupLogMix st' >= thresh
-              then pure $! Reject n' (hsSupLogMix st') nclip'
+              then pure $! finish Reject n' st' nclip'
               else go n' st' rng' nclip'
   go 0 (initialHedge hcfg) mSeed 0
 
@@ -266,6 +347,41 @@ toBB h = h { sampleA = sampleB h }
 --   symmetric.
 runBB :: Meter -> Config -> Hypothesis a -> IO Result
 runBB meter cfg hyp = runCT meter cfg (toBB hyp)
+
+-- | Attribution of a 'Reject' verdict, as determined by the A\/A
+--   and B\/B diagnostics. Rejecting diagnostics carry their
+--   'Result's as evidence.
+data Attribution
+  = TargetLeak
+    -- ^ both diagnostics passed: the harness is symmetric, and a
+    --   'Reject' from 'runCT' is attributable to the target.
+  | SampleAAsymmetry !Result
+    -- ^ the A\/A diagnostic rejected: 'sampleA' itself induces a
+    --   timing asymmetry, and the real-hypothesis verdict is not
+    --   informative until it is fixed.
+  | SampleBAsymmetry !Result
+    -- ^ the B\/B diagnostic rejected: as above, for 'sampleB'.
+  | PervasiveAsymmetry !Result !Result
+    -- ^ both diagnostics rejected (A\/A and B\/B results
+    --   respectively): the harness asymmetry is not specific to
+    --   either sampler.
+  deriving Show
+
+-- | Attribute a 'Reject' verdict by running the A\/A and B\/B
+--   diagnostics and combining their outcomes. Only meaningful after
+--   'runCT' has rejected the hypothesis: on a symmetric harness both
+--   diagnostics pass whether or not the target leaks, so a
+--   'TargetLeak' attribution confirms an existing rejection rather
+--   than detecting anything by itself.
+attribute :: Meter -> Config -> Hypothesis a -> IO Attribution
+attribute meter cfg hyp = do
+  raa <- runAA meter cfg hyp
+  rbb <- runBB meter cfg hyp
+  pure $! case (raa, rbb) of
+    (Pass{},     Pass{})     -> TargetLeak
+    (a@Reject{}, Pass{})     -> SampleAAsymmetry a
+    (Pass{},     b@Reject{}) -> SampleBAsymmetry b
+    (a@Reject{}, b@Reject{}) -> PervasiveAsymmetry a b
 
 -- internal
 
@@ -351,6 +467,14 @@ data HedgeState = HedgeState
   , hsMagn3     :: !EPMagn.State
   , hsSupLogMix :: {-# UNPACK #-} !Double
     -- ^ supremum-so-far of @log(sum_i K^i_t)@.
+  , hsSupSign   :: {-# UNPACK #-} !Double
+    -- ^ supremum-so-far of the sign component's log-wealth.
+  , hsSupMagn1  :: {-# UNPACK #-} !Double
+    -- ^ ditto, magnitude at @c@.
+  , hsSupMagn2  :: {-# UNPACK #-} !Double
+    -- ^ ditto, magnitude at @4c@.
+  , hsSupMagn3  :: {-# UNPACK #-} !Double
+    -- ^ ditto, magnitude at @16c@.
   }
 
 mkHedgeCfg :: Double -> Double -> Either ConfigError HedgeCfg
@@ -381,6 +505,10 @@ initialHedge HedgeCfg{..} = HedgeState
   , hsSupLogMix = log 8
     -- ^ each component starts at @log(K^+ + K^-) = log 2@, sum of
     --   four exp's = 8.
+  , hsSupSign   = log 2
+  , hsSupMagn1  = log 2
+  , hsSupMagn2  = log 2
+  , hsSupMagn3  = log 2
   }
 
 updateHedge :: HedgeCfg -> HedgeState -> Double -> HedgeState
@@ -391,13 +519,22 @@ updateHedge HedgeCfg{..} HedgeState{..} !d =
       !m1' = EPMagn.update hcMagn1 hsMagn1 (clipD hcC1 d)
       !m2' = EPMagn.update hcMagn2 hsMagn2 (clipD hcC2 d)
       !m3' = EPMagn.update hcMagn3 hsMagn3 (clipD hcC3 d)
-      !logMix = logSumExp4
-        (EPSign.log_wealth s')
-        (EPMagn.log_wealth m1')
-        (EPMagn.log_wealth m2')
-        (EPMagn.log_wealth m3')
-      !supMix = max hsSupLogMix logMix
-  in  HedgeState s' m1' m2' m3' supMix
+      !lwS = EPSign.log_wealth s'
+      !lw1 = EPMagn.log_wealth m1'
+      !lw2 = EPMagn.log_wealth m2'
+      !lw3 = EPMagn.log_wealth m3'
+      !logMix = logSumExp4 lwS lw1 lw2 lw3
+  in  HedgeState
+        { hsSign      = s'
+        , hsMagn1     = m1'
+        , hsMagn2     = m2'
+        , hsMagn3     = m3'
+        , hsSupLogMix = max hsSupLogMix logMix
+        , hsSupSign   = max hsSupSign lwS
+        , hsSupMagn1  = max hsSupMagn1 lw1
+        , hsSupMagn2  = max hsSupMagn2 lw2
+        , hsSupMagn3  = max hsSupMagn3 lw3
+        }
 
 clipD :: Double -> Double -> Double
 clipD !lim !x
@@ -412,21 +549,12 @@ logSumExp4 !a !b !c !d =
               + exp (c - m) + exp (d - m) )
 {-# INLINE logSumExp4 #-}
 
--- The order-bit PRNG. Deterministic splitmix64 from a resolved
--- seed. The conditional-null guarantee needs the per-pair order bit
--- to be independent of the target's timing distribution; the seed
--- itself only needs to be independent of that distribution too,
--- which fresh entropy (default) or a user-supplied constant both
--- satisfy.
-
-splitMix :: Word64 -> (Word64, Word64)
-splitMix !s =
-  let !s' = s + 0x9E3779B97F4A7C15
-      !z0 = (s' `B.xor` (s' `B.shiftR` 30)) * 0xBF58476D1CE4E5B9
-      !z1 = (z0 `B.xor` (z0 `B.shiftR` 27)) * 0x94D049BB133111EB
-      !z2 =  z1 `B.xor` (z1 `B.shiftR` 31)
-  in  (s', z2)
-{-# INLINE splitMix #-}
+-- The order-bit PRNG. Deterministic splitmix64 (from "Censor.Rng")
+-- threaded from a resolved seed. The conditional-null guarantee
+-- needs the per-pair order bit to be independent of the target's
+-- timing distribution; the seed itself only needs to be independent
+-- of that distribution too, which fresh entropy (default) or a
+-- user-supplied constant both satisfy.
 
 nextOrderBit :: Word64 -> (Word64, Bool)
 nextOrderBit !s =

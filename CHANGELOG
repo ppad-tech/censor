@@ -1,6 +1,30 @@
 # Changelog
 
 - Unreleased
+  * 'Result' constructors now carry named fields: 'resPairs',
+    'resPeakLogW', and 'resClipped' replace the positional
+    fields, joined by the warmup-derived clip bound ('resBound')
+    and per-component peak log-wealths ('resPeakSign',
+    'resPeakMagn', 'resPeakMagn4', 'resPeakMagn16') that identify
+    which hedge component drove a rejection.
+  * Add 'fixVsRandom', a 'Hypothesis' constructor encoding the
+    dudect-style fix-vs-random protocol and its measurement-
+    hygiene rules: the pinned secret is a heap value drawn from
+    the same sampler as the random class, class A draws and
+    discards a fresh secret per pair for allocation symmetry,
+    and per-pair public inputs stay fresh in both classes.
+  * Add 'Attribution' and 'attribute', which run the A/A and B/B
+    diagnostics and fold their verdicts into a four-way
+    attribution of a rejection (target leak, sampler-specific
+    asymmetry, or pervasive harness asymmetry).
+  * Add 'Censor.Rng', the splitmix64 sampler PRNG previously
+    hand-rolled by every executable, re-exported from 'Censor'.
+  * Add 'Censor.FFI.fillRandom' for filling foreign workspaces
+    with sampler randomness.
+  * The demo executables take the meter as a command-line
+    argument (wall | instructions | branches | cycles),
+    defaulting to wall-clock, instead of silently falling back
+    from PMU to wall-clock.
   * Bump to ppad-eproc 0.2. The driver now surfaces e-process
     config validation failures as 'InvalidEprocConfig', a new
     'CensorError' constructor wrapping the upstream 'ConfigError'.

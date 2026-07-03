@@ -38,21 +38,27 @@
 -- > foreign import ccall unsafe "ct_mul"
 -- >   c_mul :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> IO ()
 -- >
--- > mulHyp :: Rng -> Rng -> FFIHypothesis
--- > mulHyp ga gb = FFIHypothesis
+-- > mulHyp :: Rng -> FFIHypothesis
+-- > mulHyp g = FFIHypothesis
 -- >   { ffiWorkspaceBytes = 96
 -- >   , ffiSampleA = \p -> do
--- >       fillFixed (p `plusPtr` 0)  32  -- input A: fixed
--- >       fillRandom ga (p `plusPtr` 32) 32  -- input B: random
+-- >       fillRandom g (p `plusPtr` 0) 32    -- draw and discard,
+-- >       fillBytes (p `plusPtr` 0) 0 32     -- then fix: input a
+-- >       fillRandom g (p `plusPtr` 32) 32   -- input b: random
 -- >   , ffiSampleB = \p -> do
--- >       fillRandom gb (p `plusPtr` 0)  32
--- >       fillRandom gb (p `plusPtr` 32) 32
+-- >       fillRandom g (p `plusPtr` 0)  32
+-- >       fillRandom g (p `plusPtr` 32) 32
 -- >   , ffiTarget = \p ->
 -- >       c_mul p (p `plusPtr` 32) (p `plusPtr` 64)
 -- >   }
 -- >
--- > result <- withFFIHypothesis (mulHyp ga gb) $ \h ->
+-- > result <- withFFIHypothesis (mulHyp g) $ \h ->
 -- >   runCT wallClock defaultConfig h
+--
+-- 'Rng' and 'fillRandom' come from "Censor.Rng" and this module;
+-- @fillBytes@ is 'Foreign.Marshal.Utils.fillBytes'. The discarded
+-- 'fillRandom' in @ffiSampleA@ keeps the two samplers' generator
+-- work symmetric before the fixed operand overwrites it.
 
 module Censor.FFI (
     -- * Foreign hypothesis
@@ -60,12 +66,18 @@ module Censor.FFI (
 
     -- * Bridging to runCT
   , withFFIHypothesis
+
+    -- * Workspace fills
+  , fillRandom
   ) where
 
+import Censor.Rng (Rng, nextWord)
 import Censor (Hypothesis(..))
-import Data.Word (Word8)
+import qualified Data.Bits as B
+import Data.Word (Word8, Word64)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (Ptr)
+import Foreign.Storable (pokeByteOff)
 
 -- | A foreign-function constant-time hypothesis.
 --
@@ -101,3 +113,29 @@ withFFIHypothesis h k =
     , sampleA = ffiSampleA h p >> pure p
     , sampleB = ffiSampleB h p >> pure p
     }
+
+-- | Fill @n@ bytes at the pointer with pseudorandom bytes drawn
+--   from the generator.
+fillRandom :: Rng -> Ptr Word8 -> Int -> IO ()
+fillRandom !g !dst !n = go 0
+  where
+    go !i
+      | i >= n    = pure ()
+      | otherwise = do
+          !w <- nextWord g
+          let !left  = n - i
+              !chunk = if left > 8 then 8 else left
+          writeWord dst i w chunk
+          go (i + chunk)
+
+-- write the low @lim@ bytes of a 'Word64', little-endian, at the
+-- given offset.
+writeWord :: Ptr Word8 -> Int -> Word64 -> Int -> IO ()
+writeWord !dst !off !w !lim = go 0
+  where
+    go !j
+      | j >= lim  = pure ()
+      | otherwise = do
+          let !byte = fromIntegral (w `B.shiftR` (8 * j)) :: Word8
+          pokeByteOff dst (off + j) byte
+          go (j + 1)

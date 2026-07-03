@@ -61,6 +61,7 @@ library
       Censor
       Censor.FFI
       Censor.Meter
+      Censor.Rng
   build-depends:
       base >= 4.9 && < 5
     , ppad-eproc >= 0.3 && < 0.4
