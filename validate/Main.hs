@@ -19,7 +19,6 @@ module Main where
 
 import qualified Censor as C
 import Control.Monad (forM, forM_, unless)
-import qualified Data.Bits as B
 import Data.IORef
 import Data.List (intercalate)
 import Data.Maybe (isJust)
@@ -32,30 +31,16 @@ import Text.Read (readMaybe)
 
 -- splitmix64 -----------------------------------------------------------------
 
--- Internal PRNG for the synthetic distributions. We don't want a
--- dependency on `splitmix` or `random`, so roll splitmix64 inline.
+-- Internal PRNG for the synthetic distributions, from Censor.Rng.
 -- A separate generator is used for every stream; deterministic
 -- seeding lets failures reproduce.
 
-newtype Rng = Rng (IORef Word64)
-
-mkRng :: Word64 -> IO Rng
-mkRng !seed = Rng <$> newIORef seed
-
-nextW64 :: Rng -> IO Word64
-nextW64 (Rng ref) = atomicModifyIORef' ref $ \s ->
-  let !s' = s + 0x9E3779B97F4A7C15
-      !z0 = (s' `B.xor` (s' `B.shiftR` 30)) * 0xBF58476D1CE4E5B9
-      !z1 = (z0 `B.xor` (z0 `B.shiftR` 27)) * 0x94D049BB133111EB
-      !z2 =  z1 `B.xor` (z1 `B.shiftR` 31)
-  in  (s', z2)
-
 -- uniform integer in @[lo, hi]@, inclusive.
-uniformInt :: Rng -> Word64 -> Word64 -> IO Word64
+uniformInt :: C.Rng -> Word64 -> Word64 -> IO Word64
 uniformInt !rng !lo !hi
   | hi <= lo  = pure lo
   | otherwise = do
-      !w <- nextW64 rng
+      !w <- C.nextWord rng
       let !range = hi - lo + 1
       pure $! lo + (w `mod` range)
 
@@ -158,8 +143,8 @@ scConstant = Scenario "constant" $ \_ ->
 
 scSymUniform :: Word64 -> Scenario
 scSymUniform !seed = Scenario "sym-uniform-iid" $ \_ -> do
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   pure (uniformInt ra 0 200, uniformInt rb 0 200)
 
 -- A uniform over a wide range, B uniform over a narrow centred
@@ -168,8 +153,8 @@ scSymUniform !seed = Scenario "sym-uniform-iid" $ \_ -> do
 -- under our mean-equality null.
 scAsymUniform :: Word64 -> Scenario
 scAsymUniform !seed = Scenario "asym-uniform-equal-mean" $ \_ -> do
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   pure (uniformInt ra 0 200, uniformInt rb 50 150)
 
 -- 95% uniform[50, 150] + 5% uniform[5000, 10000] for both classes.
@@ -177,10 +162,10 @@ scAsymUniform !seed = Scenario "asym-uniform-equal-mean" $ \_ -> do
 -- distributions mean equal means, so H_0 holds.
 scHeavyTail :: Word64 -> Scenario
 scHeavyTail !seed = Scenario "heavy-tail" $ \_ -> do
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   let draw rng = do
-        u <- nextW64 rng
+        u <- C.nextWord rng
         if u `mod` 20 == 0
           then uniformInt rng 5000 10000
           else uniformInt rng 50   150
@@ -195,12 +180,12 @@ scHeavyTail !seed = Scenario "heavy-tail" $ \_ -> do
 scDriftingBaseline :: Word64 -> Scenario
 scDriftingBaseline !seed = Scenario "drifting-baseline" $ \_ -> do
   ctr <- newIORef (0 :: Int)
-  noiseA <- mkRng seed
-  noiseB <- mkRng (seed + 1)
+  noiseA <- C.mkRng seed
+  noiseB <- C.mkRng (seed + 1)
   let draw rng = do
         n <- atomicModifyIORef' ctr (\x -> (x + 1, x))
         let !base = 100 + fromIntegral (n `div` 2) * 10
-        u <- nextW64 rng
+        u <- C.nextWord rng
         let !noise = fromIntegral (u `mod` 21) - 10
         pure $! fromIntegral (base + noise :: Int)
   pure (draw noiseA, draw noiseB)
@@ -227,8 +212,8 @@ scAllClipping !seed = Scenario "pathological-clipping" $ \cfg -> do
 -- bound. Tests behaviour at the clipping boundary.
 scNearBound :: Word64 -> Scenario
 scNearBound !seed = Scenario "near-bound" $ \_ -> do
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   pure (uniformInt ra 180 200, uniformInt rb 180 200)
 
 -- Mid-run regime change: warmup and the early main phase see a
@@ -240,8 +225,8 @@ scNearBound !seed = Scenario "near-bound" $ \_ -> do
 scRegimeChange :: Word64 -> Scenario
 scRegimeChange !seed = Scenario "regime-change" $ \cfg -> do
   ctr <- newIORef (0 :: Int)
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   let !switchAt = 2 * C.cfgWarmup cfg + C.cfgBudget cfg
       draw rng = do
         n <- atomicModifyIORef' ctr (\x -> (x + 1, x))
@@ -259,8 +244,8 @@ scRegimeChange !seed = Scenario "regime-change" $ \cfg -> do
 -- scaled with reading magnitude.
 scNarrowJitter :: Word64 -> Scenario
 scNarrowJitter !seed = Scenario "narrow-jitter" $ \_ -> do
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   pure (uniformInt ra 9990 10010, uniformInt rb 9990 10010)
 
 -- Rare-outlier H_0: both classes are 99% uniform[50,150] + 1%
@@ -271,10 +256,10 @@ scNarrowJitter !seed = Scenario "narrow-jitter" $ \_ -> do
 -- components, so it shouldn't).
 scRareOutlier :: Word64 -> Scenario
 scRareOutlier !seed = Scenario "rare-outlier" $ \_ -> do
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   let draw rng = do
-        u <- nextW64 rng
+        u <- C.nextWord rng
         if u `mod` 100 == 0
           then uniformInt rng 900 1100
           else uniformInt rng 50  150
@@ -289,11 +274,11 @@ scRareOutlier !seed = Scenario "rare-outlier" $ \_ -> do
 -- rationale for the hedge.
 scRareOutlierAsym :: Word64 -> Scenario
 scRareOutlierAsym !seed = Scenario "rare-outlier-asym" $ \_ -> do
-  ra <- mkRng seed
-  rb <- mkRng (seed + 1)
+  ra <- C.mkRng seed
+  rb <- C.mkRng (seed + 1)
   let drawA = uniformInt ra 50 150
       drawB = do
-        u <- nextW64 rb
+        u <- C.nextWord rb
         if u `mod` 100 == 0
           then uniformInt rb 900 1100
           else uniformInt rb 50  150

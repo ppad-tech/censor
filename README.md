@@ -63,22 +63,49 @@ let hyp = C.Hypothesis
 result <- C.runCT C.wallClock C.defaultConfig hyp
 
 case result of
-  C.Reject n w nc -> putStrLn $
-    "leak detected after " ++ show n ++ " sample pairs"
-    ++ " (" ++ show nc ++ " pairs clipped)"
-  C.Pass n w nc -> putStrLn $
-    "no leak detected within budget (" ++ show n ++ " samples,"
-    ++ " " ++ show nc ++ " pairs clipped)"
+  C.Reject {} -> putStrLn $
+    "leak detected after " ++ show (C.resPairs result)
+    ++ " sample pairs"
+  C.Pass {} -> putStrLn $
+    "no leak detected within budget ("
+    ++ show (C.resPairs result) ++ " pairs, "
+    ++ show (C.resClipped result) ++ " clipped)"
 ```
 
-`Reject` and `Pass` both carry a clip count: the number of pairs
-whose absolute difference `|d| = |ta - tb|` exceeded the
-warmup-estimated upper bound and was truncated before being fed to
-the test. Clipping preserves the type-I error guarantee but reduces
-power against tail-shifting leaks, so a clip count that is a
-substantial fraction of `samples` indicates the warmup bound was
-too tight. Raise `cfgWarmup`, enlarge `cfgBatch`, or treat the run
-with suspicion.
+For the standard dudect-style fix-vs-random protocol, `fixVsRandom`
+builds the hypothesis and encodes the measurement-hygiene rules
+(below) for you: the fixed secret is drawn once from the sampler —
+a heap value reached by the same code path as the random class —
+class A draws and discards a fresh secret per pair so the samplers
+stay allocation-symmetric, and public inputs stay fresh in both
+classes:
+
+```haskell
+-- pin a secret key; keep per-pair messages fresh in both classes
+hyp <- C.fixVsRandom
+  (\(k, m) -> () <$ evaluate (SHA256.hmac k m))         -- target
+  (random32 g)                                          -- secret
+  (\k -> do m <- randomBytes g 256; pure (k, m))        -- completion
+
+result <- C.runCT C.wallClock C.defaultConfig hyp
+```
+
+(`Censor.Rng` provides the splitmix64 generator — `mkRng`,
+`nextWord` — that samplers typically build on: deterministic under
+a fixed seed, cheap, and allocation-light.)
+
+`Reject` and `Pass` carry the same run report: pairs consumed
+(`resPairs`), the mixture's peak log-wealth (`resPeakLogW`),
+per-component peak log-wealths (`resPeakSign`, `resPeakMagn`,
+`resPeakMagn4`, `resPeakMagn16`), the warmup-estimated clip bound
+(`resBound`), and a clip count (`resClipped`): the number of pairs
+whose absolute difference `|d| = |ta - tb|` exceeded the bound and
+was truncated before being fed to the tight magnitude component.
+Clipping preserves the type-I error guarantee but reduces power
+against tail-shifting leaks, so a clip count that is a substantial
+fraction of `resPairs` indicates the warmup bound was too tight.
+Raise `cfgWarmup`, enlarge `cfgBatch`, or treat the run with
+suspicion.
 
 ### A/A diagnostic
 
@@ -106,6 +133,16 @@ sampler, RTS state that only its fresh objects trigger). Running
 both diagnostics attributes any `Reject` to one of: (a) target
 leak, (b) `sampleA`-specific harness bug, (c) `sampleB`-specific
 harness bug, or (d) pervasive harness asymmetry across both.
+
+`attribute` packages the whole protocol — it runs both diagnostics
+and folds their verdicts into a four-way `Attribution`
+(`TargetLeak`, `SampleAAsymmetry`, `SampleBAsymmetry`, or
+`PervasiveAsymmetry`, with the rejecting diagnostic results
+attached as evidence):
+
+```haskell
+att <- C.attribute meter C.defaultConfig hyp
+```
 
 ### Reproducibility
 
@@ -144,6 +181,7 @@ via offsets the caller chooses.
 ```haskell
 import qualified Censor as C
 import qualified Censor.FFI as F
+import Foreign.Marshal.Utils (fillBytes)
 import Foreign.Ptr (Ptr, plusPtr)
 import Data.Word (Word8)
 
@@ -155,11 +193,12 @@ foreign import ccall unsafe "ct_mul"
 let hyp = F.FFIHypothesis
       { F.ffiWorkspaceBytes = 96     -- two 32B inputs + 32B output
       , F.ffiSampleA = \p -> do
-          fillFixed     (p `plusPtr`  0) 32   -- A: fixed input
-          fillRandom ga (p `plusPtr` 32) 32   -- A: random partner
+          F.fillRandom g (p `plusPtr`  0) 32  -- draw and discard,
+          fillBytes      (p `plusPtr`  0) 0 32  -- then fix input a
+          F.fillRandom g (p `plusPtr` 32) 32  -- input b: random
       , F.ffiSampleB = \p -> do
-          fillRandom gb (p `plusPtr`  0) 32
-          fillRandom gb (p `plusPtr` 32) 32
+          F.fillRandom g (p `plusPtr`  0) 32
+          F.fillRandom g (p `plusPtr` 32) 32
       , F.ffiTarget = \p ->
           c_mul p (p `plusPtr` 32) (p `plusPtr` 64)
       }
@@ -167,6 +206,10 @@ let hyp = F.FFIHypothesis
 result <- F.withFFIHypothesis hyp $ \h ->
   C.runCT C.wallClock C.defaultConfig h
 ```
+
+(`fillRandom` fills workspace bytes from a `Censor.Rng` generator;
+the discarded class-A fill keeps the samplers' generator work
+symmetric before the fixed operand overwrites it.)
 
 `ffiTarget` should be a single FFI call with no in-Haskell
 preparation — any marshalling done inside it lands in the timed
@@ -308,7 +351,11 @@ Uniform weights over the four components; threshold at
 `log(8/alpha)` (the `+log 4` over the single-component
 `log(2/alpha)` is the price of hedging). Rejection latches on the
 supremum of the mixture's log-wealth, not on the components'
-individual suprema.
+individual suprema. Each component's own peak log-wealth is
+surfaced in the `Result` for diagnosis — a rejection driven by the
+sign component points at a shape or bulk-shift leak, one driven by
+the wide magnitude components at rare outliers — but the peaks are
+attained at possibly different times and never gate the verdict.
 
 ### Baseline
 

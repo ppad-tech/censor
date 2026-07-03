@@ -4,10 +4,12 @@ module Main where
 
 import Control.Exception (try)
 import Control.Monad (replicateM_)
-import qualified Data.Bits as B
 import Data.IORef
-import Data.Word (Word64)
+import Data.Word (Word8, Word64)
 import qualified Censor as C
+import qualified Censor.FFI as F
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Marshal.Array (peekArray)
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -21,7 +23,11 @@ main = defaultMain $ testGroup "ppad-censor" [
   , offByOneTests
   , clipCountTests
   , aaDiagnosticTests
+  , attributeTests
   , signOnlyLeakTests
+  , fixVsRandomTests
+  , rngTests
+  , fillRandomTests
   , smokeCalibrationTests
   ]
 
@@ -57,10 +63,11 @@ wallClockTests = testGroup "wall-clock" [
             }
       result <- C.runCT C.wallClock testConfig hyp
       case result of
-        C.Pass _ _ _ -> pure ()
-        C.Reject n w _ -> assertFailure $
-          "CT target falsely rejected at n=" ++ show n
-          ++ " logW=" ++ show w
+        C.Pass{} -> pure ()
+        C.Reject { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "CT target falsely rejected at n=" ++ show n
+            ++ " logW=" ++ show w
 
   , testCase "leaky target rejected within budget" $ do
       ref <- newIORef (0 :: Int)
@@ -72,10 +79,11 @@ wallClockTests = testGroup "wall-clock" [
             }
       result <- C.runCT C.wallClock testConfig hyp
       case result of
-        C.Reject _ _ _ -> pure ()
-        C.Pass n w _ -> assertFailure $
-          "leaky target not detected; passed n=" ++ show n
-          ++ " logW=" ++ show w
+        C.Reject{} -> pure ()
+        C.Pass { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "leaky target not detected; passed n=" ++ show n
+            ++ " logW=" ++ show w
   ]
 
 noopHyp :: C.Hypothesis ()
@@ -95,9 +103,10 @@ flatMeterTests = testGroup "flat meter" [
             }
       r <- C.runCT (constMeter 100) c noopHyp
       case r of
-        C.Pass n _ _ -> n @?= C.cfgBudget c
-        C.Reject n w _ -> assertFailure $
-          "flat meter rejected at n=" ++ show n ++ " logW=" ++ show w
+        C.Pass { C.resPairs = n } -> n @?= C.cfgBudget c
+        C.Reject { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "flat meter rejected at n=" ++ show n ++ " logW=" ++ show w
 
   , testCase "Pass count is invariant under cfgBatch" $ do
       let mkCfg b = C.defaultConfig
@@ -105,10 +114,7 @@ flatMeterTests = testGroup "flat meter" [
             , C.cfgWarmup = 10
             , C.cfgBatch  = b
             }
-          collect r = case r of
-            C.Pass n _ _   -> n
-            C.Reject n _ _ -> n
-      ns <- mapM (\b -> collect <$>
+      ns <- mapM (\b -> C.resPairs <$>
                           C.runCT (constMeter 100) (mkCfg b) noopHyp)
                  [1, 10, 100, 1000]
       ns @?= replicate 4 100
@@ -121,8 +127,26 @@ flatMeterTests = testGroup "flat meter" [
             }
       r <- C.runCT (constMeter 100) c noopHyp
       case r of
-        C.Pass _ _ nc -> nc @?= 0
-        C.Reject _ _ _ -> assertFailure "flat meter unexpectedly rejected"
+        C.Pass { C.resClipped = nc } -> nc @?= 0
+        C.Reject{} -> assertFailure "flat meter unexpectedly rejected"
+
+    -- zero warmup differences floor the clip bound at 1, and a flat
+    -- wealth process leaves every peak at its starting value: log 2
+    -- per component, log 8 for the mixture.
+  , testCase "flat meter report: unit bound, floor peaks" $ do
+      let c = C.defaultConfig
+            { C.cfgBudget = 200
+            , C.cfgWarmup = 20
+            , C.cfgBatch  = 1
+            }
+      r <- C.runCT (constMeter 100) c noopHyp
+      C.resBound r @?= 1
+      assertBool "mixture peak below floor"
+        (C.resPeakLogW r >= log 8 - 1e-9)
+      let !minPeak = min (min (C.resPeakSign r) (C.resPeakMagn r))
+                         (min (C.resPeakMagn4 r) (C.resPeakMagn16 r))
+      assertBool "component peak below floor"
+        (minPeak >= log 2 - 1e-9)
   ]
 
 calibrationTests :: TestTree
@@ -202,10 +226,11 @@ deterministicLeakTests = testGroup "deterministic leak" [
       (hyp, meter) <- leakHyp
       r <- C.runCT meter leakCfg hyp
       case r of
-        C.Reject _ _ _ -> pure ()
-        C.Pass n w _   -> assertFailure $
-          "deterministic divergence not detected; passed n="
-          ++ show n ++ " logW=" ++ show w
+        C.Reject{} -> pure ()
+        C.Pass { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "deterministic divergence not detected; passed n="
+            ++ show n ++ " logW=" ++ show w
   ]
 
 -- regression for the off-by-one: a threshold crossing on the final
@@ -218,8 +243,8 @@ offByOneTests = testGroup "budget/decide off-by-one" [
       k <- do
         r <- C.runCT meter1 leakCfg hyp1
         case r of
-          C.Reject n _ _ -> pure n
-          C.Pass _ _ _   -> assertFailure
+          C.Reject { C.resPairs = n } -> pure n
+          C.Pass{} -> assertFailure
             "leak fixture failed to reject under generous budget"
             >> pure 0  -- unreachable
       -- 2. re-run with cfgBudget = k. Without the fix the run would
@@ -228,10 +253,11 @@ offByOneTests = testGroup "budget/decide off-by-one" [
       let tight = leakCfg { C.cfgBudget = k }
       r2 <- C.runCT meter2 tight hyp2
       case r2 of
-        C.Reject n _ _ -> n @?= k
-        C.Pass n w _   -> assertFailure $
-          "off-by-one regression: tight budget passed at n="
-          ++ show n ++ " logW=" ++ show w
+        C.Reject { C.resPairs = n } -> n @?= k
+        C.Pass { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "off-by-one regression: tight budget passed at n="
+            ++ show n ++ " logW=" ++ show w
   ]
 
 -- An equal-mean shape leak that /only/ the sign component of the
@@ -266,10 +292,15 @@ signOnlyLeakTests = testGroup "sign-only leak" [
             }
       r <- C.runCT leakMeter c hyp
       case r of
-        C.Reject _ _ _ -> pure ()
-        C.Pass n w _   -> assertFailure $
-          "shape leak not detected; passed n=" ++ show n
-          ++ " logW=" ++ show w
+        -- a shape leak grows the sign component, not the magnitude
+        -- ones; the per-component peaks should reflect that.
+        C.Reject{} -> assertBool
+          "sign component did not dominate the rejection"
+          (C.resPeakSign r > C.resPeakMagn r)
+        C.Pass { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "shape leak not detected; passed n=" ++ show n
+            ++ " logW=" ++ show w
   ]
 
 -- toAA / toBB collapse a leaky hypothesis into H_0 by construction —
@@ -285,21 +316,125 @@ aaDiagnosticTests = testGroup "A/A and B/B diagnostics" [
       let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
       r <- C.runAA meter c hyp
       case r of
-        C.Pass _ _ _ -> pure ()
-        C.Reject n w _ -> assertFailure $
-          "A/A diagnostic falsely rejected at n=" ++ show n
-          ++ " logW=" ++ show w
+        C.Pass{} -> pure ()
+        C.Reject { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "A/A diagnostic falsely rejected at n=" ++ show n
+            ++ " logW=" ++ show w
 
   , testCase "runBB passes a hypothesis that runCT would reject" $ do
       (hyp, meter) <- leakHyp
       let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
       r <- C.runBB meter c hyp
       case r of
-        C.Pass _ _ _ -> pure ()
-        C.Reject n w _ -> assertFailure $
-          "B/B diagnostic falsely rejected at n=" ++ show n
-          ++ " logW=" ++ show w
+        C.Pass{} -> pure ()
+        C.Reject { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "B/B diagnostic falsely rejected at n=" ++ show n
+            ++ " logW=" ++ show w
   ]
+
+-- attribute composes runAA and runBB: the leak fixture has
+-- class-constant samplers, so both diagnostics are flat and the
+-- rejection attributes to the target.
+attributeTests :: TestTree
+attributeTests = testGroup "attribute" [
+    testCase "symmetric-harness leak attributes to the target" $ do
+      (hyp, meter) <- leakHyp
+      let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
+      att <- C.attribute meter c hyp
+      case att of
+        C.TargetLeak -> pure ()
+        other -> assertFailure $
+          "expected TargetLeak, got " ++ show other
+  ]
+
+-- fixVsRandom pins the first secret draw as class A's input and
+-- feeds fresh draws to class B. fixture: the target writes its
+-- input to an IORef and the meter reads it back, so a sampler whose
+-- first draw differs from all later draws leaks deterministically,
+-- while the A/A collapse of the same hypothesis is null by
+-- construction.
+fixVsRandomTests :: TestTree
+fixVsRandomTests = testGroup "fixVsRandom" [
+    testCase "pinned-vs-random divergence is rejected" $ do
+      (hyp, meter) <- pinnedHyp
+      r <- C.runCT meter leakCfg hyp
+      case r of
+        C.Reject{} -> pure ()
+        C.Pass { C.resPairs = n } -> assertFailure $
+          "pinned divergence not detected; passed n=" ++ show n
+
+  , testCase "A/A collapse of the pinned hypothesis passes" $ do
+      (hyp, meter) <- pinnedHyp
+      let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
+      r <- C.runAA meter c hyp
+      case r of
+        C.Pass{} -> pure ()
+        C.Reject { C.resPairs = n } -> assertFailure $
+          "A/A collapse falsely rejected at n=" ++ show n
+
+  , testCase "constant secret sampler passes at budget" $ do
+      ref <- newIORef (0 :: Word64)
+      let meter = C.Meter $ \k act ->
+            let go 0 = pure ()
+                go i = act >> go (i - 1)
+            in  go k >> readIORef ref
+      hyp <- C.fixVsRandom (writeIORef ref) (pure (100 :: Word64)) pure
+      r <- C.runCT meter leakCfg hyp
+      case r of
+        C.Pass { C.resPairs = n } -> n @?= C.cfgBudget leakCfg
+        C.Reject { C.resPairs = n } -> assertFailure $
+          "constant sampler rejected at n=" ++ show n
+  ]
+  where
+    -- first draw 100 (the pinned secret), all later draws 200.
+    pinnedHyp = do
+      ref <- newIORef (0 :: Word64)
+      ctr <- newIORef (0 :: Int)
+      let meter = C.Meter $ \k act ->
+            let go 0 = pure ()
+                go i = act >> go (i - 1)
+            in  go k >> readIORef ref
+          sec = do
+            n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
+            pure $! if n == 0 then 100 else 200 :: Word64
+      hyp <- C.fixVsRandom (writeIORef ref) sec pure
+      pure (hyp, meter)
+
+rngTests :: TestTree
+rngTests = testGroup "Censor.Rng" [
+    testCase "equal seeds give equal streams" $ do
+      g1 <- C.mkRng 0xFEEDFACE
+      g2 <- C.mkRng 0xFEEDFACE
+      ws1 <- mapM (\_ -> C.nextWord g1) [1 .. 16 :: Int]
+      ws2 <- mapM (\_ -> C.nextWord g2) [1 .. 16 :: Int]
+      ws1 @?= ws2
+
+  , testCase "distinct seeds give distinct streams" $ do
+      g1 <- C.mkRng 1
+      g2 <- C.mkRng 2
+      w1 <- C.nextWord g1
+      w2 <- C.nextWord g2
+      assertBool "streams coincide" (w1 /= w2)
+  ]
+
+fillRandomTests :: TestTree
+fillRandomTests = testGroup "Censor.FFI.fillRandom" [
+    testCase "deterministic under a fixed seed, handles ragged n" $ do
+      let n = 13  -- deliberately not a multiple of 8
+      bs1 <- fillWith 0xABCD n
+      bs2 <- fillWith 0xABCD n
+      bs1 @?= bs2
+      assertBool "expected nonzero bytes" (any (/= 0) bs1)
+  ]
+  where
+    fillWith :: Word64 -> Int -> IO [Word8]
+    fillWith seed n = do
+      g <- C.mkRng seed
+      allocaBytes n $ \p -> do
+        F.fillRandom g p n
+        peekArray n p
 
 -- a tripwire calibration tier: run runCT a few hundred times under
 -- a true-H_0 synthetic meter and assert the empirical rejection rate
@@ -328,17 +463,9 @@ mkSynthMeter nextA nextB = do
         }
   pure (meter, hyp)
 
-splitmix :: IORef Word64 -> IO Word64
-splitmix ref = atomicModifyIORef' ref $ \s ->
-  let !s' = s + 0x9E3779B97F4A7C15
-      !z0 = (s' `B.xor` (s' `B.shiftR` 30)) * 0xBF58476D1CE4E5B9
-      !z1 = (z0 `B.xor` (z0 `B.shiftR` 27)) * 0x94D049BB133111EB
-      !z2 =  z1 `B.xor` (z1 `B.shiftR` 31)
-  in  (s', z2)
-
-uniformInRange :: IORef Word64 -> Word64 -> Word64 -> IO Word64
-uniformInRange ref lo hi = do
-  w <- splitmix ref
+uniformInRange :: C.Rng -> Word64 -> Word64 -> IO Word64
+uniformInRange g lo hi = do
+  w <- C.nextWord g
   pure $! lo + (w `mod` (hi - lo + 1))
 
 countRejects :: Int -> IO C.Result -> IO Int
@@ -372,14 +499,14 @@ smokeCalibrationTests = testGroup "smoke calibration" [
       , C.cfgBatch  = 1
       }
     symUniformTrial = do
-      ra <- newIORef 0x5EED01
-      rb <- newIORef 0x5EED02
+      ra <- C.mkRng 0x5EED01
+      rb <- C.mkRng 0x5EED02
       (m, h) <- mkSynthMeter (uniformInRange ra 0 200)
                              (uniformInRange rb 0 200)
       C.runCT m cfg h
     asymUniformTrial = do
-      ra <- newIORef 0x5EED03
-      rb <- newIORef 0x5EED04
+      ra <- C.mkRng 0x5EED03
+      rb <- C.mkRng 0x5EED04
       (m, h) <- mkSynthMeter (uniformInRange ra 0 200)
                              (uniformInRange rb 50 150)
       C.runCT m cfg h
@@ -395,8 +522,8 @@ smokeCalibrationTests = testGroup "smoke calibration" [
 -- clip count rises when |ta - tb| exceeds the warmup-derived bound.
 -- fixture: target writes its input to an IORef, meter reads it;
 -- class A always writes 100, class B writes 200 during warmup (|d|
--- = 100, so bound ~= 200) and 1000000 during the main loop (|d| ~=
--- 999900, well above the bound).
+-- = 100, so bound = 2 * 100 = 200) and 1000000 during the main loop
+-- (|d| ~= 999900, well above the bound).
 clipCountTests :: TestTree
 clipCountTests = testGroup "clip counts" [
     testCase "clip count rises when |d| exceeds bound" $ do
@@ -423,9 +550,10 @@ clipCountTests = testGroup "clip counts" [
             , C.cfgBatch  = 1
             }
       r <- C.runCT leakMeter c hyp
-      let nc = case r of
-            C.Pass _ _ x   -> x
-            C.Reject _ _ x -> x
-      assertBool ("expected nonzero clip count, got " ++ show nc)
-                 (nc > 0)
+      -- every warmup |d| is exactly 100, so the bound is pinned at
+      -- 2 * p99(|d|) = 200.
+      C.resBound r @?= 200
+      assertBool ("expected nonzero clip count, got "
+                  ++ show (C.resClipped r))
+                 (C.resClipped r > 0)
   ]
