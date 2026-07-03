@@ -265,6 +265,18 @@ posHMACSHA512 = do
 -- non-CT implementation would early-exit on B and be measurably
 -- faster. Equal-vs-unequal rather than fix-vs-random, so wired by
 -- hand.
+--
+-- Note that the comparison /result/ here correlates exactly with
+-- the class label, and materialising it as a Bool ends in a branch
+-- whose direction is that result -- so under wall clock this case
+-- typically REJECTs on the batched taken-vs-not-taken front-end
+-- asymmetry of a perfectly-predicted branch. That branch reveals
+-- only the accept/reject bit, which MAC verification makes public
+-- by protocol; it is not an exploitable leak, and no Bool-returning
+-- equality can avoid it. Expect PASS under the PMU instruction and
+-- branch meters (both directions retire identical counts). The
+-- mismatch-position case below tests the property that early-exit
+-- comparisons actually violate.
 posMACEq :: IO (C.Hypothesis (SHA256.MAC, SHA256.MAC))
 posMACEq = do
   g <- C.mkRng fixedSeed
@@ -299,6 +311,36 @@ posMACEq = do
         !m2   <- C.randomBytes g 256
         !tag2 <- evaluate $! SHA256.hmac k2 m2
         pure (tag1, tag2)
+    }
+
+-- positive control: MAC equality, mismatch-position independence.
+-- Both classes compare unequal tags (same terminal result, False),
+-- differing only in where the single mismatching byte sits: first
+-- byte (class A) vs last byte (class B). An early-exit comparison
+-- would be ~32x faster on class A; the full-walk XOR fold should
+-- show no position dependence. Unlike the equal-vs-unequal case,
+-- the (public) comparison result does not correlate with the class
+-- label here, so this directly tests the security-relevant
+-- property.
+posMACPos :: IO (C.Hypothesis (SHA256.MAC, SHA256.MAC))
+posMACPos = do
+  g <- C.mkRng fixedSeed
+  let flipAt i bs = BS.pack
+        [ if j == i then B.xor w 0xFF else w
+        | (j, w) <- zip [0 :: Int ..] (BS.unpack bs) ]
+      mk i = do
+        !k <- random32 g
+        !m <- C.randomBytes g 256
+        let SHA256.MAC raw = SHA256.hmac k m
+        !t <- evaluate (SHA256.MAC raw)
+        !u <- evaluate (SHA256.MAC (flipAt i raw))
+        pure (t, u)
+  pure C.Hypothesis
+    { C.target  = \(!a, !b) -> do
+        !_ <- evaluate (a == b)
+        pure ()
+    , C.sampleA = mk 0
+    , C.sampleB = mk 31
     }
 
 -- positive control: BIP32 child key derivation. The secret is the
@@ -457,6 +499,8 @@ runAll tex meter = do
   rh "positive: SHA512.hmac (256 B msg, secret key)"       posHMACSHA512
   runCaseWith meter cfgBigBatch
      "positive: MAC == (constant-time tag compare, batch=2000)" posMACEq
+  runCaseWith meter cfgBigBatch
+     "positive: MAC == (mismatch@0 vs mismatch@31, batch=2000)" posMACPos
   rh "positive: BIP32 derive_child_priv (secret parent)"   posBIP32Derive
   rc "negative: deliberately leaky popcount-driven loop"   negLeakyPopcount
   rc "negative: Wider.from_vartime (Integer conversion)"   negFromVartime
