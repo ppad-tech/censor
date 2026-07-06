@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE UnboxedTuples #-}
 
 -- censor-viz: record real runs of the censor construction and dump
 -- per-pair trajectories as JSON, for the ppad.tech product-page
@@ -17,13 +18,14 @@
 module Main where
 
 import Control.Exception (evaluate)
-import Control.Monad (replicateM_)
 import qualified Censor as C
-import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Crypto.Curve.Secp256k1 as Secp
 import qualified Data.Bits as B
-import qualified Data.ByteString as BS
+import qualified Data.Choice as Ch
 import Data.List (intercalate, sort)
 import Data.Word (Word64)
+import qualified Data.Word.Wider as W
+import Data.Word.Wider (Wider)
 import qualified Numeric.Eproc.Bernoulli.TwoSided as EPSign
 import qualified Numeric.Eproc.Bounded as EPMagn
 import qualified Numeric.Eproc.ConfSeq as EPCS
@@ -47,6 +49,15 @@ effectGrid = 300
 
 fixedSeed :: Word64
 fixedSeed = 0x5EED5EED5EED5EED
+
+-- seed chosen so the leaky case's pinned scalar has Hamming weight
+-- 129, a single set bit above the binomial mean of the random
+-- class. the leak's mean-shift component is then one point
+-- addition per call (well under 1us of a ~300us operation), a far
+-- subtler signal than a typical pinned draw's ~8-bit deviation
+-- would produce.
+leakySeed :: Word64
+leakySeed = 0x5EED000000000033
 
 -- trajectory ------------------------------------------------------------------
 
@@ -192,31 +203,63 @@ orderStat99 xs =
 
 -- cases -----------------------------------------------------------------------
 
--- deliberately leaky: work proportional to the secret's popcount.
--- fix-vs-random on the secret gives class A a pinned popcount and
--- class B the binomial spread around 32, so timing depends on the
--- secret and the mixture races to a rejection.
-leaky :: IO (C.Hypothesis Word64)
+-- a random 256-bit scalar in normal form, as in censor-demo
+randomWider :: C.Rng -> IO Wider
+randomWider g = do
+  !a <- C.nextWord g
+  !b <- C.nextWord g
+  !c <- C.nextWord g
+  !d <- C.nextWord g
+  pure $! W.wider (fromIntegral a) (fromIntegral b)
+                  (fromIntegral c) (fromIntegral d)
+
+-- a busted scalar mul over the library's exported group
+-- operations: fixed-length double-and-add whose loop always runs
+-- 256 iterations, so the scalar's bit length does not leak -- but
+-- the per-bit add is branched on the bit value rather than
+-- constant-time selected:
+--
+--   time = const + 256 c_dbl + popcount(s) c_add
+--
+-- an isolated Hamming-weight leak, far subtler than an
+-- early-terminating variable-time mul.
+leakyMul :: Wider -> Secp.Projective
+leakyMul = loop (256 :: Int) Secp._CURVE_ZERO Secp._CURVE_G
+  where
+    loop !i !r !d !m
+      | i == 0    = r
+      | otherwise =
+          let !nd = Secp.double d
+              !(# nm, lsb #) = W.shr1_c m
+              !nr | Ch.decide lsb = Secp.add_proj r d
+                  | otherwise     = r
+          in  loop (i - 1) nr nd nm
+
+-- deliberately leaky: fix-vs-random on the scalar pins class A's
+-- popcount while class B's spreads binomially around 128, so the
+-- add count depends on the secret and the mixture hunts down the
+-- Hamming-weight signal.
+leaky :: IO (C.Hypothesis Wider)
 leaky = do
-  g <- C.mkRng fixedSeed
+  g <- C.mkRng leakySeed
   C.fixVsRandom
-    (\w -> replicateM_ (B.popCount w) (evaluate ()))
-    (C.nextWord g)
+    (\s -> do
+        !_ <- evaluate (leakyMul s)
+        pure ())
+    (randomWider g)
     pure
 
--- constant-time: HMAC-SHA256 under a pinned vs random key, fresh
--- 256-byte messages in both classes. mirrors the censor-demo case.
-ct :: IO (C.Hypothesis (BS.ByteString, BS.ByteString))
+-- constant-time: the same operation done properly, via the ladder
+-- ppad-secp256k1 uses for secret scalars.
+ct :: IO (C.Hypothesis Wider)
 ct = do
   g <- C.mkRng fixedSeed
   C.fixVsRandom
-    (\(k, m) -> do
-        !_ <- evaluate (SHA256.hmac k m)
+    (\s -> do
+        !_ <- evaluate (Secp.mul Secp._CURVE_G s)
         pure ())
-    (C.randomBytes g 32)
-    (\k -> do
-        !m <- C.randomBytes g 256
-        pure (k, m))
+    (randomWider g)
+    pure
 
 -- json ------------------------------------------------------------------------
 
@@ -243,13 +286,20 @@ main = do
   let out = case args of
         [path] -> path
         _      -> "censor-trace.json"
+  -- the busted mul must still compute the right points
+  g0 <- C.mkRng 0xB0B
+  s0 <- randomWider g0
+  case Secp.mul Secp._CURVE_G s0 of
+    Just q | show (Secp.affine (leakyMul s0)) == show (Secp.affine q)
+      -> pure ()
+    _ -> die "censor-viz: leakyMul disagrees with Secp.mul"
   putStrLn "recording leaky case..." >> hFlush stdout
   hl <- leaky
-  tl <- runTrace "popcount-driven loop" 20 20000 hl
+  tl <- runTrace "branchy double-and-add" 20 20000 hl
   printf "  %s after %d pairs\n" (tVerdict tl) (tPairs tl)
   putStrLn "recording constant-time case..." >> hFlush stdout
   hc <- ct
-  tc <- runTrace "SHA256.hmac" 50 50000 hc
+  tc <- runTrace "Secp256k1.mul" 20 50000 hc
   printf "  %s after %d pairs\n" (tVerdict tc) (tPairs tc)
   writeFile out $ concat
     [ "{\"alpha\":", printf "%.1g" alpha

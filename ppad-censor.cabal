@@ -157,10 +157,10 @@ executable censor-viz
   else
     build-depends:
         base
-      , bytestring
       , ppad-censor
       , ppad-eproc
-      , ppad-sha256
+      , ppad-fixed
+      , ppad-secp256k1
 
 executable censor-poly
   default-language: Haskell2010
