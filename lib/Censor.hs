@@ -461,8 +461,14 @@ calibrateBatch meter hyp = do
       -- from a small probe would inflate per-call cost with the meter's
       -- fixed per-measurement overhead (e.g. the clock reads); at the
       -- resolved batch that overhead is amortised.
+      -- a cap-hit means the median per-call reading is well below
+      -- one meter unit at the largest probed batch, which no
+      -- functioning meter produces (the batch loop alone costs
+      -- more); return 1 so the subsequent run fails fast in warmup
+      -- rather than grinding through zero readings at a million
+      -- calls per measurement.
       probe !b
-        | b > calibCap = pure calibCap
+        | b > calibCap = pure 1
         | otherwise = do
             !r <- probeReading meter act b
             if fromIntegral r < calibTarget

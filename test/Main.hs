@@ -189,6 +189,13 @@ batchCalibrationTests = testGroup "batch calibration" [
       -- a single call already exceeds the target magnitude.
       b <- C.calibrateBatch (linMeter 100000) noopHyp
       b @?= 1
+
+  , testCase "unresolvable meter picks batch 1" $ do
+      -- a meter stuck at zero never reaches the target magnitude;
+      -- calibration gives up at the cap and returns 1, so the
+      -- subsequent run fails fast in warmup (WarmupZeroDuration).
+      b <- C.calibrateBatch (linMeter 0) noopHyp
+      b @?= 1
   ]
 
 runCTWithTests :: TestTree
