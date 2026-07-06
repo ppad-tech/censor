@@ -58,6 +58,13 @@ flag sha
   default:     False
   manual:      True
 
+flag sha512
+  description: Build the censor-sha512 executable, which records
+               ppad-sha512 constant-time MAC comparison traces
+               under a selectable meter (depends on ppad-sha512).
+  default:     False
+  manual:      True
+
 source-repository head
   type:     git
   location: git.ppad.tech/censor.git
@@ -203,6 +210,23 @@ executable censor-sha
       , ppad-censor
       , ppad-eproc
       , ppad-sha256
+
+executable censor-sha512
+  default-language: Haskell2010
+  hs-source-dirs:   demo
+  main-is:          Sha512.hs
+  ghc-options:
+    -O2 -rtsopts -Wall
+
+  if !flag(sha512)
+    buildable: False
+  else
+    build-depends:
+        base
+      , bytestring
+      , ppad-censor
+      , ppad-eproc
+      , ppad-sha512
 
 executable censor-demo-ffi
   default-language: Haskell2010
