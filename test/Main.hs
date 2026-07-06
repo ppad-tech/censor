@@ -19,13 +19,16 @@ main = defaultMain $ testGroup "ppad-censor" [
     wallClockTests
   , flatMeterTests
   , calibrationTests
+  , batchCalibrationTests
   , configValidationTests
   , deterministicLeakTests
+  , runCTWithTests
   , evidenceTests
   , offByOneTests
   , clipCountTests
   , aaDiagnosticTests
   , attributeTests
+  , attributedTests
   , signOnlyLeakTests
   , fixVsRandomTests
   , rngTests
@@ -163,6 +166,80 @@ calibrationTests = testGroup "calibration" [
         Left other -> assertFailure $
           "expected WarmupZeroDuration, got " ++ show other
         Right _ -> assertFailure "expected WarmupZeroDuration"
+  ]
+
+-- a meter whose reading scales linearly with the batch: reads
+-- @k * perCall@. Lets calibrateBatch resolve a per-call cost, which a
+-- flat 'constMeter' (reading independent of @k@) cannot express.
+linMeter :: Word64 -> C.Meter
+linMeter perCall = C.Meter $ \k act ->
+  let go 0 = pure ()
+      go i = act >> go (i - 1)
+  in  go k >> pure (fromIntegral k * perCall)
+
+batchCalibrationTests :: TestTree
+batchCalibrationTests = testGroup "batch calibration" [
+    testCase "nanosecond-scale target picks a large batch" $ do
+      -- reading = 64 * batch; the target magnitude (65536) is reached
+      -- at batch 1024, which refines to itself.
+      b <- C.calibrateBatch (linMeter 64) noopHyp
+      b @?= 1024
+
+  , testCase "heavy target picks batch 1" $ do
+      -- a single call already exceeds the target magnitude.
+      b <- C.calibrateBatch (linMeter 100000) noopHyp
+      b @?= 1
+  ]
+
+runCTWithTests :: TestTree
+runCTWithTests = testGroup "runCTWith / Frame" [
+    testCase "one frame per pair on a passing run" $ do
+      let c = C.defaultConfig
+            { C.cfgBudget = 300, C.cfgWarmup = 20, C.cfgBatch = 1 }
+      ref <- newIORef []
+      r   <- C.runCTWith (constMeter 100) c noopHyp $ \ !fr ->
+               modifyIORef' ref (fr :)
+      frs <- fmap reverse (readIORef ref)
+      length frs @?= C.resPairs r
+      map C.frPair frs @?= [1 .. C.resPairs r]
+
+  , testCase "one frame per pair on a rejecting run" $ do
+      (hyp, meter) <- leakHyp
+      ref <- newIORef (0 :: Int)
+      r   <- C.runCTWith meter leakCfg hyp $ \_ ->
+               modifyIORef' ref (+ 1)
+      n <- readIORef ref
+      case r of
+        C.Reject{} -> n @?= C.resPairs r
+        C.Pass{}   -> assertFailure "leak fixture did not reject"
+
+  , testCase "runCT agrees with runCTWith on a leak (pinned seed)" $ do
+      (h1, m1) <- leakHyp
+      (h2, m2) <- leakHyp
+      let c = leakCfg { C.cfgSeed = Just 12345 }
+      r1 <- C.runCT m1 c h1
+      r2 <- C.runCTWith m2 c h2 (\_ -> pure ())
+      C.resPairs r1 @?= C.resPairs r2
+  ]
+
+attributedTests :: TestTree
+attributedTests = testGroup "runCTAttributed" [
+    testCase "pass yields no attribution" $ do
+      let c = C.defaultConfig
+            { C.cfgBudget = 200, C.cfgWarmup = 20, C.cfgBatch = 1 }
+      (r, ma) <- C.runCTAttributed (constMeter 100) c noopHyp
+      case (r, ma) of
+        (C.Pass{}, Nothing) -> pure ()
+        _                   -> assertFailure "expected (Pass, Nothing)"
+
+  , testCase "reject attributes a target leak" $ do
+      (hyp, meter) <- leakHyp
+      (r, ma) <- C.runCTAttributed meter leakCfg hyp
+      case (r, ma) of
+        (C.Reject{}, Just C.TargetLeak) -> pure ()
+        (C.Reject{}, Just other)        -> assertFailure $
+          "expected TargetLeak, got " ++ show other
+        _ -> assertFailure "leak fixture did not reject"
   ]
 
 configValidationTests :: TestTree
