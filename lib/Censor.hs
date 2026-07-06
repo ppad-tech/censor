@@ -47,6 +47,12 @@ module Censor (
 
     -- * Running
   , runCT
+  , runCTWith
+  , Frame(..)
+  , runCTAttributed
+
+    -- * Batch calibration
+  , calibrateBatch
 
     -- * A\/A and B\/B diagnostics
   , toAA
@@ -290,7 +296,39 @@ data CensorError =
 
 instance Exception CensorError
 
--- | Run a constant-time test.
+-- | A per-pair snapshot of the driver's state, delivered to the
+--   observer passed to 'runCTWith' after every main-phase pair. All
+--   quantities are on the same scale as the corresponding 'Result'
+--   fields; recording the stream of frames reconstructs the wealth
+--   trajectory without reimplementing the driver.
+data Frame = Frame
+  { frPair    :: {-# UNPACK #-} !Int
+    -- ^ pair index (1-based; excludes warmup).
+  , frDiff    :: {-# UNPACK #-} !Double
+    -- ^ the raw per-pair difference @d = ta - tb@, pre-clip.
+  , frLogW    :: {-# UNPACK #-} !Double
+    -- ^ the mixture's current log e-value at this pair.
+  , frLogWSup :: {-# UNPACK #-} !Double
+    -- ^ its supremum-so-far (the quantity the reject latches on).
+  , frLo      :: {-# UNPACK #-} !Double
+    -- ^ effect-interval lower endpoint (meter units per batch).
+  , frHi      :: {-# UNPACK #-} !Double
+    -- ^ effect-interval upper endpoint.
+  , frClipped :: !Bool
+    -- ^ whether @|d|@ exceeded the warmup bound and was clipped.
+  } deriving Show
+
+-- | Run a constant-time test, delivering a 'Frame' to the observer
+--   after every main-phase pair. 'runCT' is @runCTWith@ with a
+--   no-op observer; a recording observer reconstructs the full
+--   trajectory (see "Censor.Runner"'s @record@) without duplicating
+--   the driver.
+--
+--   The observer runs outside the timed region — between one pair's
+--   measurement and the next — so it does not perturb measurement
+--   hygiene. It is handed the frame lazily: under the 'runCT'
+--   no-op observer nothing in the frame is forced, so the plain
+--   test path pays nothing for the hook.
 --
 --   Phases:
 --
@@ -318,8 +356,9 @@ instance Exception CensorError
 --   @p99(|d|)@ rather than with the target's baseline runtime
 --   @p99(t)@, which for narrow-noise heavy-baseline targets can be
 --   orders of magnitude better for power at the same alpha.
-runCT :: Meter -> Config -> Hypothesis a -> IO Result
-runCT meter cfg hyp = do
+runCTWith
+  :: Meter -> Config -> Hypothesis a -> (Frame -> IO ()) -> IO Result
+runCTWith meter cfg hyp observe = do
   validateConfig cfg
   (!wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
   (!c, !meterResolves) <- warmup meter cfg hyp wSeed
@@ -361,11 +400,108 @@ runCT meter cfg hyp = do
                              Nothing -> iv
                 !nclip'  = if clipped then nclip + 1 else nclip
                 !n'      = n + 1
+            -- lazy: the frame's fields (mixture reads) are forced
+            -- only if the observer forces them, so runCT pays nothing.
+            observe (Frame n' d
+                       (EPMix.log_evalue mixc (hsMix st'))
+                       (EPMix.log_evalue_sup mixc (hsMix st'))
+                       (fst iv') (snd iv') clipped)
             case EPMix.decide mixc (hsMix st') of
               EPMix.Reject -> pure $! finish Reject n' st' iv' nclip'
               _            -> go n' st' cs' iv' rng' nclip'
       !iv0 = (negate (hcC3 hcfg), hcC3 hcfg)
   go 0 (initialHedge hcfg) (EPCS.initial cscfg) iv0 mSeed 0
+
+-- | Run a constant-time test. See 'runCTWith' for the phase-by-phase
+--   description; this is that driver with the per-pair observer
+--   discarded.
+runCT :: Meter -> Config -> Hypothesis a -> IO Result
+runCT meter cfg hyp = runCTWith meter cfg hyp (\_ -> pure ())
+
+-- | Run a constant-time test and, if it rejects, attribute the
+--   rejection with the A\/A and B\/B diagnostics ('attribute'). A
+--   'Pass' returns 'Nothing' (no attribution needed); a 'Reject'
+--   returns @'Just' att@ distinguishing a target leak from a harness
+--   asymmetry. The diagnostics re-run the test twice, so this costs
+--   up to three runs on a rejection.
+runCTAttributed
+  :: Meter -> Config -> Hypothesis a -> IO (Result, Maybe Attribution)
+runCTAttributed meter cfg hyp = do
+  r <- runCT meter cfg hyp
+  case r of
+    Reject{} -> do
+      att <- attribute meter cfg hyp
+      pure (r, Just att)
+    Pass{}   -> pure (r, Nothing)
+
+-- | Estimate a 'cfgBatch' for a hypothesis under a meter, so the
+--   timed region sits well above the meter's resolution. Measures the
+--   target on a class-A sample at geometrically increasing batch
+--   sizes until a nonzero reading resolves, then returns the batch
+--   that brings the per-batch reading up to a target magnitude
+--   (roughly a batch of @1@ for microsecond targets, thousands for
+--   nanosecond ones).
+--
+--   > b <- calibrateBatch meter hyp
+--   > r <- runCT meter cfg { cfgBatch = b } hyp
+--
+--   Returns @1@ if the meter cannot resolve the target even at a
+--   large batch (the subsequent 'runCT' then throws
+--   'WarmupZeroDuration'). This is a heuristic — it reads the median
+--   of a few samples per probe to resist a single quantum-straddling
+--   measurement — and the batch it picks is meter-specific; pin
+--   'cfgBatch' explicitly when you need identical batches across
+--   meters for comparability.
+calibrateBatch :: Meter -> Hypothesis a -> IO Int
+calibrateBatch meter hyp = do
+  !x <- sampleA hyp
+  let !act = target hyp x
+      -- grow the batch until the reading itself reaches the target
+      -- magnitude, then refine down from that measurement. Estimating
+      -- from a small probe would inflate per-call cost with the meter's
+      -- fixed per-measurement overhead (e.g. the clock reads); at the
+      -- resolved batch that overhead is amortised.
+      probe !b
+        | b > calibCap = pure calibCap
+        | otherwise = do
+            !r <- probeReading meter act b
+            if fromIntegral r < calibTarget
+              then probe (b * 4)
+              else
+                let !b' = ceiling
+                       (fromIntegral b * calibTarget / fromIntegral r)
+                in  pure $! max 1 (min calibCap b')
+  probe 1
+
+-- median reading over a few measurements at batch @b@: robust to a
+-- single 0 (fast target straddling the quantum) or a single spike
+-- (a scheduler hiccup on the wall clock).
+probeReading :: Meter -> IO () -> Int -> IO Word64
+probeReading meter act b = fmap median (collect calibProbes)
+  where
+    collect 0 = pure []
+    collect i = do
+      !r <- measure meter b act
+      fmap (r :) (collect (i - 1 :: Int))
+
+median :: [Word64] -> Word64
+median xs = case drop (length xs `div` 2) (sort xs) of
+  (m : _) -> m
+  []      -> 0
+
+-- Target per-batch reading magnitude (meter units) and probe budget.
+-- 65536 matches the known-good hand-tuned batch for nanosecond-scale
+-- targets (batch ~2000 at ~30 ns/call); erring high favours power,
+-- since an underpowered default that misses a real leak is the
+-- dangerous failure mode for a constant-time tester.
+calibTarget :: Double
+calibTarget = 65536
+
+calibCap :: Int
+calibCap = 1000000
+
+calibProbes :: Int
+calibProbes = 5
 
 -- | Convert a 'Hypothesis' into its /A\/A diagnostic/ form: 'sampleB'
 --   is replaced by 'sampleA', so the driver measures the same class
