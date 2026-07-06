@@ -124,6 +124,12 @@
             (hlib.enableCabalFlag aead "llvm")
             [ llvm clang ];
 
+        poly1305 = ppad-poly1305.packages.${system}.default;
+        poly1305-llvm =
+          hlib.addBuildTools
+            (hlib.enableCabalFlag poly1305 "llvm")
+            [ llvm clang ];
+
         # rust staticlib exercised by censor-demo-ffi. bundles all
         # FFI targets (the 32-byte inequality witnesses and the
         # fastcrypto::secp256r1 sign bridge) in one crate so the
@@ -174,24 +180,28 @@
           ppad-secp256k1 = secp-llvm;
           ppad-bip32 = bip32-llvm;
           ppad-aead = aead-llvm;
+          ppad-poly1305 = poly1305-llvm;
           ${lib} = hlib.overrideCabal (hlib.enableCabalFlag
             (hlib.enableCabalFlag
-              (new.callCabal2nixWithOptions lib ./.
-                 "--flag=demo --flag=demo-ffi" {
-                 ppad-eproc = new.ppad-eproc;
-                 ppad-fixed = new.ppad-fixed;
-                 ppad-sha256 = new.ppad-sha256;
-                 ppad-sha512 = new.ppad-sha512;
-                 ppad-secp256k1 = new.ppad-secp256k1;
-                 ppad-bip32 = new.ppad-bip32;
-                 ppad-aead = new.ppad-aead;
-                 # supplied at link time via --extra-lib-dirs
-                 # below; cabal2nix would otherwise treat the
-                 # extra-libraries entry as a missing nix arg.
-                 censor_rs_demo = null;
-               })
-              "demo")
-            "demo-ffi")
+              (hlib.enableCabalFlag
+                (new.callCabal2nixWithOptions lib ./.
+                   "--flag=demo --flag=demo-ffi --flag=poly" {
+                   ppad-eproc = new.ppad-eproc;
+                   ppad-fixed = new.ppad-fixed;
+                   ppad-sha256 = new.ppad-sha256;
+                   ppad-sha512 = new.ppad-sha512;
+                   ppad-secp256k1 = new.ppad-secp256k1;
+                   ppad-bip32 = new.ppad-bip32;
+                   ppad-aead = new.ppad-aead;
+                   ppad-poly1305 = new.ppad-poly1305;
+                   # supplied at link time via --extra-lib-dirs
+                   # below; cabal2nix would otherwise treat the
+                   # extra-libraries entry as a missing nix arg.
+                   censor_rs_demo = null;
+                 })
+                "demo")
+              "demo-ffi")
+            "poly")
             (drv: {
               configureFlags = (drv.configureFlags or []) ++ [
                 "--extra-lib-dirs=${rs-demo}/lib"

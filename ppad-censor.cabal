@@ -44,6 +44,13 @@ flag validate
   default:     False
   manual:      True
 
+flag poly
+  description: Build the censor-poly executable, which records
+               ppad-poly1305 constant-time MAC comparison traces
+               under a selectable meter (depends on ppad-poly1305).
+  default:     False
+  manual:      True
+
 source-repository head
   type:     git
   location: git.ppad.tech/censor.git
@@ -154,6 +161,23 @@ executable censor-viz
       , ppad-censor
       , ppad-eproc
       , ppad-sha256
+
+executable censor-poly
+  default-language: Haskell2010
+  hs-source-dirs:   demo
+  main-is:          Poly.hs
+  ghc-options:
+    -O2 -rtsopts -Wall
+
+  if !flag(poly)
+    buildable: False
+  else
+    build-depends:
+        base
+      , bytestring
+      , ppad-censor
+      , ppad-eproc
+      , ppad-poly1305
 
 executable censor-demo-ffi
   default-language: Haskell2010
