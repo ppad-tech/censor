@@ -228,6 +228,7 @@
             buildInputs = [
               cabal
               cc
+              clang
               llvm
               cargo
               rustc
@@ -237,6 +238,7 @@
               PS1="[${lib}] \w$ "
               echo "entering ${system} shell, using"
               echo "cc:    $(${cc}/bin/cc --version)"
+              echo "clang: $(${clang}/bin/clang --version | head -1)"
               echo "ghc:   $(${ghc}/bin/ghc --version)"
               echo "cabal: $(${cabal}/bin/cabal --version)"
               echo "llc:   $(${llvm}/bin/llc --version | head -2 | tail -1)"
