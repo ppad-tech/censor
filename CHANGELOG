@@ -1,74 +1,27 @@
 # Changelog
 
-- Unreleased
-  * Bump to ppad-eproc 0.4. The K=4 hedge's convex combination,
-    rejection latch, and threshold are now delegated to
-    Numeric.Eproc.Mixture; decisions are unchanged.
-  * Evidence in 'Result' is now reported on the calibrated log
-    e-value scale: 'resPeakLogW' and the per-component peaks start
-    at 0, and the mixture rejects when 'resPeakLogW' crosses
-    log(1/alpha). (Previously the fields carried raw log-wealths
-    starting at log 8 and log 2 respectively.)
-  * Add 'resPValue', the mixture's anytime-valid p-value: monotone
-    nonincreasing, valid at any data-dependent stopping time, and
-    at or below 'cfgAlpha' exactly when the verdict is 'Reject'.
-  * Add 'resEffect', an anytime-valid 1 - alpha confidence interval
-    (Numeric.Eproc.ConfSeq: the Waudby-Smith--Ramdas hedged-capital
-    construction) for the mean of d clipped to [-16c, 16c], in
-    meter units per batch: the effect size of a detected leak, or a
-    bound on any undetected one. If the evidence pins the mean
-    below the estimation grid's resolution, the last resolvable
-    interval is reported; nesting keeps it covered by the same
-    time-uniform guarantee.
-  * The demo executables print the anytime-valid p-value and the
-    effect interval for every case.
-  * 'Result' constructors now carry named fields: 'resPairs',
-    'resPeakLogW', and 'resClipped' replace the positional
-    fields, joined by the warmup-derived clip bound ('resBound')
-    and per-component peak log-wealths ('resPeakSign',
-    'resPeakMagn', 'resPeakMagn4', 'resPeakMagn16') that identify
-    which hedge component drove a rejection.
-  * Add 'fixVsRandom', a 'Hypothesis' constructor encoding the
-    dudect-style fix-vs-random protocol and its measurement-
-    hygiene rules: the pinned secret is a heap value drawn from
-    the same sampler as the random class, class A draws and
-    discards a fresh secret per pair for allocation symmetry,
-    and per-pair public inputs stay fresh in both classes.
-  * Add 'Attribution' and 'attribute', which run the A/A and B/B
-    diagnostics and fold their verdicts into a four-way
-    attribution of a rejection (target leak, sampler-specific
-    asymmetry, or pervasive harness asymmetry).
-  * Add 'Censor.Rng', the splitmix64 sampler PRNG previously
-    hand-rolled by every executable, re-exported from 'Censor'.
-    Alongside the generator it provides 'randomBytes' (draw a
-    strict, fully-forced pseudorandom ByteString, suitable for
-    returning directly from a sampler; also re-exported from
-    'Censor') and 'fillRandom' for filling foreign workspaces
-    with sampler randomness (re-exported from 'Censor.FFI').
-  * The demo executables take the meter as a command-line
-    argument (wall | instructions | branches | cycles),
-    defaulting to wall-clock, instead of silently falling back
-    from PMU to wall-clock.
-  * Bump to ppad-eproc 0.2. The driver now surfaces e-process
-    config validation failures as 'InvalidEprocConfig', a new
-    'CensorError' constructor wrapping the upstream 'ConfigError'.
-    The 'Double' field of 'Pass' and 'Reject' tracks the supremum
-    log-wealth (matching the upstream change), not the value at
-    the stopping time.
-  * Add 'Censor.FFI', a buffer-allocating helper for testing
-    foreign-function targets (C, Rust, Go via cgo, etc.) under the
-    same sequential CT driver. A single pinned workspace is allocated
-    once outside the timed region; samplers fill it in place and the
-    target consumes it via the user's chosen offset layout.
-  * Add Phase-2 hardware performance-counter meters on Linux:
-    'Censor.withCounter' acquires an 'InstructionsRetired',
-    'BranchesRetired', or 'Cycles' meter via perf_event_open
-    (user-space only, so usable unprivileged at perf_event_paranoid
-    <= 2). InstructionsRetired and BranchesRetired count a
-    deterministic property of the executed code; Cycles is additionally
-    sensitive to data-dependent latency and microarchitectural state.
-    The counter is thread-affine; the callback runs on one OS thread
-    and the fd is released on exit. wallClock is unchanged.
+- 0.2.0 (2026-07-07)
+  * Hardware performance-counter meters on Linux
+    (instructions retired, branches retired, cycles) via
+    perf_event_open, alongside the existing wall-clock meter.
+
+  * Foreign-function target support ('Censor.FFI'): a pinned
+    workspace shared across pairs lets C, Rust, or Go targets
+    run under the same sequential CT driver.
+
+  * Fix-vs-random hypothesis and 'Attribution': A/A and B/B
+    diagnostics fold into a four-way attribution of any
+    rejection (target, sampler, or harness).
+
+  * 'Result' now reports an anytime-valid p-value and a
+    time-uniform confidence interval on the leak's effect
+    size, with named fields throughout.
+
+  * Mixture internals delegated to ppad-eproc; verdicts
+    unchanged.
+
+  * 'Censor.Rng' extracts the splitmix64 sampler PRNG
+    previously duplicated across demos.
 
 - 0.1.0 (2026-05-31)
   * Initial release. Sequential constant-time testing via
