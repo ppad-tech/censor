@@ -7,3 +7,7 @@ sandbox
 
 # rust target dir
 rs-demo/target
+
+# shared libraries built by the shim smoke script
+etc/censor-run-test/shim.dylib
+etc/censor-run-test/shim.so
