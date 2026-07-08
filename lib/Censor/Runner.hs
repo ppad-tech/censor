@@ -33,8 +33,10 @@ module Censor.Runner (
   , sweep
   , partitionVerdicts
 
-    -- * Verdicts
+    -- * Verdicts and rendering
   , verdictName
+  , summary
+  , resultToJSON
   ) where
 
 import Control.Exception (try)
@@ -71,7 +73,7 @@ meterName MeterWall         = "wall"
 meterName (MeterPMU _ name)  = name
 
 -- | Parse a meter token (defaulting to wall-clock when absent) and
---   run the callback with the resolved 'Meter' and its name,
+--   run the callback with the resolved t'Meter' and its name,
 --   bracketing a PMU counter for its lifetime and dying with a clear
 --   message if it cannot be opened (e.g. the PMU meters off Linux, or
 --   an unknown name). Handles the whole "wall everywhere, PMU
@@ -95,7 +97,7 @@ withMeterArg marg k = do
 
 -- recording -------------------------------------------------------------------
 
--- | A recorded run: the final 'Result' plus the per-pair 'Frame'
+-- | A recorded run: the final 'Result' plus the per-pair t'Frame'
 --   trajectory.
 data Trace = Trace
   { traceName   :: !String
@@ -104,7 +106,7 @@ data Trace = Trace
   , traceFrames :: ![Frame]
   } deriving Show
 
--- | Record a run, capturing every 'Frame' via 'runCTWith'. The
+-- | Record a run, capturing every t'Frame' via 'runCTWith'. The
 --   observer strictly accumulates frames; the driver is 'runCTWith'
 --   itself, not a reimplementation of it.
 record :: String -> String -> Meter -> Config -> Hypothesis a -> IO Trace
@@ -126,7 +128,7 @@ thin frs =
              || frPair fr == m
   in  filter keep frs
 
--- | Render a 'Trace' as a JSON object (the frame array is 'thin'ned).
+-- | Render a t'Trace' as a JSON object (the frame array is 'thin'ned).
 --   Each trace entry is @[pair, logW, logWSup, lo, hi]@.
 renderTrace :: Trace -> String
 renderTrace t = concat
@@ -203,9 +205,79 @@ partitionVerdicts = foldr step ([], [])
     step (p, Pass{})   (ps, rs) = (p : ps, rs)
     step (p, Reject{}) (ps, rs) = (ps, p : rs)
 
--- verdicts --------------------------------------------------------------------
+-- verdicts and rendering ------------------------------------------------------
 
 -- | @\"REJECT\"@ or @\"PASS\"@.
 verdictName :: Result -> String
 verdictName Reject{} = "REJECT"
 verdictName Pass{}   = "PASS"
+
+-- | A one-line human-readable render of a t'Result', suitable for
+--   logging or embedding in a larger status line. Includes the
+--   verdict, pairs consumed, evidence (peak log e-value, p-value),
+--   effect interval, and clip count; on 'Reject' it also names the
+--   driver channel of the hedge ('leakShape').
+--
+--   > REJECT after 342 pairs; driver=bulk peakLogW=18.42 p=1.0e-8
+--   > effect=[-101.5,-98.4] clipped=6/342
+summary :: Result -> String
+summary r =
+  let !effLo = fst (resEffect r)
+      !effHi = snd (resEffect r)
+      base = printf "peakLogW=%.2f effect=[%.1f,%.1f] clipped=%d/%d"
+               (resPeakLogW r) effLo effHi
+               (resClipped r) (resPairs r)
+  in  case r of
+        Reject{} ->
+          printf "REJECT after %d pairs; driver=%s %s p=%.2g"
+            (resPairs r) (shapeName (leakShape r))
+            (base :: String) (resPValue r)
+        Pass{} ->
+          printf "PASS at %d pairs; %s"
+            (resPairs r) (base :: String)
+
+-- | Serialise a t'Result' as a stable JSON object. Includes verdict,
+--   pairs, mixture peak log e-value, anytime-valid p-value, effect
+--   interval, clip count, warmup bound, per-component peaks, and the
+--   'diagnose' advisories.
+--
+--   The object is a single line; pipe multiple runs into a
+--   line-oriented store and diff or filter with @jq@.
+resultToJSON :: Result -> String
+resultToJSON r = concat
+  [ "{\"verdict\":",    jstr (verdictName r)
+  , ",\"pairs\":",      show (resPairs r)
+  , printf ",\"peakLogW\":%.6g" (resPeakLogW r)
+  , printf ",\"pvalue\":%.6g"   (resPValue r)
+  , printf ",\"effect\":[%.6g,%.6g]"
+      (fst (resEffect r)) (snd (resEffect r))
+  , ",\"clipped\":",    show (resClipped r)
+  , printf ",\"bound\":%.6g" (resBound r)
+  , ",\"peaks\":{"
+  ,       printf "\"sign\":%.6g"    (resPeakSign r)
+  , printf ",\"magn\":%.6g"         (resPeakMagn r)
+  , printf ",\"magn4\":%.6g"        (resPeakMagn4 r)
+  , printf ",\"magn16\":%.6g"       (resPeakMagn16 r)
+  , "}"
+  , ",\"advisories\":["
+  , intercalate "," (map advisoryJSON (diagnose r))
+  , "]}"
+  ]
+
+advisoryJSON :: Advisory -> String
+advisoryJSON a = case a of
+  HighClipRate f -> printf
+    "{\"kind\":\"HighClipRate\",\"clipFraction\":%.4g}" f
+  LowPower h -> printf
+    "{\"kind\":\"LowPower\",\"widthOverBound\":%.4g}" h
+  RejectionDriver s -> concat
+    [ "{\"kind\":\"RejectionDriver\",\"shape\":"
+    , jstr (shapeName s), "}"
+    ]
+
+shapeName :: LeakShape -> String
+shapeName s = case s of
+  BulkShift   -> "bulk"
+  ShapeLeak   -> "shape"
+  RareOutlier -> "tail"
+  MixedShape  -> "mixed"

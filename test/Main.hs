@@ -7,8 +7,10 @@ import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
 import Data.IORef
 import Data.Word (Word8, Word64)
+import Data.List (isInfixOf, isPrefixOf)
 import qualified Censor as C
 import qualified Censor.FFI as F
+import qualified Censor.Runner as R
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Array (peekArray)
 import Test.Tasty
@@ -35,6 +37,9 @@ main = defaultMain $ testGroup "ppad-censor" [
   , randomBytesTests
   , fillRandomTests
   , smokeCalibrationTests
+  , diagnoseTests
+  , renderingTests
+  , calibReportTests
   ]
 
 -- Test config tuned for fast feedback: less strict alpha and small
@@ -719,4 +724,174 @@ clipCountTests = testGroup "clip counts" [
       assertBool ("expected nonzero clip count, got "
                   ++ show (C.resClipped r))
                  (C.resClipped r > 0)
+  ]
+
+-- deterministic constant-mean bulk shift, seeded for reproducibility.
+-- Reused as a "reliably-rejects" fixture across diagnose / rendering
+-- tests below.
+runLeak :: IO C.Result
+runLeak = do
+  (hyp, meter) <- leakHyp
+  let c = leakCfg { C.cfgSeed = Just 0xB0BFACE }
+  C.runCT meter c hyp
+
+-- deterministic Pass fixture with a well-behaved effect interval.
+runFlatPass :: IO C.Result
+runFlatPass = do
+  let c = C.defaultConfig
+        { C.cfgBudget = 500, C.cfgWarmup = 20, C.cfgBatch = 1 }
+  C.runCT (constMeter 100) c noopHyp
+
+isRejDriver :: C.Advisory -> Bool
+isRejDriver (C.RejectionDriver _) = True
+isRejDriver _                     = False
+
+isHighClipRate :: C.Advisory -> Bool
+isHighClipRate (C.HighClipRate _) = True
+isHighClipRate _                  = False
+
+diagnoseTests :: TestTree
+diagnoseTests = testGroup "diagnose" [
+    testCase "sign-only leak -> RejectionDriver ShapeLeak" $ do
+      ref <- newIORef (0 :: Word64)
+      ctr <- newIORef (0 :: Int)
+      let leakMeter = C.Meter $ \k act ->
+            let go 0 = pure ()
+                go i = act >> go (i - 1)
+            in  go k >> readIORef ref
+          hyp = C.Hypothesis
+            { C.target  = writeIORef ref
+            , C.sampleA = do
+                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
+                pure $! if n `mod` 4 == 0 then 97 else 101
+            , C.sampleB = pure 100
+            }
+          c = C.defaultConfig
+            { C.cfgAlpha  = 1.0e-3
+            , C.cfgBudget = 5000
+            , C.cfgWarmup = 100
+            , C.cfgBatch  = 1
+            , C.cfgSeed   = Just 0xC0FFEE
+            }
+      r <- C.runCT leakMeter c hyp
+      case r of
+        C.Reject{} ->
+          let advs = C.diagnose r
+          in  assertBool
+                ("expected RejectionDriver ShapeLeak in " ++ show advs)
+                (C.RejectionDriver C.ShapeLeak `elem` advs)
+        C.Pass{} -> assertFailure "shape leak fixture did not reject"
+
+  , testCase "bulk leak -> some RejectionDriver" $ do
+      r <- runLeak
+      case r of
+        C.Reject{} ->
+          let advs = C.diagnose r
+          in  assertBool
+                ("expected some RejectionDriver in " ++ show advs)
+                (any isRejDriver advs)
+        C.Pass{} -> assertFailure "bulk leak did not reject"
+
+  , testCase "flat Pass -> no RejectionDriver" $ do
+      r <- runFlatPass
+      case r of
+        C.Pass{} -> do
+          let advs = C.diagnose r
+          assertBool ("unexpected RejectionDriver on Pass: " ++ show advs)
+            (not (any isRejDriver advs))
+        C.Reject{} -> assertFailure "flat meter unexpectedly rejected"
+
+  , testCase "heavy clipping -> HighClipRate advisory" $ do
+      ref <- newIORef (0 :: Word64)
+      ctr <- newIORef (0 :: Int)
+      let leakMeter = C.Meter $ \k act ->
+            let go 0 = pure ()
+                go i = act >> go (i - 1)
+            in  go k >> readIORef ref
+          warmupPairs = 20
+          hyp = C.Hypothesis
+            { C.target  = writeIORef ref
+            , C.sampleA = pure 100
+            , C.sampleB = do
+                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
+                pure $! if n < warmupPairs
+                          then 200
+                          else 1000000
+            }
+          c = C.defaultConfig
+            { C.cfgAlpha  = 1.0e-3
+            , C.cfgBudget = 50
+            , C.cfgWarmup = warmupPairs
+            , C.cfgBatch  = 1
+            }
+      r <- C.runCT leakMeter c hyp
+      let advs = C.diagnose r
+      assertBool ("expected HighClipRate in " ++ show advs)
+        (any isHighClipRate advs)
+  ]
+
+renderingTests :: TestTree
+renderingTests = testGroup "summary / resultToJSON" [
+    testCase "summary on Pass starts with PASS" $ do
+      r <- runFlatPass
+      let s = R.summary r
+      assertBool ("expected PASS prefix, got: " ++ s)
+        ("PASS" `isPrefixOf` s)
+
+  , testCase "summary on Reject starts with REJECT and names driver" $ do
+      r <- runLeak
+      let s = R.summary r
+      assertBool ("expected REJECT prefix, got: " ++ s)
+        ("REJECT" `isPrefixOf` s)
+      assertBool ("expected driver= in: " ++ s)
+        ("driver=" `isInfixOf` s)
+
+  , testCase "resultToJSON on Pass exposes expected keys" $ do
+      r <- runFlatPass
+      let j = R.resultToJSON r
+      mapM_ (\k -> assertBool ("expected " ++ k ++ " in " ++ j)
+                              (k `isInfixOf` j))
+        [ "\"verdict\":\"PASS\""
+        , "\"pairs\":"
+        , "\"peakLogW\":"
+        , "\"pvalue\":"
+        , "\"effect\":"
+        , "\"clipped\":"
+        , "\"bound\":"
+        , "\"peaks\":"
+        , "\"sign\":"
+        , "\"magn\":"
+        , "\"magn4\":"
+        , "\"magn16\":"
+        , "\"advisories\":"
+        ]
+
+  , testCase "resultToJSON on Reject reports the driver in advisories" $ do
+      r <- runLeak
+      let j = R.resultToJSON r
+      assertBool ("expected verdict REJECT in " ++ j)
+        ("\"verdict\":\"REJECT\"" `isInfixOf` j)
+      assertBool ("expected RejectionDriver in " ++ j)
+        ("RejectionDriver" `isInfixOf` j)
+  ]
+
+calibReportTests :: TestTree
+calibReportTests = testGroup "calibrateBatchReport" [
+    testCase "resolves a nanosecond target and records probes" $ do
+      let m = linMeter 64
+      rep <- C.calibrateBatchReport m noopHyp
+      -- same batch as calibrateBatch's convenience wrapper.
+      b <- C.calibrateBatch m noopHyp
+      C.crBatch rep @?= b
+      C.crBatch rep @?= 1024
+      C.crCapHit rep @?= False
+      -- probes grow geometrically (x4) from 1 until the reading
+      -- reaches calibTarget (65536); at 64 per call that lands
+      -- exactly at batch 1024.
+      map fst (C.crProbes rep) @?= [1, 4, 16, 64, 256, 1024]
+
+  , testCase "unresolvable meter -> capHit True, batch 1" $ do
+      rep <- C.calibrateBatchReport (linMeter 0) noopHyp
+      C.crBatch rep @?= 1
+      C.crCapHit rep @?= True
   ]

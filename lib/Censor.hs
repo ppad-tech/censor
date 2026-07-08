@@ -10,7 +10,7 @@
 --
 -- Sequential constant-time testing.
 --
--- Declare a 'Hypothesis' (an @IO@ action plus two input samplers);
+-- Declare a t'Hypothesis' (an @IO@ action plus two input samplers);
 -- 'runCT' measures paired class-A \/ class-B timings, streams them
 -- through an anytime-valid two-sample test, and either rejects (a
 -- leak is detected) or exhausts its budget.
@@ -42,6 +42,12 @@ module Censor (
     -- * Result
   , Result(..)
 
+    -- * Advisories
+  , Advisory(..)
+  , LeakShape(..)
+  , diagnose
+  , leakShape
+
     -- * Errors
   , CensorError(..)
 
@@ -53,6 +59,8 @@ module Censor (
 
     -- * Batch calibration
   , calibrateBatch
+  , CalibReport(..)
+  , calibrateBatchReport
 
     -- * A\/A and B\/B diagnostics
   , toAA
@@ -79,7 +87,7 @@ module Censor (
 import Control.Exception (Exception, throwIO)
 import Control.Monad (unless)
 import qualified Data.Bits as B
-import Data.List (sort)
+import Data.List (sort, sortBy)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import qualified Numeric.Eproc.Bernoulli.TwoSided as EPSign
@@ -113,7 +121,7 @@ data Hypothesis a = Hypothesis
   , sampleB :: !(IO a)
   }
 
--- | Construct a dudect-style /fix-vs-random/ 'Hypothesis' from a
+-- | Construct a dudect-style /fix-vs-random/ t'Hypothesis' from a
 --   target, a secret sampler, and a completion function building a
 --   full input around a secret.
 --
@@ -273,6 +281,96 @@ data Result
       }
   deriving Show
 
+-- | An actionable observation about a t'Result', produced by
+--   'diagnose'. Each constructor identifies a specific pattern in
+--   the report and points to the corresponding remedy in prose you
+--   would otherwise have to reconstruct from the 'Result' docstring.
+data Advisory
+  = HighClipRate !Double
+    -- ^ Fraction @resClipped \/ resPairs@ exceeded @0.05@: the tight
+    --   magnitude component saw its input truncated on a nontrivial
+    --   share of pairs, hurting power against small consistent
+    --   shifts. Raise 'cfgWarmup' for a better @c@ estimate, enlarge
+    --   'cfgBatch', or treat the run with suspicion.
+  | LowPower !Double
+    -- ^ On 'Pass' only: the effect-interval half-width exceeded the
+    --   tight clip bound @c@ (the ratio is carried here, in units of
+    --   @c@). Leaks with a mean shift below that scale would not have
+    --   been resolved by this run; raise 'cfgBudget' to sharpen the
+    --   interval.
+  | RejectionDriver !LeakShape
+    -- ^ On 'Reject' only: which channel of the K=4 hedge drove the
+    --   detection, i.e. what shape of leak was found.
+  deriving (Eq, Show)
+
+-- | The qualitative shape of a leak, inferred from the per-component
+--   peaks of the hedge. Reported by 'RejectionDriver' and available
+--   standalone via 'leakShape'.
+data LeakShape
+  = BulkShift
+    -- ^ 'resPeakMagn' (tight magnitude) dominates: a small consistent
+    --   mean shift in @d@.
+  | ShapeLeak
+    -- ^ 'resPeakSign' dominates: an equal-mean distributional
+    --   asymmetry (@P(d > 0) \/= 1\/2@).
+  | RareOutlier
+    -- ^ 'resPeakMagn4' or 'resPeakMagn16' dominates: rare-tail
+    --   outliers (e.g. a rarely-taken data-dependent branch).
+  | MixedShape
+    -- ^ No single component peak dominates by @>= 1.5x@; the leak
+    --   registers on several channels comparably.
+  deriving (Eq, Show)
+
+-- | Interpret a t'Result' and emit advisories highlighting the
+--   patterns the report exposes: heavy clipping (the tight component
+--   is starved), a low-power 'Pass' (the effect interval remains
+--   wider than the tight bound), and, on 'Reject', which channel of
+--   the K=4 hedge drove the detection.
+--
+--   The output is stable in order — clip, then power, then driver —
+--   so downstream tooling can pattern-match by position.
+diagnose :: Result -> [Advisory]
+diagnose r =
+  let !frac = if resPairs r == 0
+                then 0
+                else fromIntegral (resClipped r)
+                     / (fromIntegral (resPairs r) :: Double)
+      clipA = [HighClipRate frac | frac > 0.05]
+      powerA = case r of
+        Pass{} ->
+          let !hw = (snd (resEffect r) - fst (resEffect r)) / 2
+              !c  = resBound r
+          in  [LowPower (hw / c) | c > 0 && hw > c]
+        Reject{} -> []
+      drvA = case r of
+        Reject{} -> [RejectionDriver (leakShape r)]
+        Pass{}   -> []
+  in  clipA ++ powerA ++ drvA
+
+-- | Identify which component of the K=4 hedge has the largest peak
+--   log e-value in a t'Result', binning the two wider magnitude
+--   components together as 'RareOutlier'. Returns 'MixedShape' when
+--   no single peak exceeds the next-largest by a factor of @1.5@.
+--
+--   Only meaningful on a 'Reject' — on a 'Pass' every peak sits near
+--   the calibrated floor of @0@ and the returned shape is not
+--   informative.
+leakShape :: Result -> LeakShape
+leakShape r =
+  let !sig  = resPeakSign r
+      !mag  = resPeakMagn r
+      !tl   = max (resPeakMagn4 r) (resPeakMagn16 r)
+      ranked = sortBy (\a b -> compare (fst b) (fst a))
+                 [ (sig, ShapeLeak)
+                 , (mag, BulkShift)
+                 , (tl,  RareOutlier)
+                 ]
+  in  case ranked of
+        (p1, s1) : (p2, _) : _
+          | p1 > 1.5 * max 0 p2 -> s1
+          | otherwise           -> MixedShape
+        _ -> MixedShape
+
 -- | Errors thrown by 'runCT' when calibration or configuration fails.
 data CensorError =
     WarmupZeroDuration
@@ -284,7 +382,7 @@ data CensorError =
     --   sampled inputs, which is the expected happy path under a
     --   PMU meter on truly CT code.)
   | InvalidConfig !String
-    -- ^ a 'Config' field was outside its admissible range. The
+    -- ^ a t'Config' field was outside its admissible range. The
     --   'String' names which field and why.
   | InvalidEprocConfig !ConfigError
     -- ^ the underlying e-process rejected the test configuration
@@ -318,7 +416,7 @@ data Frame = Frame
     -- ^ whether @|d|@ exceeded the warmup bound and was clipped.
   } deriving Show
 
--- | Run a constant-time test, delivering a 'Frame' to the observer
+-- | Run a constant-time test, delivering a t'Frame' to the observer
 --   after every main-phase pair. 'runCT' is @runCTWith@ with a
 --   no-op observer; a recording observer reconstructs the full
 --   trajectory (see "Censor.Runner"'s @record@) without duplicating
@@ -453,31 +551,67 @@ runCTAttributed meter cfg hyp = do
 --   'cfgBatch' explicitly when you need identical batches across
 --   meters for comparability.
 calibrateBatch :: Meter -> Hypothesis a -> IO Int
-calibrateBatch meter hyp = do
+calibrateBatch meter hyp = fmap crBatch (calibrateBatchReport meter hyp)
+
+-- | The probe history behind a 'calibrateBatchReport' run: which
+--   batches were tried, what the meter reported at each, whether the
+--   cap 'terminated the search, and the target reading magnitude
+--   used for the refinement.
+--
+--   Useful when 'calibrateBatch' picks a batch that surprises you
+--   (or falls back to @1@ on an unresolvable meter): the probe list
+--   shows exactly what the meter reported at each geometric step.
+data CalibReport = CalibReport
+  { crBatch     :: {-# UNPACK #-} !Int
+    -- ^ the batch size the calibrator selected.
+  , crProbes    :: ![(Int, Word64)]
+    -- ^ @(batch, median reading)@ pairs, oldest first.
+  , crCapHit    :: !Bool
+    -- ^ 'True' when the meter never reached 'crTargetMag' before
+    --   the internal cap. 'crBatch' will then be @1@ and a
+    --   subsequent 'runCT' will throw 'WarmupZeroDuration'.
+  , crTargetMag :: {-# UNPACK #-} !Double
+    -- ^ the target per-batch reading magnitude used for refinement.
+  } deriving Show
+
+-- | 'calibrateBatch' with a t'CalibReport'. Same probe loop; useful
+--   for understanding /why/ the calibrator picked what it picked
+--   (particularly when the answer is @1@).
+calibrateBatchReport :: Meter -> Hypothesis a -> IO CalibReport
+calibrateBatchReport meter hyp = do
   !x <- sampleA hyp
   let !act = target hyp x
       -- grow the batch until the reading itself reaches the target
       -- magnitude, then refine down from that measurement. Estimating
-      -- from a small probe would inflate per-call cost with the meter's
-      -- fixed per-measurement overhead (e.g. the clock reads); at the
-      -- resolved batch that overhead is amortised.
+      -- from a small probe would inflate per-call cost with the
+      -- meter's fixed per-measurement overhead (e.g. the clock reads);
+      -- at the resolved batch that overhead is amortised.
       -- a cap-hit means the median per-call reading is well below
       -- one meter unit at the largest probed batch, which no
-      -- functioning meter produces (the batch loop alone costs
-      -- more); return 1 so the subsequent run fails fast in warmup
-      -- rather than grinding through zero readings at a million
-      -- calls per measurement.
-      probe !b
-        | b > calibCap = pure 1
+      -- functioning meter produces (the batch loop alone costs more);
+      -- return 1 so the subsequent run fails fast in warmup rather
+      -- than grinding through zero readings at a million calls per
+      -- measurement.
+      probe !b !ps
+        | b > calibCap =
+            pure $! finish 1 True ps
         | otherwise = do
             !r <- probeReading meter act b
+            let !ps' = (b, r) : ps
             if fromIntegral r < calibTarget
-              then probe (b * 4)
+              then probe (b * 4) ps'
               else
                 let !b' = ceiling
                        (fromIntegral b * calibTarget / fromIntegral r)
-                in  pure $! max 1 (min calibCap b')
-  probe 1
+                    !bf = max 1 (min calibCap b')
+                in  pure $! finish bf False ps'
+      finish !bf !cap !ps = CalibReport
+        { crBatch     = bf
+        , crProbes    = reverse ps
+        , crCapHit    = cap
+        , crTargetMag = calibTarget
+        }
+  probe 1 []
 
 -- median reading over a few measurements at batch @b@: robust to a
 -- single 0 (fast target straddling the quantum) or a single spike
@@ -509,7 +643,7 @@ calibCap = 1000000
 calibProbes :: Int
 calibProbes = 5
 
--- | Convert a 'Hypothesis' into its /A\/A diagnostic/ form: 'sampleB'
+-- | Convert a t'Hypothesis' into its /A\/A diagnostic/ form: 'sampleB'
 --   is replaced by 'sampleA', so the driver measures the same class
 --   twice per pair.
 --
@@ -534,7 +668,7 @@ toAA h = h { sampleB = sampleA h }
 runAA :: Meter -> Config -> Hypothesis a -> IO Result
 runAA meter cfg hyp = runCT meter cfg (toAA hyp)
 
--- | Convert a 'Hypothesis' into its /B\/B diagnostic/ form:
+-- | Convert a t'Hypothesis' into its /B\/B diagnostic/ form:
 --   'sampleA' is replaced by 'sampleB'. Symmetric companion to
 --   'toAA' — a 'Reject' verdict here indicts an asymmetry specific
 --   to 'sampleB' rather than the target.
