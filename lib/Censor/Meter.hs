@@ -10,7 +10,7 @@
 --
 -- Measurement abstraction.
 --
--- A 'Meter' wraps an @IO@ action and returns a 'Word64' reading.
+-- A t'Meter' wraps an @IO@ action and returns a 'Word64' reading.
 -- 'wallClock' is available everywhere, backed by
 -- @GHC.Clock.getMonotonicTimeNSec@. On Linux, 'withCounter' provides
 -- hardware performance-counter meters (retired instructions, retired
@@ -134,7 +134,7 @@ counterCode InstructionsRetired = 0
 counterCode BranchesRetired     = 1
 counterCode Cycles              = 2
 
--- | Acquire a hardware performance-counter 'Meter' for the duration of
+-- | Acquire a hardware performance-counter t'Meter' for the duration of
 --   the callback, then release it.
 --
 --   The counter is opened in user-space-only mode

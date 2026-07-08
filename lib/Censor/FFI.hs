@@ -54,7 +54,7 @@
 -- > result <- withFFIHypothesis (mulHyp g) $ \h ->
 -- >   runCT wallClock defaultConfig h
 --
--- 'Rng' and 'fillRandom' come from "Censor.Rng" ('fillRandom' is
+-- @Rng@ and 'fillRandom' come from "Censor.Rng" ('fillRandom' is
 -- re-exported here); @fillBytes@ is
 -- 'Foreign.Marshal.Utils.fillBytes'. The discarded 'fillRandom' in
 -- @ffiSampleA@ keeps the two samplers' generator work symmetric
@@ -94,7 +94,7 @@ data FFIHypothesis = FFIHypothesis
     --   a single FFI call with no in-Haskell preparation.
   }
 
--- | Acquire the workspace, present a regular 'Hypothesis' that the
+-- | Acquire the workspace, present a regular t'Hypothesis' that the
 --   sequential driver ('Censor.runCT') can consume, and release the
 --   workspace when the continuation returns.
 --

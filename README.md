@@ -15,37 +15,13 @@ The statistical layer is anytime-valid: type-I error is controlled at
 as the wealth process crosses threshold rather than running a fixed
 budget every time. (The "wealth process" is a notional bankroll that
 bets on the data and grows only when the null is wrong; see
-[ppad-eproc][eproc] for the mechanics.)
+[ppad-eproc][eproc] for the mechanics.) The claim that the run-wide
+false-alarm probability is at most `alpha` is itself checked
+empirically by the calibration battery described below.
 
-## Compared with dudect
-
-[dudect][dude]'s ingredients are the right ones — fix-vs-random
-input classes, randomised interleaving, cropping at multiple
-percentile thresholds — and censor adopts all of them (the
-multi-clip hedge is dudect's cropping ladder, combined validly).
-The difference is the statistical layer that consumes the
-measurements.
-
-dudect reports a t-statistic and leaves the verdict to you: below
-~4.5 is fine, above ~10 is a leak, in between is "keep running".
-Re-checking a t-test as data accumulates quietly breaks it — every
-peek is another chance for noise to cross the line — which is why
-the practical threshold is folklore rather than theory, and why
-"what is my false-positive rate?" has no answer.
-
-censor's e-process layer is built for continuous monitoring: the
-driver checks after every sample pair, halts the moment evidence
-suffices, and the type-I guarantee survives the peeking. The
-verdict is binary and the knob is `alpha`: if the target really is
-constant-time, the probability of ever seeing a false `Reject` —
-across the whole run, however long — is at most `alpha`. That claim
-is itself checked empirically by the calibration battery described
-below.
-
-Neither tool can certify code as constant-time: a `Pass` is absence
-of detectable evidence at the given budget, hardware, and meter,
-not proof. Both are falsifiers — censor is one whose alarm rate you
-can put a number on.
+A `Pass` is not a proof of constant-time execution — it is absence of
+detectable evidence at the given budget, hardware, and meter. censor
+is a falsifier whose alarm rate you can put a number on.
 
 ## Usage
 
@@ -444,9 +420,6 @@ $ cabal repl ppad-censor
 
 to get a REPL for the main library.
 
-[dude]: https://github.com/oreparaz/dudect
 [eproc]: https://git.ppad.tech/eproc
 [nixos]: https://nixos.org/
 [flake]: https://nixos.org/manual/nix/unstable/command-ref/new-cli/nix3-flake.html
-[const]: https://www.chosenplaintext.ca/articles/beginners-guide-constant-time-cryptography.html
-[subst]: https://git.ppad.tech/substratum

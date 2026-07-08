@@ -1,5 +1,5 @@
 {
-  description = "Sequential constant-time testing for Haskell.";
+  description = "Anytime-valid sequential constant-time testing.";
 
   inputs = {
     ppad-nixpkgs = {
