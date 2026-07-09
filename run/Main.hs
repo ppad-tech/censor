@@ -6,7 +6,7 @@
 --     [--secret off:len]... [--public off:len]...
 --     [--meter wall|instructions|cycles|branches]
 --     [--alpha FLOAT] [--budget INT] [--warmup INT] [--batch INT]
---     [--seed HEX] [--json | --summary]
+--     [--seed HEX] [--format pretty|json|plain]
 --     [--trace PATH] [--attribute]
 --
 -- Workspace layout: every pair starts with a workspace of --workspace
@@ -40,6 +40,7 @@ import qualified Censor as C
 import qualified Censor.FFI as F
 import qualified Censor.Runner as R
 import qualified Censor.Runner.DL as DL
+import qualified Censor.Runner.Report as Rep
 
 -- args ------------------------------------------------------------------------
 
@@ -47,8 +48,6 @@ data Range = Range
   { rangeOff :: {-# UNPACK #-} !Int
   , rangeLen :: {-# UNPACK #-} !Int
   } deriving (Eq, Show)
-
-data OutputMode = Summary | JSON deriving (Eq, Show)
 
 data Args = Args
   { argLib        :: !FilePath
@@ -62,7 +61,7 @@ data Args = Args
   , argWarmup     :: !(Maybe Int)
   , argBatch      :: !(Maybe Int)
   , argSeed       :: !(Maybe Word64)
-  , argOutput     :: !OutputMode
+  , argFormat     :: !(Maybe String)
   , argTrace      :: !(Maybe FilePath)
   , argAttribute  :: !Bool
   } deriving Show
@@ -79,7 +78,7 @@ data ArgAcc = ArgAcc
   , accWarmup     :: !(Maybe Int)
   , accBatch      :: !(Maybe Int)
   , accSeed       :: !(Maybe Word64)
-  , accOutput     :: !(Maybe OutputMode)
+  , accFormat     :: !(Maybe String)
   , accTrace      :: !(Maybe FilePath)
   , accAttribute  :: !Bool
   }
@@ -103,7 +102,8 @@ usage = unlines
   , "              [--meter wall|instructions|cycles|branches]"
   , "              [--alpha FLOAT] [--budget INT] [--warmup INT]"
   , "              [--batch INT] [--seed HEX]"
-  , "              [--json | --summary] [--trace PATH] [--attribute]"
+  , "              [--format pretty|json|plain]"
+  , "              [--trace PATH] [--attribute]"
   , ""
   , "--secret pins class A only (fix vs. random axis)."
   , "--public pins BOTH classes (shared public context)."
@@ -159,8 +159,9 @@ go acc (x:xs)        = case x of
   "--seed"       -> withVal x xs $ \v ys -> do
     w <- parseHex x v
     go acc { accSeed = Just w } ys
-  "--json"       -> setOutput x JSON acc xs
-  "--summary"    -> setOutput x Summary acc xs
+  "--format"     -> withVal x xs $ \v ys ->
+    onceStr x (accFormat acc) $
+      go acc { accFormat = Just v } ys
   "--trace"      -> withVal x xs $ \v ys ->
     onceStr x (accTrace acc) $
       go acc { accTrace = Just v } ys
@@ -187,11 +188,6 @@ onceStr _    Nothing  k = k
 onceInt :: String -> Maybe Int -> IO a -> IO a
 onceInt name (Just _) _ = die2 ("censor: " ++ name ++ " given twice")
 onceInt _    Nothing  k = k
-
-setOutput :: String -> OutputMode -> ArgAcc -> [String] -> IO ArgAcc
-setOutput name m acc xs = case accOutput acc of
-  Just _  -> die2 ("censor: output mode set twice at " ++ name)
-  Nothing -> go acc { accOutput = Just m } xs
 
 parseInt :: String -> String -> IO Int
 parseInt name v = case reads v of
@@ -249,7 +245,7 @@ finish acc = do
     , argWarmup    = accWarmup acc
     , argBatch     = accBatch acc
     , argSeed      = accSeed acc
-    , argOutput    = maybe Summary id (accOutput acc)
+    , argFormat    = accFormat acc
     , argTrace     = accTrace acc
     , argAttribute = accAttribute acc
     }
@@ -313,31 +309,6 @@ buildConfig args = C.defaultConfig
   , C.cfgSeed   = argSeed args
   }
 
-renderResult :: OutputMode -> C.Result -> Maybe C.Attribution -> String
-renderResult Summary r mat =
-  R.summary r ++ maybe "" (\a -> "\n  attribution: "
-                                 ++ attribLabel a) mat
-renderResult JSON r mat = case mat of
-  Nothing -> R.resultToJSON r
-  Just a  -> spliceJSON (R.resultToJSON r) (attribJSON a)
-
-attribLabel :: C.Attribution -> String
-attribLabel C.TargetLeak             = "target leak"
-attribLabel (C.SampleAAsymmetry _)   = "sampleA asymmetry"
-attribLabel (C.SampleBAsymmetry _)   = "sampleB asymmetry"
-attribLabel (C.PervasiveAsymmetry{}) = "pervasive asymmetry"
-
-attribJSON :: C.Attribution -> String
-attribJSON a = "\"attribution\":\"" ++ attribLabel a ++ "\""
-
--- splice an extra key/value pair into a flat JSON object by
--- rewriting its trailing "}" to "," ++ extra ++ "}". Not a general
--- JSON manipulation; assumes resultToJSON's stable object shape.
-spliceJSON :: String -> String -> String
-spliceJSON base extra = case reverse base of
-  '}':rest -> reverse rest ++ "," ++ extra ++ "}"
-  _        -> base
-
 verdictExit :: C.Result -> Int
 verdictExit C.Pass{}   = exitPass
 verdictExit C.Reject{} = exitReject
@@ -362,21 +333,34 @@ runWith :: Args -> IO ()
 runWith args = DL.withLibrary (argLib args) $ \lib -> do
   target <- DL.resolveTarget lib (argTarget args)
   hyp    <- buildHypothesis args target
-  let cfg = buildConfig args
+  rnd    <- Rep.resolveFormat (argFormat args)
+  rc     <- Rep.initReportCfg
+  let cfg  = buildConfig args
+      seed = maybe defaultSeed id (argSeed args)
   R.withMeterArg (argMeter args) $ \mname meter -> do
-    result <- F.withFFIHypothesis hyp $ \h -> case argTrace args of
-      Nothing -> C.runCT meter cfg h
-      Just tp -> do
-        t <- R.record (argTarget args) mname meter cfg h
-        writeFile tp (R.renderTrace t)
-        pure (R.traceResult t)
-    -- run the A/A and B/B diagnostics if the user asked and the
-    -- primary run rejected; otherwise skip.
-    mat <- case (argAttribute args, result) of
-      (True, C.Reject{}) -> F.withFFIHypothesis hyp $ \h ->
-        Just <$> C.attribute meter cfg h
-      _                  -> pure Nothing
-    putStrLn (renderResult (argOutput args) result mat)
-    exitWith (case verdictExit result of
-      0 -> ExitSuccess
-      n -> ExitFailure n)
+    let hdr = Rep.ReportHeader
+          { Rep.rhMeter  = mname
+          , Rep.rhConfig = cfg
+          , Rep.rhSeed   = Just seed
+          , Rep.rhTarget = Just (argTarget args)
+          , Rep.rhNote   = Just ("library " ++ argLib args)
+          }
+    cases <- Rep.withReport rc rnd hdr $ \emit -> do
+      result <- F.withFFIHypothesis hyp $ \h -> case argTrace args of
+        Nothing -> C.runCT meter cfg h
+        Just tp -> do
+          t <- R.record (argTarget args) mname meter cfg h
+          writeFile tp (R.renderTrace t)
+          pure (R.traceResult t)
+      -- run the A/A and B/B diagnostics if the user asked and the
+      -- primary run rejected; otherwise skip.
+      mat <- case (argAttribute args, result) of
+        (True, C.Reject{}) -> F.withFFIHypothesis hyp $ \h ->
+          Just <$> C.attribute meter cfg h
+        _                  -> pure Nothing
+      emit (Rep.CaseReport (argTarget args) result mat)
+      pure (argTrace args)
+    let code = case cases of
+          [cr] -> verdictExit (Rep.crResult cr)
+          _    -> exitPass  -- unreachable: exactly one case emitted
+    exitWith (if code == 0 then ExitSuccess else ExitFailure code)

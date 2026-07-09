@@ -1,5 +1,12 @@
 # Changelog
 
+- 0.3.1 (2026-07-09)
+  * The `censor` executable renders through `Censor.Runner.Report`
+    like the other suites. `--json` and `--summary` become
+    `--format pretty|json|plain`; verdict and attribution ride on
+    a single `CaseReport`. Exit codes and the `--trace` /
+    `--attribute` behavior are unchanged.
+
 - 0.3.0 (2026-07-09)
   * `Censor.Runner.Report`: uniform report rendering with a
     header/case/footer data model and three renderers:
