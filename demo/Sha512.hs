@@ -4,18 +4,22 @@
 -- HMAC-tag comparison under a selectable meter, dumping per-pair
 -- trajectories as JSON for plotting.
 --
--- Usage: censor-sha512 [wall|instructions|cycles|branches] [OUT.json]
+-- Usage: censor-sha512 [--format pretty|json|plain]
+--                      [wall|instructions|cycles|branches] [OUT.json]
 --
--- This is the whole tool: 'Censor.Runner' supplies meter selection,
--- trace recording (via Censor.runCTWith, not a reimplemented driver),
--- and the JSON rendering; Censor.calibrateBatch picks the batch. What
+-- 'Censor.Runner' supplies meter selection, trace recording (via
+-- 'Censor.runCTWith', not a reimplemented driver), and the trace-
+-- JSON rendering; 'Censor.Runner.Report' owns the human-facing
+-- report; 'Censor.calibrateBatch' picks the inner-loop batch. What
 -- remains here is the hypothesis and the case list.
 
 module Main where
 
 import Control.Exception (evaluate)
+import Control.Monad (forM)
 import qualified Censor as C
 import Censor.Runner
+import qualified Censor.Runner.Report as R
 import qualified Crypto.Hash.SHA512 as SHA512
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
@@ -67,32 +71,46 @@ cases =
   , ("position @0 vs @63",  0, 63)
   ]
 
+version :: String
+version = "0.2.0"
+
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  args <- Env.getArgs
-  let (marg, out) = case args of
+  raw <- Env.getArgs
+  let (farg, rest) = R.takeFormatArg raw
+      (marg, out) = case rest of
         []      -> (Nothing, Nothing)
         [m]     -> (Just m,  Nothing)
         (m:o:_) -> (Just m,  Just o)
+  rnd <- R.resolveFormat farg
+  rc  <- R.initReportCfg
   withMeterArg marg $ \mname meter -> do
     h0 <- posCase 0 0
     b  <- C.calibrateBatch meter h0
-    let c = cfg { C.cfgBatch = b }
-    printf "meter: %s, batch=%d (auto), budget=%d\n" mname b (C.cfgBudget c)
-    traces <- mapM (recordCase mname meter c) cases
-    let path = fromMaybe ("censor-sha512-" ++ mname ++ ".json") out
-    writeFile path $ concat
-      [ "{\"meter\":\"", mname, "\""
-      , printf ",\"alpha\":%.1g" (C.cfgAlpha c)
-      , printf ",\"thresh\":%.6f" (log (1 / C.cfgAlpha c))
-      , ",\"cases\":[", intercalate "," (map renderTrace traces), "]}"
-      ]
-    putStrLn ("wrote " ++ path)
-  where
-    recordCase mname meter c (name, i0, i1) = do
-      h <- posCase i0 i1
-      t <- record name mname meter c h
-      printf "  %-24s %s after %d pairs\n"
-        name (verdictName (traceResult t)) (C.resPairs (traceResult t))
-      pure t
+    let c   = cfg { C.cfgBatch = b }
+        hdr = R.ReportHeader
+          { R.rhSuite   = "censor-sha512"
+          , R.rhVersion = version
+          , R.rhMeter   = mname
+          , R.rhConfig  = c
+          , R.rhSeed    = Just fixedSeed
+          , R.rhTarget  =
+              Just "ppad-sha512 HMAC MAC == (mismatch-position independence)"
+          , R.rhNote    = Just "batch auto-calibrated"
+          }
+        path = fromMaybe ("censor-sha512-" ++ mname ++ ".json") out
+    _ <- R.withReport rc rnd hdr $ \emit -> do
+      traces <- forM cases $ \(name, i0, i1) -> do
+        h <- posCase i0 i1
+        t <- record name mname meter c h
+        emit (R.CaseReport name (traceResult t) Nothing)
+        pure t
+      writeFile path $ concat
+        [ "{\"meter\":\"", mname, "\""
+        , printf ",\"alpha\":%.1g"  (C.cfgAlpha c)
+        , printf ",\"thresh\":%.6f" (log (1 / C.cfgAlpha c))
+        , ",\"cases\":[", intercalate "," (map renderTrace traces), "]}"
+        ]
+      pure (Just path)
+    pure ()

@@ -18,24 +18,27 @@
 -- than fix-vs-random) and the deliberately leaky negative controls
 -- (adversarial all-zero fixed inputs) are wired by hand.
 --
--- The meter is chosen by the first command-line argument (wall,
--- instructions, branches, or cycles), defaulting to wall-clock.
--- The PMU meters are Linux-only; asking for one elsewhere is a
--- hard error rather than a silent fallback.
+-- Usage: censor-demo [--format pretty|json|plain]
+--                    [wall|instructions|cycles|branches]
+--
+-- The meter is chosen by the first positional argument, defaulting
+-- to wall-clock. The PMU meters are Linux-only; asking for one
+-- elsewhere is a hard error rather than a silent fallback.
 
 module Main where
 
-import Control.Exception (evaluate, try)
+import Control.Exception (evaluate)
 import Control.Monad (replicateM_)
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
 import qualified System.Environment as Env
 import System.Exit (die)
-import System.IO (hFlush, hSetBuffering, stdout, BufferMode(..))
-import Text.Printf (printf)
+import System.IO (hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
+import Censor.Runner (withMeterArg)
+import qualified Censor.Runner.Report as R
 import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
 import qualified Crypto.Curve.Secp256k1 as Secp
 import qualified Crypto.Hash.SHA256 as SHA256
@@ -74,6 +77,9 @@ random12 g = C.randomBytes g 12
 -- secret (the stream's first draw) is reproducible across runs.
 fixedSeed :: Word64
 fixedSeed = 0x5EED5EED5EED5EED
+
+version :: String
+version = "0.2.0"
 
 -- hypotheses -----------------------------------------------------------------
 
@@ -428,124 +434,71 @@ cfgBigBatch = cfg { C.cfgBatch = 2000 }
 cfgHeavy :: C.Config
 cfgHeavy = cfg { C.cfgBatch = 1 }
 
-renderResult :: C.Result -> IO ()
-renderResult r = do
-  let verdict = case r of
-        C.Reject{} -> "REJECT after "
-        C.Pass{}   -> "PASS    after "
-  putStrLn $ "  " ++ verdict ++ show (C.resPairs r)
-    ++ " pairs, logE=" ++ show (C.resPeakLogW r)
-    ++ ", clipped=" ++ show (C.resClipped r)
-    ++ ", bound=" ++ show (C.resBound r)
-  printf "    evidence: p=%.3g  peaks: sign=%.2f magn(c)=%.2f \
-         \magn(4c)=%.2f magn(16c)=%.2f\n"
-    (C.resPValue r)
-    (C.resPeakSign r) (C.resPeakMagn r)
-    (C.resPeakMagn4 r) (C.resPeakMagn16 r)
-  let (elo, ehi) = C.resEffect r
-  printf "    effect: mean clipped d in [%.1f, %.1f] per batch\n"
-    elo ehi
-
-renderAttribution :: C.Attribution -> String
-renderAttribution att = case att of
-  C.TargetLeak ->
-    "A/A and B/B both PASS — target leak confirmed"
-  C.SampleAAsymmetry r ->
-    "A/A REJECT after " ++ show (C.resPairs r)
-    ++ " — sampleA asymmetry, not a target leak"
-  C.SampleBAsymmetry r ->
-    "B/B REJECT after " ++ show (C.resPairs r)
-    ++ " — sampleB asymmetry, not a target leak"
-  C.PervasiveAsymmetry ra rb ->
-    "A/A and B/B both REJECT (nA=" ++ show (C.resPairs ra)
-    ++ ", nB=" ++ show (C.resPairs rb)
-    ++ ") — pervasive harness asymmetry"
-
-runCaseWith :: C.Meter -> C.Config -> String -> IO (C.Hypothesis a) -> IO ()
-runCaseWith meter c name mkH = do
-  putStrLn $ "-- " ++ name
-  hFlush stdout
+-- Run one case: execute the hypothesis, and on 'Reject' re-run the
+-- A/A + B/B attribution to distinguish target leaks from harness
+-- asymmetries.
+runCase
+  :: (R.CaseReport -> IO ())
+  -> C.Meter -> C.Config -> String -> IO (C.Hypothesis a) -> IO ()
+runCase emit meter c name mkH = do
   h <- mkH
   r <- C.runCT meter c h
-  renderResult r
-  case r of
+  mat <- case r of
     C.Reject{} -> do
-      -- A/A and B/B diagnostics: each collapses one sampler onto
-      -- itself and should always Pass under a symmetric harness;
-      -- 'attribute' combines their verdicts.
-      putStrLn "    (running A/A and B/B diagnostics to attribute the reject...)"
-      hFlush stdout
       hD <- mkH
-      att <- C.attribute meter c hD
-      putStrLn $ "    " ++ renderAttribution att
-    C.Pass{} -> pure ()
-  hFlush stdout
+      Just <$> C.attribute meter c hD
+    C.Pass{}   -> pure Nothing
+  emit (R.CaseReport name r mat)
 
 -- run every case under the given meter.
-runAll :: Secp.Context -> C.Meter -> IO ()
-runAll tex meter = do
-  let rc = runCaseWith meter cfg
-      rh = runCaseWith meter cfgHeavy
-  runCaseWith meter cfgBigBatch
-     "positive: Scalar.mul (single multiply, batch=2000)"  posScalarMul
-  rc "positive: Scalar.inv (addition chain)"               posScalarInv
-  rc "positive: Scalar.exp (constant-iteration ladder)"    posScalarExp
-  rh "positive: Secp.mul_wnaf (wNAF point multiplication)" (posMulWNAF tex)
-  rh "positive: Secp.sign_schnorr' (BIP0340)"              (posSignSchnorr tex)
-  rh "positive: Secp.sign_ecdsa' (RFC6979)"                (posSignECDSA tex)
-  rc "positive: AEAD.encrypt (ChaCha20-Poly1305, 256 B)"   posAEADEncrypt
-  rc "positive: AEAD.decrypt (ChaCha20-Poly1305, 256 B)"   posAEADDecrypt
-  rh "positive: SHA256.hmac (256 B msg, secret key)"       posHMACSHA256
-  rh "positive: SHA512.hmac (256 B msg, secret key)"       posHMACSHA512
-  runCaseWith meter cfgBigBatch
-     "positive: MAC == (constant-time tag compare, batch=2000)" posMACEq
-  runCaseWith meter cfgBigBatch
-     "positive: MAC == (mismatch@0 vs mismatch@31, batch=2000)" posMACPos
-  rh "positive: BIP32 derive_child_priv (secret parent)"   posBIP32Derive
-  rc "negative: deliberately leaky popcount-driven loop"   negLeakyPopcount
-  rc "negative: Wider.from_vartime (Integer conversion)"   negFromVartime
-
--- meter selection: first CLI argument, defaulting to wall-clock.
--- The PMU meters are Linux-only; an unavailable counter is a hard
--- error rather than a silent fallback.
-data MeterChoice
-  = MeterWall
-  | MeterPMU !C.Counter !String
-
-parseMeter :: [String] -> Maybe MeterChoice
-parseMeter args = case args of
-  []               -> Just MeterWall
-  ["wall"]         -> Just MeterWall
-  ["instructions"] ->
-    Just (MeterPMU C.InstructionsRetired "instructions_retired")
-  ["branches"]     ->
-    Just (MeterPMU C.BranchesRetired "branches_retired")
-  ["cycles"]       ->
-    Just (MeterPMU C.Cycles "cycles")
-  _                -> Nothing
-
-withMeter :: String -> MeterChoice -> (String -> C.Meter -> IO ()) -> IO ()
-withMeter _ MeterWall k = k "wall-clock" C.wallClock
-withMeter prog (MeterPMU counter label) k = do
-  r <- try (C.withCounter counter (k label))
-        :: IO (Either C.MeterError ())
-  case r of
-    Left e   -> die $ prog ++ ": PMU meter unavailable: " ++ show e
-    Right () -> pure ()
+runAll
+  :: Secp.Context -> C.Meter -> (R.CaseReport -> IO ()) -> IO ()
+runAll tex meter emit = do
+  let rc = runCase emit meter cfg
+      rh = runCase emit meter cfgHeavy
+      rb = runCase emit meter cfgBigBatch
+  rb "positive: Scalar.mul (single multiply, batch=2000)"        posScalarMul
+  rc "positive: Scalar.inv (addition chain)"                     posScalarInv
+  rc "positive: Scalar.exp (constant-iteration ladder)"          posScalarExp
+  rh "positive: Secp.mul_wnaf (wNAF point multiplication)"       (posMulWNAF tex)
+  rh "positive: Secp.sign_schnorr' (BIP0340)"                    (posSignSchnorr tex)
+  rh "positive: Secp.sign_ecdsa' (RFC6979)"                      (posSignECDSA tex)
+  rc "positive: AEAD.encrypt (ChaCha20-Poly1305, 256 B)"         posAEADEncrypt
+  rc "positive: AEAD.decrypt (ChaCha20-Poly1305, 256 B)"         posAEADDecrypt
+  rh "positive: SHA256.hmac (256 B msg, secret key)"             posHMACSHA256
+  rh "positive: SHA512.hmac (256 B msg, secret key)"             posHMACSHA512
+  rb "positive: MAC == (constant-time tag compare, batch=2000)"  posMACEq
+  rb "positive: MAC == (mismatch@0 vs mismatch@31, batch=2000)"  posMACPos
+  rh "positive: BIP32 derive_child_priv (secret parent)"         posBIP32Derive
+  rc "negative: deliberately leaky popcount-driven loop"         negLeakyPopcount
+  rc "negative: Wider.from_vartime (Integer conversion)"         negFromVartime
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  args <- Env.getArgs
-  choice <- case parseMeter args of
-    Just m  -> pure m
-    Nothing -> die "usage: censor-demo [wall|instructions|branches|cycles]"
-  putStrLn "ppad-censor demo: dudect-style fix-vs-random against \
-           \ppad-fixed, ppad-secp256k1, ppad-aead, ppad-sha256, \
-           \ppad-sha512, and ppad-bip32"
-  putStrLn $ "config: " ++ show cfg
-  -- one-shot secp256k1 precomputation, shared across all secp targets.
+  raw <- Env.getArgs
+  let (farg, rest) = R.takeFormatArg raw
+  marg <- case rest of
+    []  -> pure Nothing
+    [m] -> pure (Just m)
+    _   -> die "usage: censor-demo [--format pretty|json|plain] \
+               \[wall|instructions|cycles|branches]"
+  rnd <- R.resolveFormat farg
+  rc  <- R.initReportCfg
   let !tex = Secp.precompute
-  withMeter "censor-demo" choice $ \label meter -> do
-    putStrLn $ "\nmeter: " ++ label
-    runAll tex meter
+  withMeterArg marg $ \mname meter -> do
+    let hdr = R.ReportHeader
+          { R.rhSuite   = "censor-demo"
+          , R.rhVersion = version
+          , R.rhMeter   = mname
+          , R.rhConfig  = cfg
+          , R.rhSeed    = Just fixedSeed
+          , R.rhTarget  = Just "dudect-style fix-vs-random against \
+                               \ppad-* and controls"
+          , R.rhNote    = Just "batch varies per case: 50 (base), \
+                               \1 (secp), 2000 (nanosecond targets)"
+          }
+    _ <- R.withReport rc rnd hdr $ \emit -> do
+      runAll tex meter emit
+      pure Nothing
+    pure ()

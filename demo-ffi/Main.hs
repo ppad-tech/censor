@@ -19,8 +19,9 @@
 --     should reject under PMU. See
 --     ppad.tech/articles/introducing-substratum.md.
 --
--- The meter is chosen by the first command-line argument (wall,
--- instructions, branches, or cycles), defaulting to wall-clock.
+-- Usage: censor-demo-ffi [--format pretty|json|plain]
+--                        [wall|instructions|branches|cycles]
+--
 -- instructions_retired catches control-flow leaks (different code
 -- paths retire different counts) but is blind to data-dependent
 -- latency from cache misses, so it can pass a target that
@@ -31,7 +32,6 @@
 
 module Main where
 
-import Control.Exception (try)
 import Control.Monad (when)
 import Data.Word (Word8, Word64)
 import Foreign.C.Types (CSize(..))
@@ -41,11 +41,12 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (peek, poke)
 import qualified System.Environment as Env
 import System.Exit (die)
-import System.IO (hFlush, hSetBuffering, stdout, BufferMode(..))
-import Text.Printf (printf)
+import System.IO (hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
 import qualified Censor.FFI as F
+import Censor.Runner (withMeterArg)
+import qualified Censor.Runner.Report as R
 
 -- foreign imports ------------------------------------------------------------
 
@@ -69,6 +70,9 @@ foreign import ccall unsafe "h_byinv_fr_invert"
 
 fixedSeed :: Word64
 fixedSeed = 0x5EED5EED5EED5EED
+
+version :: String
+version = "0.2.0"
 
 -- build a fastcrypto Secp256r1KeyPair from a 32-byte secret drawn
 -- from the supplied RNG. errors on invalid scalar (vanishingly
@@ -235,116 +239,64 @@ cfgSign = C.defaultConfig
   , C.cfgBatch  = 50
   }
 
-renderResult :: C.Result -> IO ()
-renderResult r = do
-  let verdict = case r of
-        C.Reject{} -> "REJECT after "
-        C.Pass{}   -> "PASS    after "
-  putStrLn $ "  " ++ verdict ++ show (C.resPairs r)
-    ++ " pairs, logE=" ++ show (C.resPeakLogW r)
-    ++ ", clipped=" ++ show (C.resClipped r)
-    ++ ", bound=" ++ show (C.resBound r)
-  printf "    evidence: p=%.3g  peaks: sign=%.2f magn(c)=%.2f \
-         \magn(4c)=%.2f magn(16c)=%.2f\n"
-    (C.resPValue r)
-    (C.resPeakSign r) (C.resPeakMagn r)
-    (C.resPeakMagn4 r) (C.resPeakMagn16 r)
-  let (elo, ehi) = C.resEffect r
-  printf "    effect: mean clipped d in [%.1f, %.1f] per batch\n"
-    elo ehi
+-- Run one FFI case: execute the hypothesis and, on 'Reject', re-run
+-- the A/A + B/B attribution to distinguish target leaks from harness
+-- asymmetries.
+runCase
+  :: (R.CaseReport -> IO ())
+  -> C.Meter -> C.Config -> String -> F.FFIHypothesis -> IO ()
+runCase emit meter c name fh = do
+  r <- F.withFFIHypothesis fh $ \h -> C.runCT meter c h
+  mat <- case r of
+    C.Reject{} -> Just <$> F.withFFIHypothesis fh (C.attribute meter c)
+    C.Pass{}   -> pure Nothing
+  emit (R.CaseReport name r mat)
 
-renderAttribution :: C.Attribution -> String
-renderAttribution att = case att of
-  C.TargetLeak ->
-    "A/A and B/B both PASS — target leak confirmed"
-  C.SampleAAsymmetry r ->
-    "A/A REJECT after " ++ show (C.resPairs r)
-    ++ " — sampleA asymmetry, not a target leak"
-  C.SampleBAsymmetry r ->
-    "B/B REJECT after " ++ show (C.resPairs r)
-    ++ " — sampleB asymmetry, not a target leak"
-  C.PervasiveAsymmetry ra rb ->
-    "A/A and B/B both REJECT (nA=" ++ show (C.resPairs ra)
-    ++ ", nB=" ++ show (C.resPairs rb)
-    ++ ") — pervasive harness asymmetry"
-
-runCase :: C.Meter -> C.Config -> String -> F.FFIHypothesis -> IO ()
-runCase meter c name fh = do
-  putStrLn $ "-- " ++ name
-  hFlush stdout
-  result <- F.withFFIHypothesis fh $ \h -> C.runCT meter c h
-  renderResult result
-  case result of
-    C.Reject{} -> do
-      -- A/A and B/B diagnostics: each collapses one sampler onto
-      -- itself and should always Pass under a symmetric harness;
-      -- 'attribute' combines their verdicts.
-      putStrLn "    (running A/A and B/B diagnostics to attribute the reject...)"
-      hFlush stdout
-      att <- F.withFFIHypothesis fh $ \h -> C.attribute meter c h
-      putStrLn $ "    " ++ renderAttribution att
-    C.Pass{} -> pure ()
-  hFlush stdout
-
-runAll :: C.Meter -> IO ()
-runAll meter = do
+runAll :: C.Meter -> (R.CaseReport -> IO ()) -> IO ()
+runAll meter emit = do
   ga <- C.mkRng 0xCAFEBABE
   gb <- C.mkRng 0xDEADBEEF
-  runCase meter cfg "positive: rust censor_ct_neq32 (XOR fold, 32B)"
+  runCase emit meter cfg
+    "positive: rust censor_ct_neq32 (XOR fold, 32B)"
     (posCTNeq32 ga gb)
-  runCase meter cfg "negative: rust censor_naive_neq32 (short-circuit)"
+  runCase emit meter cfg
+    "negative: rust censor_naive_neq32 (short-circuit)"
     (negNaiveNeq32 ga gb)
   signHyp <- negFastcryptoSign ga gb
-  runCase meter cfgSign
+  runCase emit meter cfgSign
     "negative: fastcrypto::secp256r1 sign (WindowedScalarMultiplier)"
     signHyp
   byHyp <- negBYInvFr ga gb
-  runCase meter cfgSign
+  runCase emit meter cfgSign
     "negative: halo2curves BYInverter::invert bn254 Fr (no black_box)"
     byHyp
-
--- meter selection: first CLI argument, defaulting to wall-clock.
--- The PMU meters are Linux-only; an unavailable counter is a hard
--- error rather than a silent fallback.
-data MeterChoice
-  = MeterWall
-  | MeterPMU !C.Counter !String
-
-parseMeter :: [String] -> Maybe MeterChoice
-parseMeter args = case args of
-  []               -> Just MeterWall
-  ["wall"]         -> Just MeterWall
-  ["instructions"] ->
-    Just (MeterPMU C.InstructionsRetired "instructions_retired")
-  ["branches"]     ->
-    Just (MeterPMU C.BranchesRetired "branches_retired")
-  ["cycles"]       ->
-    Just (MeterPMU C.Cycles "cycles")
-  _                -> Nothing
-
-withMeter :: String -> MeterChoice -> (String -> C.Meter -> IO ()) -> IO ()
-withMeter _ MeterWall k = k "wall-clock" C.wallClock
-withMeter prog (MeterPMU counter label) k = do
-  r <- try (C.withCounter counter (k label))
-        :: IO (Either C.MeterError ())
-  case r of
-    Left e   -> die $ prog ++ ": PMU meter unavailable: " ++ show e
-    Right () -> pure ()
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  args <- Env.getArgs
-  choice <- case parseMeter args of
-    Just m  -> pure m
-    Nothing -> die
-      "usage: censor-demo-ffi [wall|instructions|branches|cycles]"
-  putStrLn "ppad-censor demo-ffi: dudect-style fix-vs-random \
-           \against rust 32-byte inequality witnesses, \
-           \fastcrypto secp256r1 sign, and halo2curves BY \
-           \inverter (black_box stripped)"
-  putStrLn $ "cfg:     " ++ show cfg
-  putStrLn $ "cfgSign: " ++ show cfgSign
-  withMeter "censor-demo-ffi" choice $ \label meter -> do
-    putStrLn $ "\nmeter: " ++ label
-    runAll meter
+  raw <- Env.getArgs
+  let (farg, rest) = R.takeFormatArg raw
+  marg <- case rest of
+    []  -> pure Nothing
+    [m] -> pure (Just m)
+    _   -> die "usage: censor-demo-ffi [--format pretty|json|plain] \
+               \[wall|instructions|branches|cycles]"
+  rnd <- R.resolveFormat farg
+  rc  <- R.initReportCfg
+  withMeterArg marg $ \mname meter -> do
+    let hdr = R.ReportHeader
+          { R.rhSuite   = "censor-demo-ffi"
+          , R.rhVersion = version
+          , R.rhMeter   = mname
+          , R.rhConfig  = cfg
+          , R.rhSeed    = Just fixedSeed
+          , R.rhTarget  = Just "fix-vs-random against rust CT/naive \
+                               \neq32, fastcrypto secp256r1, and \
+                               \halo2curves BY inverter"
+          , R.rhNote    = Just "sign/inverter cases use cfgSign \
+                               \(batch=50)"
+          }
+    _ <- R.withReport rc rnd hdr $ \emit -> do
+      runAll meter emit
+      pure Nothing
+    pure ()
