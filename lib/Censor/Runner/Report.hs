@@ -7,20 +7,23 @@
 -- License: MIT
 -- Maintainer: Jared Tobin <jared@ppad.tech>
 --
--- Uniform report rendering for censor demos and command-line tools.
--- A single header\/case\/footer data model is streamed through a
--- 'Renderer'; three renderers are provided out of the box:
+-- Uniform report rendering and demo scaffolding for censor
+-- executables. Three concentric layers:
 --
--- * 'pretty' — the ppad terminal aesthetic: bold brand line, a dim
---   key column, middle-dot separators, ANSI-colored @PASS@\/@REJECT@
---   on a TTY (identical bytes otherwise).
--- * 'json' — one line-oriented JSON object per battery, deterministic
---   key order, tagged @\"schema\":\"censor\/report-v1\"@ for stable
---   downstream tooling.
--- * 'plain' — ASCII-only, no ANSI, no unicode; grep-safe for CI logs.
---
--- 'withReport' streams cases through the chosen renderer and returns
--- the accumulated list so callers can drive exit codes off it.
+-- * The lowest layer is a header\/case\/footer data model streamed
+--   through a 'Renderer'. Three renderers are provided —
+--   'pretty' (the ppad terminal aesthetic: bold brand line, dim
+--   key column, middle-dot separators, ANSI-colored verdicts on a
+--   TTY), 'json' (one line-oriented @censor\/report-v1@ object per
+--   run, deterministic key order), and 'plain' (ASCII-only,
+--   grep-safe).
+-- * 'withReport' streams cases through the chosen renderer and
+--   returns the accumulated list so callers can drive exit codes.
+-- * At the top, t'TraceDemo' and t'BatteryDemo' package up the
+--   entire censor demo shape (arg parse, meter selection, header
+--   assembly, calibration, per-case loop, optional trace dump)
+--   into one call, so a demo's @Main.hs@ contains only the
+--   hypothesis and case list.
 
 module Censor.Runner.Report (
     -- * Report config
@@ -47,18 +50,34 @@ module Censor.Runner.Report (
   , rendererFor
   , takeFormatArg
   , resolveFormat
+
+    -- * Standard demo arg surface
+  , DemoArgs(..)
+  , parseDemoArgs
+
+    -- * Demo scaffolds
+  , TraceDemo(..)
+  , runTraceDemo
+  , BatteryDemo(..)
+  , runBatteryDemo
   ) where
 
+import Control.Monad (forM)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.List (intercalate)
+import Data.Maybe (fromMaybe)
 import Data.Word (Word64)
 import Numeric (showHex)
+import qualified System.Environment as Env
 import System.Exit (die)
-import System.IO (hIsTerminalDevice, stdout)
+import System.IO (BufferMode(..), hIsTerminalDevice, hSetBuffering, stdout)
 import Text.Printf (printf)
 
 import Censor
-import Censor.Runner (verdictName, resultToJSON)
+import Censor.Runner
+  ( traceResult, record, renderTracesJSON
+  , verdictName, resultToJSON, withMeterArg
+  )
 
 -- report config -------------------------------------------------------------
 
@@ -509,3 +528,161 @@ jstr s = "\"" ++ concatMap esc s ++ "\""
 padR, padL :: Int -> String -> String
 padR n s = s ++ replicate (max 0 (n - length s)) ' '
 padL n s = replicate (max 0 (n - length s)) ' ' ++ s
+
+-- shared demo arg surface --------------------------------------------------
+
+-- | The parsed demo argv. All censor demos share the shape
+--   @[--format FMT] [METER] [EXTRA...]@; each demo's runner
+--   interprets @daExtra@ in its own way (trace demos take the first
+--   extra as an output path; battery demos reject them).
+data DemoArgs = DemoArgs
+  { daRenderer :: !Renderer
+    -- ^ resolved from @--format@; defaults to 'pretty'.
+  , daMeter    :: !(Maybe String)
+    -- ^ meter name (@wall@, @instructions@, ...); 'Nothing' means
+    --   accept the runner's default.
+  , daExtra    :: ![String]
+    -- ^ positional arguments left after meter, in order.
+  }
+
+-- | Parse the standard demo argv from 'Env.getArgs'. Dies with a
+--   clear message if @--format@ is malformed. The extras list is
+--   handed to the runner for further interpretation.
+parseDemoArgs :: IO DemoArgs
+parseDemoArgs = do
+  raw <- Env.getArgs
+  let (farg, rest) = takeFormatArg raw
+  rnd <- resolveFormat farg
+  let (marg, extra) = case rest of
+        []       -> (Nothing, [])
+        (m:more) -> (Just m,  more)
+  pure DemoArgs
+    { daRenderer = rnd
+    , daMeter    = marg
+    , daExtra    = extra
+    }
+
+-- trace-recording demo scaffold --------------------------------------------
+
+-- | A trace-recording demo: iterate a parameterised hypothesis over
+--   a case list under a chosen meter, record the per-pair frame
+--   trajectory of each run, and dump the whole battery as a
+--   plot-artifact JSON alongside the human-facing report.
+--
+--   The demo's @Main.hs@ builds one of these and calls
+--   'runTraceDemo'; everything else — arg parse, meter selection,
+--   'calibrateBatch', header assembly, per-case 'record' loop,
+--   'renderTracesJSON' envelope write, 'withReport' driver — is
+--   done inside.
+data TraceDemo p a = TraceDemo
+  { tdSuite   :: !String
+    -- ^ tool name, used in the report brand line and as the default
+    --   trace-output file stem.
+  , tdVersion :: !String
+    -- ^ tool version, shown in the brand line.
+  , tdTarget  :: !String
+    -- ^ one-line target description shown in the header block.
+  , tdConfig  :: !Config
+    -- ^ base driver config. 'calibrateBatch' overrides
+    --   @cfgBatch@ using the first case as its probe.
+  , tdSeed    :: !(Maybe Word64)
+    -- ^ user-facing sampler seed shown in the header block.
+  , tdNote    :: !(Maybe String)
+    -- ^ optional one-line note under the header block.
+  , tdCases   :: ![(String, p)]
+    -- ^ case list: display name paired with the hypothesis
+    --   parameter.
+  , tdBuild   :: !(p -> IO (Hypothesis a))
+    -- ^ hypothesis builder invoked once per case.
+  }
+
+-- | Drive a t'TraceDemo' end to end. The trace JSON is written to
+--   the first positional argument after the meter, defaulting to
+--   @<suite>-<meter>.json@.
+runTraceDemo :: TraceDemo p a -> IO ()
+runTraceDemo td = do
+  hSetBuffering stdout LineBuffering
+  da <- parseDemoArgs
+  rc <- initReportCfg
+  probe <- case tdCases td of
+    []         -> die (tdSuite td ++ ": no cases configured")
+    ((_,p):_)  -> pure p
+  let out = case daExtra da of
+        (o:_) -> Just o
+        _     -> Nothing
+  withMeterArg (daMeter da) $ \mname meter -> do
+    h0 <- tdBuild td probe
+    b  <- calibrateBatch meter h0
+    let c    = (tdConfig td) { cfgBatch = b }
+        hdr  = ReportHeader
+          { rhSuite   = tdSuite td
+          , rhVersion = tdVersion td
+          , rhMeter   = mname
+          , rhConfig  = c
+          , rhSeed    = tdSeed td
+          , rhTarget  = Just (tdTarget td)
+          , rhNote    = tdNote td
+          }
+        path = fromMaybe (tdSuite td ++ "-" ++ mname ++ ".json") out
+    _ <- withReport rc (daRenderer da) hdr $ \emit -> do
+      traces <- forM (tdCases td) $ \(name, p) -> do
+        h <- tdBuild td p
+        t <- record name mname meter c h
+        emit (CaseReport name (traceResult t) Nothing)
+        pure t
+      writeFile path (renderTracesJSON mname (cfgAlpha c) traces)
+      pure (Just path)
+    pure ()
+
+-- battery demo scaffold ----------------------------------------------------
+
+-- | A battery demo: a fixed set of heterogeneous cases (each with
+--   its own type and possibly its own 'Config'), no trace recording,
+--   no per-case parameter passing. The demo supplies a callback
+--   that runs the whole battery under the chosen meter and emits
+--   each result; 'runBatteryDemo' handles the surrounding
+--   scaffolding.
+data BatteryDemo = BatteryDemo
+  { bdSuite   :: !String
+  , bdVersion :: !String
+  , bdTarget  :: !String
+  , bdConfig  :: !Config
+    -- ^ base driver config (shown in the header). Individual cases
+    --   may run under different configs internally; the header only
+    --   surfaces this one.
+  , bdSeed    :: !(Maybe Word64)
+  , bdNote    :: !(Maybe String)
+  , bdRun     :: !(String -> Meter -> (CaseReport -> IO ()) -> IO ())
+    -- ^ battery driver. Receives the meter name, the meter, and an
+    --   @emit@ action that records one 'CaseReport'.
+  }
+
+-- | Drive a t'BatteryDemo' end to end. Rejects positional arguments
+--   past the meter with a usage error — battery demos do not take
+--   an output path.
+runBatteryDemo :: BatteryDemo -> IO ()
+runBatteryDemo bd = do
+  hSetBuffering stdout LineBuffering
+  da <- parseDemoArgs
+  case daExtra da of
+    [] -> pure ()
+    xs -> die $ bdSuite bd ++ ": unexpected positional arg(s) "
+            ++ show xs
+            ++ " (usage: " ++ bdSuite bd
+            ++ " [--format pretty|json|plain] "
+            ++ "[wall|instructions|cycles|branches])"
+  rc <- initReportCfg
+  withMeterArg (daMeter da) $ \mname meter -> do
+    let hdr = ReportHeader
+          { rhSuite   = bdSuite bd
+          , rhVersion = bdVersion bd
+          , rhMeter   = mname
+          , rhConfig  = bdConfig bd
+          , rhSeed    = bdSeed bd
+          , rhTarget  = Just (bdTarget bd)
+          , rhNote    = bdNote bd
+          }
+    _ <- withReport rc (daRenderer da) hdr $ \emit -> do
+      bdRun bd mname meter emit
+      pure Nothing
+    pure ()

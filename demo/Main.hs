@@ -32,12 +32,8 @@ import Control.Monad (replicateM_)
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
-import qualified System.Environment as Env
-import System.Exit (die)
-import System.IO (hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
-import Censor.Runner (withMeterArg)
 import qualified Censor.Runner.Report as R
 import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
 import qualified Crypto.Curve.Secp256k1 as Secp
@@ -475,30 +471,14 @@ runAll tex meter emit = do
 
 main :: IO ()
 main = do
-  hSetBuffering stdout LineBuffering
-  raw <- Env.getArgs
-  let (farg, rest) = R.takeFormatArg raw
-  marg <- case rest of
-    []  -> pure Nothing
-    [m] -> pure (Just m)
-    _   -> die "usage: censor-demo [--format pretty|json|plain] \
-               \[wall|instructions|cycles|branches]"
-  rnd <- R.resolveFormat farg
-  rc  <- R.initReportCfg
   let !tex = Secp.precompute
-  withMeterArg marg $ \mname meter -> do
-    let hdr = R.ReportHeader
-          { R.rhSuite   = "censor-demo"
-          , R.rhVersion = version
-          , R.rhMeter   = mname
-          , R.rhConfig  = cfg
-          , R.rhSeed    = Just fixedSeed
-          , R.rhTarget  = Just "dudect-style fix-vs-random against \
-                               \ppad-* and controls"
-          , R.rhNote    = Just "batch varies per case: 50 (base), \
-                               \1 (secp), 2000 (nanosecond targets)"
-          }
-    _ <- R.withReport rc rnd hdr $ \emit -> do
-      runAll tex meter emit
-      pure Nothing
-    pure ()
+  R.runBatteryDemo R.BatteryDemo
+    { R.bdSuite   = "censor-demo"
+    , R.bdVersion = version
+    , R.bdTarget  = "dudect-style fix-vs-random against ppad-* and controls"
+    , R.bdConfig  = cfg
+    , R.bdSeed    = Just fixedSeed
+    , R.bdNote    = Just "batch varies per case: 50 (base), \
+                         \1 (secp), 2000 (nanosecond targets)"
+    , R.bdRun     = \_ meter emit -> runAll tex meter emit
+    }

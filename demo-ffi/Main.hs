@@ -39,13 +39,9 @@ import Foreign.Marshal.Alloc (allocaBytes, mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (peek, poke)
-import qualified System.Environment as Env
-import System.Exit (die)
-import System.IO (hSetBuffering, stdout, BufferMode(..))
 
 import qualified Censor as C
 import qualified Censor.FFI as F
-import Censor.Runner (withMeterArg)
 import qualified Censor.Runner.Report as R
 
 -- foreign imports ------------------------------------------------------------
@@ -272,31 +268,13 @@ runAll meter emit = do
     byHyp
 
 main :: IO ()
-main = do
-  hSetBuffering stdout LineBuffering
-  raw <- Env.getArgs
-  let (farg, rest) = R.takeFormatArg raw
-  marg <- case rest of
-    []  -> pure Nothing
-    [m] -> pure (Just m)
-    _   -> die "usage: censor-demo-ffi [--format pretty|json|plain] \
-               \[wall|instructions|branches|cycles]"
-  rnd <- R.resolveFormat farg
-  rc  <- R.initReportCfg
-  withMeterArg marg $ \mname meter -> do
-    let hdr = R.ReportHeader
-          { R.rhSuite   = "censor-demo-ffi"
-          , R.rhVersion = version
-          , R.rhMeter   = mname
-          , R.rhConfig  = cfg
-          , R.rhSeed    = Just fixedSeed
-          , R.rhTarget  = Just "fix-vs-random against rust CT/naive \
-                               \neq32, fastcrypto secp256r1, and \
-                               \halo2curves BY inverter"
-          , R.rhNote    = Just "sign/inverter cases use cfgSign \
-                               \(batch=50)"
-          }
-    _ <- R.withReport rc rnd hdr $ \emit -> do
-      runAll meter emit
-      pure Nothing
-    pure ()
+main = R.runBatteryDemo R.BatteryDemo
+  { R.bdSuite   = "censor-demo-ffi"
+  , R.bdVersion = version
+  , R.bdTarget  = "fix-vs-random against rust CT/naive neq32, \
+                  \fastcrypto secp256r1, and halo2curves BY inverter"
+  , R.bdConfig  = cfg
+  , R.bdSeed    = Just fixedSeed
+  , R.bdNote    = Just "sign/inverter cases use cfgSign (batch=50)"
+  , R.bdRun     = \_ meter emit -> runAll meter emit
+  }

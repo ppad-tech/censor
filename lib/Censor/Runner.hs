@@ -24,6 +24,7 @@ module Censor.Runner (
   , record
   , thin
   , renderTrace
+  , renderTracesJSON
 
     -- * Batteries
   , Case(..)
@@ -150,6 +151,21 @@ renderTrace t = concat
 
 jstr :: String -> String
 jstr s = "\"" ++ s ++ "\""
+
+-- | Wrap a battery of recorded 'Trace's in the plot-artifact JSON
+--   envelope used by the ppad plotting frontends:
+--
+--   > {"meter":..., "alpha":..., "thresh":..., "cases":[<renderTrace> ...]}
+--
+--   @thresh@ is @log(1 \/ alpha)@ — the log e-value rejection level
+--   the plot renders as a horizontal line.
+renderTracesJSON :: String -> Double -> [Trace] -> String
+renderTracesJSON mname alpha traces = concat
+  [ "{\"meter\":\"", mname, "\""
+  , printf ",\"alpha\":%.1g"  alpha
+  , printf ",\"thresh\":%.6f" (log (1 / alpha))
+  , ",\"cases\":[", intercalate "," (map renderTrace traces), "]}"
+  ]
 
 -- batteries -------------------------------------------------------------------
 
