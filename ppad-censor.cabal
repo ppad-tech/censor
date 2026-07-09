@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               ppad-censor
-version:            0.2.0
+version:            0.3.0
 synopsis:           Anytime-valid sequential constant-time testing.
 license:            MIT
 license-file:       LICENSE

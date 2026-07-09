@@ -1,5 +1,30 @@
 # Changelog
 
+- 0.3.0 (2026-07-09)
+  * `Censor.Runner.Report`: uniform report rendering with a
+    header/case/footer data model and three renderers:
+    `pretty` (the ppad terminal aesthetic), `json`
+    (line-oriented `censor/report-v1` object), and `plain`
+    (ASCII/CI-safe).
+
+  * `Suite` and `TraceSuite` scaffolds package the full
+    test-suite lifecycle (arg parse, meter selection, header
+    assembly, `calibrateBatch`, per-case loop, optional trace
+    JSON dump) so a tool's `Main.hs` reduces to the
+    hypotheses and the case list.
+
+  * `Censor.Runner.DL` and the `censor` executable: a
+    dlopen-based runner that drives a constant-time
+    hypothesis against a foreign target resolved by name from
+    a shared library.
+
+  * `diagnose` interprets a `Result` into actionable
+    `Advisory`s (clip-rate warning, low-power `Pass`,
+    rejection-driver hint); `summary` and `resultToJSON` give
+    one-line and JSON views of the same evidence;
+    `calibrateBatchReport` returns the auto-batch decision
+    alongside its calibration probes.
+
 - 0.2.0 (2026-07-07)
   * Hardware performance-counter meters on Linux
     (instructions retired, branches retired, cycles) via
