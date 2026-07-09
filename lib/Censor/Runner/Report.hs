@@ -7,7 +7,7 @@
 -- License: MIT
 -- Maintainer: Jared Tobin <jared@ppad.tech>
 --
--- Uniform report rendering and demo scaffolding for censor
+-- Uniform report rendering and suite scaffolding for censor
 -- executables. Three concentric layers:
 --
 -- * The lowest layer is a header\/case\/footer data model streamed
@@ -19,11 +19,11 @@
 --   grep-safe).
 -- * 'withReport' streams cases through the chosen renderer and
 --   returns the accumulated list so callers can drive exit codes.
--- * At the top, t'TraceDemo' and t'BatteryDemo' package up the
---   entire censor demo shape (arg parse, meter selection, header
+-- * At the top, t'Suite' and t'TraceSuite' package up the entire
+--   censor test-suite shape (arg parse, meter selection, header
 --   assembly, calibration, per-case loop, optional trace dump)
---   into one call, so a demo's @Main.hs@ contains only the
---   hypothesis and case list.
+--   into one call, so a suite's @Main.hs@ contains only the
+--   hypotheses and case list.
 
 module Censor.Runner.Report (
     -- * Report config
@@ -51,21 +51,22 @@ module Censor.Runner.Report (
   , takeFormatArg
   , resolveFormat
 
-    -- * Standard demo arg surface
-  , DemoArgs(..)
-  , parseDemoArgs
+    -- * Standard suite arg surface
+  , SuiteArgs(..)
+  , parseSuiteArgs
 
-    -- * Demo scaffolds
-  , TraceDemo(..)
-  , runTraceDemo
-  , BatteryDemo(..)
-  , runBatteryDemo
+    -- * Suite scaffolds
+  , TraceSuite(..)
+  , runTraceSuite
+  , Suite(..)
+  , runSuite
   ) where
 
 import Control.Monad (forM)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
+import Data.Version (showVersion)
 import Data.Word (Word64)
 import Numeric (showHex)
 import qualified System.Environment as Env
@@ -78,6 +79,19 @@ import Censor.Runner
   ( traceResult, record, renderTracesJSON
   , verdictName, resultToJSON, withMeterArg
   )
+import qualified Paths_ppad_censor as Paths
+
+-- | Package name used in the report brand line (@ppad censor@) and
+--   the @tool@ field of the JSON envelope. All censor executables
+--   render as this string — individual suites do not carry their own
+--   brand.
+brand :: String
+brand = "censor"
+
+-- | Package version, sourced from the autogen'd @Paths_ppad_censor@
+--   module so it always tracks the cabal file.
+brandVersion :: String
+brandVersion = showVersion Paths.version
 
 -- report config -------------------------------------------------------------
 
@@ -101,22 +115,19 @@ initReportCfg = do
 -- data model ---------------------------------------------------------------
 
 -- | Static header emitted once, before any case row. Populate this
---   at 'main' entry with the tool's own metadata.
+--   at 'main' entry with the run's own metadata; the brand line
+--   (@ppad censor v\<VER\>@) is fixed and does not appear here.
 data ReportHeader = ReportHeader
-  { rhSuite   :: !String
-    -- ^ tool name, e.g. @\"censor-poly\"@.
-  , rhVersion :: !String
-    -- ^ tool version, e.g. @\"0.2.0\"@.
-  , rhMeter   :: !String
+  { rhMeter  :: !String
     -- ^ meter name (@wall@ \/ @instructions@ \/ ...).
-  , rhConfig  :: !Config
+  , rhConfig :: !Config
     -- ^ the driver 'Config' the run used (surfaced on the header line).
-  , rhSeed    :: !(Maybe Word64)
+  , rhSeed   :: !(Maybe Word64)
     -- ^ user-facing sampler seed (distinct from 'cfgSeed', which
     --   only seeds the per-pair A\/B order bit).
-  , rhTarget  :: !(Maybe String)
+  , rhTarget :: !(Maybe String)
     -- ^ short target description, e.g. @\"Poly1305 MAC ==\"@.
-  , rhNote    :: !(Maybe String)
+  , rhNote   :: !(Maybe String)
     -- ^ optional one-line caveat under the header block.
   } deriving Show
 
@@ -252,8 +263,8 @@ pretty = Renderer
 
 prettyOpen :: ReportCfg -> ReportHeader -> IO ()
 prettyOpen rc hdr = do
-  putStrLn $ "  " ++ cBold rc ("ppad " ++ rhSuite hdr)
-    ++ " " ++ cDim rc ("v" ++ rhVersion hdr)
+  putStrLn $ "  " ++ cBold rc ("ppad " ++ brand)
+    ++ " " ++ cDim rc ("v" ++ brandVersion)
   putStr (prettyHeaderBlock rc hdr)
   putStrLn ""
 
@@ -357,8 +368,8 @@ json = Renderer
 jsonClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
 jsonClose _ hdr tl = putStrLn $ concat
   [ "{\"schema\":\"censor/report-v1\""
-  , ",\"suite\":",   jstr (rhSuite hdr)
-  , ",\"version\":", jstr (rhVersion hdr)
+  , ",\"tool\":",    jstr brand
+  , ",\"version\":", jstr brandVersion
   , ",\"meter\":",   jstr (rhMeter hdr)
   , ",\"config\":",  configJSON (rhConfig hdr)
   , maybe "" (\w -> ",\"seed\":"   ++ jstr (seedHex w)) (rhSeed hdr)
@@ -425,7 +436,7 @@ plain = Renderer
 
 plainOpen :: ReportCfg -> ReportHeader -> IO ()
 plainOpen _ hdr = do
-  putStrLn $ "ppad " ++ rhSuite hdr ++ " v" ++ rhVersion hdr
+  putStrLn $ "ppad " ++ brand ++ " v" ++ brandVersion
   let entries = concat
         [ [("meter", plainMeterLine hdr)]
         , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
@@ -529,104 +540,98 @@ padR, padL :: Int -> String -> String
 padR n s = s ++ replicate (max 0 (n - length s)) ' '
 padL n s = replicate (max 0 (n - length s)) ' ' ++ s
 
--- shared demo arg surface --------------------------------------------------
+-- shared suite arg surface -------------------------------------------------
 
--- | The parsed demo argv. All censor demos share the shape
---   @[--format FMT] [METER] [EXTRA...]@; each demo's runner
---   interprets @daExtra@ in its own way (trace demos take the first
---   extra as an output path; battery demos reject them).
-data DemoArgs = DemoArgs
-  { daRenderer :: !Renderer
+-- | The parsed suite argv. All censor suites share the shape
+--   @[--format FMT] [METER] [EXTRA...]@; each runner interprets
+--   @saExtra@ in its own way (trace suites take the first extra as
+--   an output path; plain suites reject them).
+data SuiteArgs = SuiteArgs
+  { saRenderer :: !Renderer
     -- ^ resolved from @--format@; defaults to 'pretty'.
-  , daMeter    :: !(Maybe String)
+  , saMeter    :: !(Maybe String)
     -- ^ meter name (@wall@, @instructions@, ...); 'Nothing' means
     --   accept the runner's default.
-  , daExtra    :: ![String]
+  , saExtra    :: ![String]
     -- ^ positional arguments left after meter, in order.
   }
 
--- | Parse the standard demo argv from 'Env.getArgs'. Dies with a
+-- | Parse the standard suite argv from 'Env.getArgs'. Dies with a
 --   clear message if @--format@ is malformed. The extras list is
 --   handed to the runner for further interpretation.
-parseDemoArgs :: IO DemoArgs
-parseDemoArgs = do
+parseSuiteArgs :: IO SuiteArgs
+parseSuiteArgs = do
   raw <- Env.getArgs
   let (farg, rest) = takeFormatArg raw
   rnd <- resolveFormat farg
   let (marg, extra) = case rest of
         []       -> (Nothing, [])
         (m:more) -> (Just m,  more)
-  pure DemoArgs
-    { daRenderer = rnd
-    , daMeter    = marg
-    , daExtra    = extra
+  pure SuiteArgs
+    { saRenderer = rnd
+    , saMeter    = marg
+    , saExtra    = extra
     }
 
--- trace-recording demo scaffold --------------------------------------------
+-- trace-recording suite scaffold -------------------------------------------
 
--- | A trace-recording demo: iterate a parameterised hypothesis over
---   a case list under a chosen meter, record the per-pair frame
---   trajectory of each run, and dump the whole battery as a
+-- | A trace-recording suite: iterate a parameterised hypothesis
+--   over a case list under a chosen meter, record the per-pair
+--   frame trajectory of each run, and dump the whole battery as a
 --   plot-artifact JSON alongside the human-facing report.
 --
---   The demo's @Main.hs@ builds one of these and calls
---   'runTraceDemo'; everything else — arg parse, meter selection,
+--   The tool's @Main.hs@ builds one of these and calls
+--   'runTraceSuite'; everything else — arg parse, meter selection,
 --   'calibrateBatch', header assembly, per-case 'record' loop,
 --   'renderTracesJSON' envelope write, 'withReport' driver — is
 --   done inside.
-data TraceDemo p a = TraceDemo
-  { tdSuite   :: !String
-    -- ^ tool name, used in the report brand line and as the default
-    --   trace-output file stem.
-  , tdVersion :: !String
-    -- ^ tool version, shown in the brand line.
-  , tdTarget  :: !String
+data TraceSuite p a = TraceSuite
+  { tsTarget :: !String
     -- ^ one-line target description shown in the header block.
-  , tdConfig  :: !Config
-    -- ^ base driver config. 'calibrateBatch' overrides
-    --   @cfgBatch@ using the first case as its probe.
-  , tdSeed    :: !(Maybe Word64)
+  , tsConfig :: !Config
+    -- ^ base driver config. 'calibrateBatch' overrides @cfgBatch@
+    --   using the first case as its probe.
+  , tsSeed   :: !(Maybe Word64)
     -- ^ user-facing sampler seed shown in the header block.
-  , tdNote    :: !(Maybe String)
+  , tsNote   :: !(Maybe String)
     -- ^ optional one-line note under the header block.
-  , tdCases   :: ![(String, p)]
+  , tsCases  :: ![(String, p)]
     -- ^ case list: display name paired with the hypothesis
     --   parameter.
-  , tdBuild   :: !(p -> IO (Hypothesis a))
+  , tsBuild  :: !(p -> IO (Hypothesis a))
     -- ^ hypothesis builder invoked once per case.
   }
 
--- | Drive a t'TraceDemo' end to end. The trace JSON is written to
+-- | Drive a t'TraceSuite' end to end. The trace JSON is written to
 --   the first positional argument after the meter, defaulting to
---   @<suite>-<meter>.json@.
-runTraceDemo :: TraceDemo p a -> IO ()
-runTraceDemo td = do
+--   @\<progName\>-\<meter\>.json@.
+runTraceSuite :: TraceSuite p a -> IO ()
+runTraceSuite ts = do
   hSetBuffering stdout LineBuffering
-  da <- parseDemoArgs
-  rc <- initReportCfg
-  probe <- case tdCases td of
-    []         -> die (tdSuite td ++ ": no cases configured")
+  prog <- Env.getProgName
+  sa   <- parseSuiteArgs
+  rc   <- initReportCfg
+  probe <- case tsCases ts of
+    []         -> die (prog ++ ": no cases configured")
     ((_,p):_)  -> pure p
-  let out = case daExtra da of
+  let out = case saExtra sa of
         (o:_) -> Just o
         _     -> Nothing
-  withMeterArg (daMeter da) $ \mname meter -> do
-    h0 <- tdBuild td probe
+  withMeterArg (saMeter sa) $ \mname meter -> do
+    h0 <- tsBuild ts probe
     b  <- calibrateBatch meter h0
-    let c    = (tdConfig td) { cfgBatch = b }
+    let c    = (tsConfig ts) { cfgBatch = b }
         hdr  = ReportHeader
-          { rhSuite   = tdSuite td
-          , rhVersion = tdVersion td
-          , rhMeter   = mname
-          , rhConfig  = c
-          , rhSeed    = tdSeed td
-          , rhTarget  = Just (tdTarget td)
-          , rhNote    = tdNote td
+          { rhMeter  = mname
+          , rhConfig = c
+          , rhSeed   = tsSeed ts
+          , rhTarget = Just (tsTarget ts)
+          , rhNote   = tsNote ts
           }
-        path = fromMaybe (tdSuite td ++ "-" ++ mname ++ ".json") out
-    _ <- withReport rc (daRenderer da) hdr $ \emit -> do
-      traces <- forM (tdCases td) $ \(name, p) -> do
-        h <- tdBuild td p
+        path = fromMaybe (prog ++ "-" ++ mname ++ ".json") out
+    _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
+      traces <- forM (tsCases ts) $ \(name, p) -> do
+        h <- tsBuild ts p
         t <- record name mname meter c h
         emit (CaseReport name (traceResult t) Nothing)
         pure t
@@ -634,55 +639,52 @@ runTraceDemo td = do
       pure (Just path)
     pure ()
 
--- battery demo scaffold ----------------------------------------------------
+-- plain suite scaffold -----------------------------------------------------
 
--- | A battery demo: a fixed set of heterogeneous cases (each with
---   its own type and possibly its own 'Config'), no trace recording,
---   no per-case parameter passing. The demo supplies a callback
---   that runs the whole battery under the chosen meter and emits
---   each result; 'runBatteryDemo' handles the surrounding
---   scaffolding.
-data BatteryDemo = BatteryDemo
-  { bdSuite   :: !String
-  , bdVersion :: !String
-  , bdTarget  :: !String
-  , bdConfig  :: !Config
+-- | A censor test suite: a fixed set of heterogeneous hypotheses
+--   (each with its own type and possibly its own 'Config'), no
+--   trace recording, no per-case parameter passing. The tool
+--   supplies a callback that runs the whole battery under the
+--   chosen meter and emits each result; 'runSuite' handles the
+--   surrounding scaffolding.
+data Suite = Suite
+  { suTarget :: !String
+  , suConfig :: !Config
     -- ^ base driver config (shown in the header). Individual cases
     --   may run under different configs internally; the header only
     --   surfaces this one.
-  , bdSeed    :: !(Maybe Word64)
-  , bdNote    :: !(Maybe String)
-  , bdRun     :: !(String -> Meter -> (CaseReport -> IO ()) -> IO ())
+  , suSeed   :: !(Maybe Word64)
+  , suNote   :: !(Maybe String)
+  , suRun    :: !(String -> Meter -> (CaseReport -> IO ()) -> IO ())
     -- ^ battery driver. Receives the meter name, the meter, and an
     --   @emit@ action that records one 'CaseReport'.
   }
 
--- | Drive a t'BatteryDemo' end to end. Rejects positional arguments
---   past the meter with a usage error — battery demos do not take
---   an output path.
-runBatteryDemo :: BatteryDemo -> IO ()
-runBatteryDemo bd = do
+-- | Drive a t'Suite' end to end. Rejects positional arguments past
+--   the meter with a usage error — plain suites do not take an
+--   output path.
+runSuite :: Suite -> IO ()
+runSuite su = do
   hSetBuffering stdout LineBuffering
-  da <- parseDemoArgs
-  case daExtra da of
+  prog <- Env.getProgName
+  sa   <- parseSuiteArgs
+  case saExtra sa of
     [] -> pure ()
-    xs -> die $ bdSuite bd ++ ": unexpected positional arg(s) "
+    xs -> die $ prog ++ ": unexpected positional arg(s) "
             ++ show xs
-            ++ " (usage: " ++ bdSuite bd
+            ++ " (usage: " ++ prog
             ++ " [--format pretty|json|plain] "
             ++ "[wall|instructions|cycles|branches])"
   rc <- initReportCfg
-  withMeterArg (daMeter da) $ \mname meter -> do
+  withMeterArg (saMeter sa) $ \mname meter -> do
     let hdr = ReportHeader
-          { rhSuite   = bdSuite bd
-          , rhVersion = bdVersion bd
-          , rhMeter   = mname
-          , rhConfig  = bdConfig bd
-          , rhSeed    = bdSeed bd
-          , rhTarget  = Just (bdTarget bd)
-          , rhNote    = bdNote bd
+          { rhMeter  = mname
+          , rhConfig = suConfig su
+          , rhSeed   = suSeed su
+          , rhTarget = Just (suTarget su)
+          , rhNote   = suNote su
           }
-    _ <- withReport rc (daRenderer da) hdr $ \emit -> do
-      bdRun bd mname meter emit
+    _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
+      suRun su mname meter emit
       pure Nothing
     pure ()

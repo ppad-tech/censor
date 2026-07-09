@@ -67,9 +67,6 @@ foreign import ccall unsafe "h_byinv_fr_invert"
 fixedSeed :: Word64
 fixedSeed = 0x5EED5EED5EED5EED
 
-version :: String
-version = "0.2.0"
-
 -- build a fastcrypto Secp256r1KeyPair from a 32-byte secret drawn
 -- from the supplied RNG. errors on invalid scalar (vanishingly
 -- improbable).
@@ -268,13 +265,11 @@ runAll meter emit = do
     byHyp
 
 main :: IO ()
-main = R.runBatteryDemo R.BatteryDemo
-  { R.bdSuite   = "censor-demo-ffi"
-  , R.bdVersion = version
-  , R.bdTarget  = "fix-vs-random against rust CT/naive neq32, \
-                  \fastcrypto secp256r1, and halo2curves BY inverter"
-  , R.bdConfig  = cfg
-  , R.bdSeed    = Just fixedSeed
-  , R.bdNote    = Just "sign/inverter cases use cfgSign (batch=50)"
-  , R.bdRun     = \_ meter emit -> runAll meter emit
+main = R.runSuite R.Suite
+  { R.suTarget = "fix-vs-random against rust CT/naive neq32, \
+                 \fastcrypto secp256r1, and halo2curves BY inverter"
+  , R.suConfig = cfg
+  , R.suSeed   = Just fixedSeed
+  , R.suNote   = Just "sign/inverter cases use cfgSign (batch=50)"
+  , R.suRun    = \_ meter emit -> runAll meter emit
   }

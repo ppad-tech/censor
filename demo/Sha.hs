@@ -8,7 +8,7 @@
 --                   [wall|instructions|cycles|branches] [OUT.json]
 --
 -- Everything besides the hypothesis and the case list is handled
--- by 'Censor.Runner.Report.runTraceDemo'.
+-- by 'Censor.Runner.Report.runTraceSuite'.
 
 module Main where
 
@@ -47,19 +47,17 @@ posCase (i0, i1) = do
     }
 
 main :: IO ()
-main = R.runTraceDemo R.TraceDemo
-  { R.tdSuite   = "censor-sha"
-  , R.tdVersion = "0.2.0"
-  , R.tdTarget  = "ppad-sha256 HMAC MAC == (mismatch-position independence)"
-  , R.tdConfig  = C.defaultConfig
+main = R.runTraceSuite R.TraceSuite
+  { R.tsTarget = "ppad-sha256 HMAC MAC == (mismatch-position independence)"
+  , R.tsConfig = C.defaultConfig
       { C.cfgAlpha  = 1.0e-3
       , C.cfgWarmup = 500
       , C.cfgBudget = 50000
       }
-  , R.tdSeed    = Just fixedSeed
-  , R.tdNote    = Just "batch auto-calibrated"
-  , R.tdBuild   = posCase
-  , R.tdCases   =
+  , R.tsSeed   = Just fixedSeed
+  , R.tsNote   = Just "batch auto-calibrated"
+  , R.tsBuild  = posCase
+  , R.tsCases  =
       [ ("H0 control @0 vs @0", (0, 0))
       , ("position @0 vs @7",   (0, 7))
       , ("position @0 vs @15",  (0, 15))

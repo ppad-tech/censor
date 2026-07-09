@@ -74,9 +74,6 @@ random12 g = C.randomBytes g 12
 fixedSeed :: Word64
 fixedSeed = 0x5EED5EED5EED5EED
 
-version :: String
-version = "0.2.0"
-
 -- hypotheses -----------------------------------------------------------------
 
 -- positive control: Montgomery scalar multiplication.
@@ -472,13 +469,11 @@ runAll tex meter emit = do
 main :: IO ()
 main = do
   let !tex = Secp.precompute
-  R.runBatteryDemo R.BatteryDemo
-    { R.bdSuite   = "censor-demo"
-    , R.bdVersion = version
-    , R.bdTarget  = "dudect-style fix-vs-random against ppad-* and controls"
-    , R.bdConfig  = cfg
-    , R.bdSeed    = Just fixedSeed
-    , R.bdNote    = Just "batch varies per case: 50 (base), \
-                         \1 (secp), 2000 (nanosecond targets)"
-    , R.bdRun     = \_ meter emit -> runAll tex meter emit
+  R.runSuite R.Suite
+    { R.suTarget = "dudect-style fix-vs-random against ppad-* and controls"
+    , R.suConfig = cfg
+    , R.suSeed   = Just fixedSeed
+    , R.suNote   = Just "batch varies per case: 50 (base), \
+                        \1 (secp), 2000 (nanosecond targets)"
+    , R.suRun    = \_ meter emit -> runAll tex meter emit
     }

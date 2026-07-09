@@ -104,6 +104,10 @@ library
       Censor.Runner
       Censor.Runner.DL
       Censor.Runner.Report
+  other-modules:
+      Paths_ppad_censor
+  autogen-modules:
+      Paths_ppad_censor
   build-depends:
       base >= 4.9 && < 5
     , bytestring >= 0.9 && < 0.13
