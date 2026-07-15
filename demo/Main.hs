@@ -34,7 +34,9 @@ import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
 
 import qualified Censor as C
+import qualified Censor.Runner as CR
 import qualified Censor.Runner.Report as R
+import System.Environment (getArgs)
 import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
 import qualified Crypto.Curve.Secp256k1 as Secp
 import qualified Crypto.Hash.SHA256 as SHA256
@@ -466,14 +468,46 @@ runAll tex meter emit = do
   rc "negative: deliberately leaky popcount-driven loop"         negLeakyPopcount
   rc "negative: Wider.from_vartime (Integer conversion)"         negFromVartime
 
+-- Record the three secp positive controls under the wall meter with
+-- per-pair trajectories, and write a consistent samples.jsonl +
+-- trace.jsonl pair (censor/report-v1 + the measure trace format) into
+-- DIR. Reuses the suite's exact hypotheses; only the meter output
+-- differs. Used to backfill a bundle's censor tree with trace data.
+backfillSecpTraces :: Secp.Context -> FilePath -> IO ()
+backfillSecpTraces tex dir = do
+  -- the three hypotheses have distinct payload types, so they cannot
+  -- share a list; record each individually (Trace is monomorphic).
+  t1 <- rec "positive: Secp.mul_wnaf (wNAF point multiplication)" (posMulWNAF tex)
+  t2 <- rec "positive: Secp.sign_schnorr' (BIP0340)"    (posSignSchnorr tex)
+  t3 <- rec "positive: Secp.sign_ecdsa' (RFC6979)"      (posSignECDSA tex)
+  let traces = [t1, t2, t3]
+      meta = "{\"schema\":\"censor/report-v1\",\"tool\":\"censor\","
+          ++ "\"version\":\"0.3.1\",\"meter\":\"wall\","
+          ++ "\"config\":{\"alpha\":0.001,\"budget\":50000,\"batch\":1,"
+          ++ "\"warmup\":500},\"seed\":\"0x5eed5eed5eed5eed\","
+          ++ "\"target\":\"dudect-style fix-vs-random against ppad-secp256k1\","
+          ++ "\"note\":\"secp targets only, batch=1, recorded with --trace\","
+          ++ "\"kind\":\"meta\"}"
+      caseLine t = "{\"name\":" ++ show (CR.traceName t)
+                ++ ",\"result\":" ++ CR.resultToJSON (CR.traceResult t)
+                ++ ",\"kind\":\"case\"}"
+  writeFile (dir ++ "/samples.jsonl") (unlines (meta : map caseLine traces))
+  writeFile (dir ++ "/trace.jsonl")  (unlines (map CR.renderTrace traces))
+  putStrLn ("wrote " ++ show (length traces) ++ " secp cases + traces to " ++ dir)
+  where
+    rec nm mkH = mkH >>= CR.record nm "wall" C.wallClock cfgHeavy
+
 main :: IO ()
 main = do
+  args <- getArgs
   let !tex = Secp.precompute
-  R.runSuite R.Suite
-    { R.suTarget = "dudect-style fix-vs-random against ppad-* and controls"
-    , R.suConfig = cfg
-    , R.suSeed   = Just fixedSeed
-    , R.suNote   = Just "batch varies per case: 50 (base), \
-                        \1 (secp), 2000 (nanosecond targets)"
-    , R.suRun    = \_ meter emit -> runAll tex meter emit
-    }
+  case args of
+    ("backfill-trace" : dir : _) -> backfillSecpTraces tex dir
+    _ -> R.runSuite R.Suite
+      { R.suTarget = "dudect-style fix-vs-random against ppad-* and controls"
+      , R.suConfig = cfg
+      , R.suSeed   = Just fixedSeed
+      , R.suNote   = Just "batch varies per case: 50 (base), \
+                          \1 (secp), 2000 (nanosecond targets)"
+      , R.suRun    = \_ meter emit -> runAll tex meter emit
+      }
