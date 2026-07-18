@@ -23,8 +23,6 @@ module Censor.Runner (
   , Trace(..)
   , record
   , thin
-  , renderTrace
-  , renderTracesJSON
 
     -- * Batteries
   , Case(..)
@@ -128,44 +126,6 @@ thin frs =
              || frPair fr `mod` stride == 0
              || frPair fr == m
   in  filter keep frs
-
--- | Render a t'Trace' as a JSON object (the frame array is 'thin'ned).
---   Each trace entry is @[pair, logW, logWSup, lo, hi]@.
-renderTrace :: Trace -> String
-renderTrace t = concat
-  [ "{\"name\":",    jstr (traceName t)
-  , ",\"meter\":",   jstr (traceMeter t)
-  , ",\"verdict\":", jstr (verdictName r)
-  , ",\"pairs\":",   show (resPairs r)
-  , printf ",\"pvalue\":%.6g" (resPValue r)
-  , printf ",\"bound\":%.6g"  (resBound r)
-  , printf ",\"effect\":[%.1f,%.1f]" (fst (resEffect r)) (snd (resEffect r))
-  , ",\"trace\":["
-  , intercalate "," (map frameJSON (thin (traceFrames t)))
-  , "]}"
-  ]
-  where
-    r = traceResult t
-    frameJSON fr = printf "[%d,%.4f,%.4f,%.1f,%.1f]"
-      (frPair fr) (frLogW fr) (frLogWSup fr) (frLo fr) (frHi fr)
-
-jstr :: String -> String
-jstr s = "\"" ++ s ++ "\""
-
--- | Wrap a battery of recorded 'Trace's in the plot-artifact JSON
---   envelope used by the ppad plotting frontends:
---
---   > {"meter":..., "alpha":..., "thresh":..., "cases":[<renderTrace> ...]}
---
---   @thresh@ is @log(1 \/ alpha)@ — the log e-value rejection level
---   the plot renders as a horizontal line.
-renderTracesJSON :: String -> Double -> [Trace] -> String
-renderTracesJSON mname alpha traces = concat
-  [ "{\"meter\":\"", mname, "\""
-  , printf ",\"alpha\":%.1g"  alpha
-  , printf ",\"thresh\":%.6f" (log (1 / alpha))
-  , ",\"cases\":[", intercalate "," (map renderTrace traces), "]}"
-  ]
 
 -- batteries -------------------------------------------------------------------
 
@@ -297,3 +257,6 @@ shapeName s = case s of
   ShapeLeak   -> "shape"
   RareOutlier -> "tail"
   MixedShape  -> "mixed"
+
+jstr :: String -> String
+jstr s = "\"" ++ s ++ "\""

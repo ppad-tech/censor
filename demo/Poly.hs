@@ -60,10 +60,9 @@ main = R.runTraceSuite R.TraceSuite
       }
   , R.tsSeed   = Just fixedSeed
   , R.tsNote   = Just "batch auto-calibrated"
-  , R.tsBuild  = posCase
   , R.tsCases  =
-      [ ("H0 control @0 vs @0",  (0, 0))
-      , ("same-lane @0 vs @7",   (0, 7))
-      , ("cross-lane @0 vs @15", (0, 15))
+      [ R.TraceCase "H0 control @0 vs @0"  (posCase (0, 0))
+      , R.TraceCase "same-lane @0 vs @7"   (posCase (0, 7))
+      , R.TraceCase "cross-lane @0 vs @15" (posCase (0, 15))
       ]
   }

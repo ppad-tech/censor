@@ -1,5 +1,6 @@
 {-# OPTIONS_HADDOCK prune #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ExistentialQuantification #-}
 
 -- |
 -- Module: Censor.Runner.Report
@@ -14,16 +15,16 @@
 --   through a 'Renderer'. Three renderers are provided —
 --   'pretty' (the ppad terminal aesthetic: bold brand line, dim
 --   key column, middle-dot separators, ANSI-colored verdicts on a
---   TTY), 'json' (one line-oriented @censor\/report-v1@ object per
---   run, deterministic key order), and 'plain' (ASCII-only,
---   grep-safe).
+--   TTY), 'json' (one @censor\/report-v1@ object per run,
+--   deterministic key order, per-case trace arrays when present),
+--   and 'plain' (ASCII-only, grep-safe).
 -- * 'withReport' streams cases through the chosen renderer and
 --   returns the accumulated list so callers can drive exit codes.
 -- * At the top, t'Suite' and t'TraceSuite' package up the entire
 --   censor test-suite shape (arg parse, meter selection, header
---   assembly, calibration, per-case loop, optional trace dump)
---   into one call, so a suite's @Main.hs@ contains only the
---   hypotheses and case list.
+--   assembly, per-case calibration and attribution, trace record,
+--   JSON artefact write) into one call, so a suite's @Main.hs@
+--   contains only the hypotheses and case list.
 
 module Censor.Runner.Report (
     -- * Report config
@@ -56,13 +57,17 @@ module Censor.Runner.Report (
   , parseSuiteArgs
 
     -- * Suite scaffolds
+  , TraceCase(..)
   , TraceSuite(..)
   , runTraceSuite
   , Suite(..)
   , runSuite
+
+    -- * JSON serialisation
+  , reportJSON
   ) where
 
-import Control.Monad (forM)
+import Control.Monad (forM_)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
@@ -74,9 +79,9 @@ import System.Exit (die)
 import System.IO (BufferMode(..), hIsTerminalDevice, hSetBuffering, stdout)
 import Text.Printf (printf)
 
-import Censor
+import Censor hiding (crBatch)
 import Censor.Runner
-  ( traceResult, record, renderTracesJSON
+  ( traceResult, traceFrames, record, thin
   , verdictName, resultToJSON, withMeterArg
   )
 import qualified Paths_ppad_censor as Paths
@@ -118,17 +123,24 @@ initReportCfg = do
 --   at 'main' entry with the run's own metadata; the brand line
 --   (@ppad censor v\<VER\>@) is fixed and does not appear here.
 data ReportHeader = ReportHeader
-  { rhMeter  :: !String
+  { rhMeter     :: !String
     -- ^ meter name (@wall@ \/ @instructions@ \/ ...).
-  , rhConfig :: !Config
+  , rhConfig    :: !Config
     -- ^ the driver 'Config' the run used (surfaced on the header line).
-  , rhSeed   :: !(Maybe Word64)
+  , rhSeed      :: !(Maybe Word64)
     -- ^ user-facing sampler seed (distinct from 'cfgSeed', which
     --   only seeds the per-pair A\/B order bit).
-  , rhTarget :: !(Maybe String)
+  , rhTarget    :: !(Maybe String)
     -- ^ short target description, e.g. @\"Poly1305 MAC ==\"@.
-  , rhNote   :: !(Maybe String)
+  , rhNote      :: !(Maybe String)
     -- ^ optional one-line caveat under the header block.
+  , rhAutoBatch :: !Bool
+    -- ^ 'True' when the runner calibrates 'cfgBatch' per case
+    --   (see 'runTraceSuite'). Header renders @batch=auto@ and the
+    --   config JSON emits @\"batch\":\"auto\"@; the resolved batch
+    --   for each case appears on that case's row via 'crBatch'.
+    --   'False' means the run used a single 'cfgBatch' from
+    --   'rhConfig' throughout, rendered as usual.
   } deriving Show
 
 -- | A single case row.
@@ -141,6 +153,14 @@ data CaseReport = CaseReport
     -- ^ optional A\/A + B\/B attribution result, surfaced under the
     --   case row on 'Reject'. 'Nothing' when the tool did not run
     --   attribution.
+  , crBatch       :: !(Maybe Int)
+    -- ^ the 'cfgBatch' the case actually ran under. Populated by
+    --   'runTraceSuite' from per-case 'calibrateBatch'; 'Nothing'
+    --   when the case ran under a shared 'rhConfig' batch.
+  , crTrace       :: !(Maybe [Frame])
+    -- ^ per-pair 'Frame' trajectory, when the runner recorded one
+    --   (via 'record'). Surfaces in the JSON artefact as a thinned
+    --   array; the human renderers ignore it.
   } deriving Show
 
 -- | The tail passed to a renderer's 'rndClose'. Carries the
@@ -288,8 +308,13 @@ meterLine hdr =
         , printf "alpha=%.1g"       (cfgAlpha c) :: String
         , "warmup=" ++ show (cfgWarmup c)
         , "budget=" ++ show (cfgBudget c)
-        , "batch="  ++ show (cfgBatch c)
+        , "batch="  ++ batchText hdr
         ]
+
+batchText :: ReportHeader -> String
+batchText hdr
+  | rhAutoBatch hdr = "auto"
+  | otherwise       = show (cfgBatch (rhConfig hdr))
 
 -- Row layout: verdict + pairs + driver in fixed-width columns on the
 -- left, evidence in the middle, case name after a dim separator on
@@ -321,6 +346,10 @@ prettyCase rc cr = do
                      elo ehi (resClipped r) (resPairs r) :: String
       putStrLn $ replicate detailIndent ' ' ++ cDim rc detail
     Pass{} -> pure ()
+  case crBatch cr of
+    Just b  -> putStrLn $ replicate detailIndent ' '
+                          ++ cDim rc ("batch=" ++ show b)
+    Nothing -> pure ()
   case crAttribution cr of
     Just a  -> putStrLn $ replicate detailIndent ' '
                           ++ cDim rc (attributionText a)
@@ -354,10 +383,10 @@ colorCount col rc n suf
 
 -- json renderer ------------------------------------------------------------
 
--- | Emit one line-oriented JSON object per battery, deterministic
---   key order, with a @\"schema\":\"censor\/report-v1\"@ tag. Header
---   and per-case callbacks are no-ops; the whole object materialises
---   at close.
+-- | Emit one @censor\/report-v1@ JSON object per battery,
+--   deterministic key order. Header and per-case callbacks are
+--   no-ops; the whole object materialises at close, exactly as
+--   'reportJSON' would render it.
 json :: Renderer
 json = Renderer
   { rndOpen  = \_ _   -> pure ()
@@ -366,41 +395,64 @@ json = Renderer
   }
 
 jsonClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
-jsonClose _ hdr tl = putStrLn $ concat
+jsonClose _ hdr tl = putStrLn (reportJSON hdr (btCases tl))
+
+-- | Serialise a header + case list as the canonical
+--   @censor\/report-v1@ JSON object. Deterministic key order; the
+--   per-case block carries 'crBatch' and 'crTrace' as optional
+--   fields, present exactly when the runner recorded them.
+--
+--   The 'json' renderer and 'runTraceSuite' both call this so
+--   stdout output and the on-disk artefact are byte-identical.
+reportJSON :: ReportHeader -> [CaseReport] -> String
+reportJSON hdr cases = concat
   [ "{\"schema\":\"censor/report-v1\""
   , ",\"tool\":",    jstr brand
   , ",\"version\":", jstr brandVersion
   , ",\"meter\":",   jstr (rhMeter hdr)
-  , ",\"config\":",  configJSON (rhConfig hdr)
+  , ",\"config\":",  configJSON hdr
   , maybe "" (\w -> ",\"seed\":"   ++ jstr (seedHex w)) (rhSeed hdr)
   , maybe "" (\t -> ",\"target\":" ++ jstr t)           (rhTarget hdr)
   , maybe "" (\n -> ",\"note\":"   ++ jstr n)           (rhNote hdr)
   , ",\"cases\":["
-  , intercalate "," (map caseJSON (btCases tl))
+  , intercalate "," (map caseJSON cases)
   , "]"
-  , maybe "" (\p -> ",\"output\":" ++ jstr p) (btOutput tl)
-  , ",\"totals\":", totalsJSON (btCases tl)
+  , ",\"totals\":", totalsJSON cases
   , "}"
   ]
 
-configJSON :: Config -> String
-configJSON c = concat
-  [ "{\"alpha\":",  showF (cfgAlpha c)
-  , ",\"budget\":", show (cfgBudget c)
-  , ",\"batch\":",  show (cfgBatch c)
-  , ",\"warmup\":", show (cfgWarmup c)
-  , maybe "" (\w -> ",\"seed\":" ++ jstr (seedHex w)) (cfgSeed c)
-  , "}"
-  ]
+configJSON :: ReportHeader -> String
+configJSON hdr =
+  let c = rhConfig hdr
+      batchField
+        | rhAutoBatch hdr = ",\"batch\":\"auto\""
+        | otherwise       = ",\"batch\":" ++ show (cfgBatch c)
+  in  concat
+        [ "{\"alpha\":",  showF (cfgAlpha c)
+        , ",\"budget\":", show (cfgBudget c)
+        , ",\"warmup\":", show (cfgWarmup c)
+        , batchField
+        , maybe "" (\w -> ",\"seed\":" ++ jstr (seedHex w)) (cfgSeed c)
+        , "}"
+        ]
 
 caseJSON :: CaseReport -> String
 caseJSON cr = concat
   [ "{\"name\":",   jstr (crName cr)
+  , maybe "" (\b -> ",\"batch\":" ++ show b) (crBatch cr)
   , ",\"result\":", resultToJSON (crResult cr)
   , maybe "" (\a -> ",\"attribution\":" ++ jstr (attribJSONLabel a))
       (crAttribution cr)
+  , maybe "" (\frs -> ",\"trace\":" ++ traceArrayJSON frs) (crTrace cr)
   , "}"
   ]
+
+traceArrayJSON :: [Frame] -> String
+traceArrayJSON frs =
+  "[" ++ intercalate "," (map frameJSON (thin frs)) ++ "]"
+  where
+    frameJSON fr = printf "[%d,%.4f,%.4f,%.1f,%.1f]"
+      (frPair fr) (frLogW fr) (frLogWSup fr) (frLo fr) (frHi fr)
 
 totalsJSON :: [CaseReport] -> String
 totalsJSON cs =
@@ -455,7 +507,7 @@ plainMeterLine hdr =
         , printf "alpha=%.1g"       (cfgAlpha c) :: String
         , "warmup=" ++ show (cfgWarmup c)
         , "budget=" ++ show (cfgBudget c)
-        , "batch="  ++ show (cfgBatch c)
+        , "batch="  ++ batchText hdr
         ]
 
 plainCase :: ReportCfg -> CaseReport -> IO ()
@@ -474,6 +526,9 @@ plainCase _ cr = do
       putStrLn $ printf "  effect=[%.1f,%.1f] clipped=%d/%d"
         elo ehi (resClipped r) (resPairs r)
     Pass{} -> pure ()
+  case crBatch cr of
+    Just b  -> putStrLn ("  batch=" ++ show b)
+    Nothing -> pure ()
   case crAttribution cr of
     Just a  -> putStrLn ("  " ++ attributionText a)
     Nothing -> pure ()
@@ -575,67 +630,101 @@ parseSuiteArgs = do
 
 -- trace-recording suite scaffold -------------------------------------------
 
--- | A trace-recording suite: iterate a parameterised hypothesis
---   over a case list under a chosen meter, record the per-pair
---   frame trajectory of each run, and dump the whole battery as a
---   plot-artifact JSON alongside the human-facing report.
+-- | One case in a t'TraceSuite': a display name plus an @IO@ action
+--   producing the hypothesis. Existentially quantified over the
+--   hypothesis input type so a suite can hold cases with different
+--   payload shapes in one list.
+--
+--   >>> TraceCase "encrypt" posAeadEncrypt
+--   >>> TraceCase "decrypt" posAeadDecrypt
+--
+--   The action is re-executed for the calibration probe, the main
+--   run, and (on 'Reject') attribution — three times total on
+--   rejecting cases, twice on passing cases — so the builder should
+--   be inexpensive and side-effect free.
+data TraceCase = forall a. TraceCase !String !(IO (Hypothesis a))
+
+-- | A trace-recording suite: iterate a list of hypotheses under a
+--   chosen meter, record each run's per-pair frame trajectory, and
+--   write the whole battery as a single @censor\/report-v1@ JSON
+--   artefact alongside the human-facing report.
 --
 --   The tool's @Main.hs@ builds one of these and calls
 --   'runTraceSuite'; everything else — arg parse, meter selection,
---   'calibrateBatch', header assembly, per-case 'record' loop,
---   'renderTracesJSON' envelope write, 'withReport' driver — is
---   done inside.
-data TraceSuite p a = TraceSuite
+--   per-case 'calibrateBatch', 'record', auto-attribution on
+--   'Reject', header assembly, @withReport@ driver, JSON write —
+--   is done inside.
+data TraceSuite = TraceSuite
   { tsTarget :: !String
     -- ^ one-line target description shown in the header block.
   , tsConfig :: !Config
-    -- ^ base driver config. 'calibrateBatch' overrides @cfgBatch@
-    --   using the first case as its probe.
+    -- ^ base driver config. 'runTraceSuite' calibrates 'cfgBatch'
+    --   per case, so the value of @cfgBatch@ here is ignored;
+    --   'cfgAlpha', 'cfgWarmup', 'cfgBudget', and 'cfgSeed' are
+    --   applied verbatim.
   , tsSeed   :: !(Maybe Word64)
     -- ^ user-facing sampler seed shown in the header block.
   , tsNote   :: !(Maybe String)
     -- ^ optional one-line note under the header block.
-  , tsCases  :: ![(String, p)]
-    -- ^ case list: display name paired with the hypothesis
-    --   parameter.
-  , tsBuild  :: !(p -> IO (Hypothesis a))
-    -- ^ hypothesis builder invoked once per case.
+  , tsCases  :: ![TraceCase]
+    -- ^ heterogeneous case list.
   }
 
--- | Drive a t'TraceSuite' end to end. The trace JSON is written to
---   the first positional argument after the meter, defaulting to
---   @\<progName\>-\<meter\>.json@.
-runTraceSuite :: TraceSuite p a -> IO ()
+-- | Drive a t'TraceSuite' end to end. The JSON artefact is written
+--   to the first positional argument after the meter, defaulting to
+--   @\<progName\>-\<meter\>.json@; it carries the same content the
+--   'json' renderer emits to stdout under @--format json@.
+--
+--   Per case: 'calibrateBatch' picks the batch (resolved batch
+--   surfaces on the case row and in the JSON), 'record' streams the
+--   run and keeps its frames, and on 'Reject' 'attribute' runs the
+--   A\/A + B\/B diagnostics automatically (two extra runs).
+runTraceSuite :: TraceSuite -> IO ()
 runTraceSuite ts = do
   hSetBuffering stdout LineBuffering
   prog <- Env.getProgName
   sa   <- parseSuiteArgs
   rc   <- initReportCfg
-  probe <- case tsCases ts of
-    []         -> die (prog ++ ": no cases configured")
-    ((_,p):_)  -> pure p
+  case tsCases ts of
+    [] -> die (prog ++ ": no cases configured")
+    _  -> pure ()
   let out = case saExtra sa of
         (o:_) -> Just o
         _     -> Nothing
   withMeterArg (saMeter sa) $ \mname meter -> do
-    h0 <- tsBuild ts probe
-    b  <- calibrateBatch meter h0
-    let c    = (tsConfig ts) { cfgBatch = b }
-        hdr  = ReportHeader
-          { rhMeter  = mname
-          , rhConfig = c
-          , rhSeed   = tsSeed ts
-          , rhTarget = Just (tsTarget ts)
-          , rhNote   = tsNote ts
+    let hdr = ReportHeader
+          { rhMeter     = mname
+          , rhConfig    = tsConfig ts
+          , rhSeed      = tsSeed ts
+          , rhTarget    = Just (tsTarget ts)
+          , rhNote      = tsNote ts
+          , rhAutoBatch = True
           }
         path = fromMaybe (prog ++ "-" ++ mname ++ ".json") out
+    ref <- newIORef ([] :: [CaseReport])
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
-      traces <- forM (tsCases ts) $ \(name, p) -> do
-        h <- tsBuild ts p
+      forM_ (tsCases ts) $ \(TraceCase name mkH) -> do
+        h <- mkH
+        b <- calibrateBatch meter h
+        let c = (tsConfig ts) { cfgBatch = b }
         t <- record name mname meter c h
-        emit (CaseReport name (traceResult t) Nothing)
-        pure t
-      writeFile path (renderTracesJSON mname (cfgAlpha c) traces)
+        let r = traceResult t
+        mat <- case r of
+          Reject{} -> do
+            hAtt <- mkH
+            Just <$> attribute meter c hAtt
+          Pass{}   -> pure Nothing
+        let cr = CaseReport
+              { crName        = name
+              , crResult      = r
+              , crAttribution = mat
+              , crBatch       = Just b
+              , crTrace       = Just (traceFrames t)
+              }
+        modifyIORef' ref (cr :)
+        emit cr
+      cases <- fmap reverse (readIORef ref)
+      writeFile path (reportJSON hdr cases)
       pure (Just path)
     pure ()
 
@@ -678,11 +767,12 @@ runSuite su = do
   rc <- initReportCfg
   withMeterArg (saMeter sa) $ \mname meter -> do
     let hdr = ReportHeader
-          { rhMeter  = mname
-          , rhConfig = suConfig su
-          , rhSeed   = suSeed su
-          , rhTarget = Just (suTarget su)
-          , rhNote   = suNote su
+          { rhMeter     = mname
+          , rhConfig    = suConfig su
+          , rhSeed      = suSeed su
+          , rhTarget    = Just (suTarget su)
+          , rhNote      = suNote su
+          , rhAutoBatch = False
           }
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
       suRun su mname meter emit
