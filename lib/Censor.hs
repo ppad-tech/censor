@@ -167,7 +167,24 @@ fixVsRandom tgt sec embed = do
 data Config = Config
   { cfgAlpha  :: !Double  -- ^ significance level
   , cfgBudget :: !Int     -- ^ max sample pairs to consume
-  , cfgBatch  :: !Int     -- ^ target repetitions per timed region
+  , cfgBatch  :: !Int     -- ^ target repetitions per timed region.
+                          --   The meter repeats the /same/ @target a@
+                          --   action on one pre-drawn sample (see
+                          --   'Censor.Meter.rep'). This only multiplies
+                          --   real work when each repetition genuinely
+                          --   recomputes -- a foreign (FFI) call, or a
+                          --   target that forces fresh work every time.
+                          --   For a pure Haskell target
+                          --   @\\a -> evaluate (f a)@ the @f a@ thunk is
+                          --   shared across the batch and forced once;
+                          --   the remaining repetitions are no-ops on an
+                          --   already-evaluated value, so a per-batch
+                          --   reading divided by @cfgBatch@ is /not/ a
+                          --   per-call figure. Use @cfgBatch = 1@ for
+                          --   pure targets and let the target's own cost
+                          --   clear the timer quantum; if it is
+                          --   sub-quantum, widen the work rather than
+                          --   batching.
   , cfgWarmup :: !Int     -- ^ warmup pairs. The clip bound is set
                           --   from the @~p99@ of @cfgWarmup@ per-pair
                           --   absolute differences @|d|@; at small
