@@ -338,12 +338,14 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
   let cfg  = buildConfig args
       seed = maybe defaultSeed id (argSeed args)
   R.withMeterArg (argMeter args) $ \mname meter -> do
+    env <- Rep.captureEnv
     let hdr = Rep.ReportHeader
           { Rep.rhMeter     = mname
           , Rep.rhConfig    = cfg
           , Rep.rhSeed      = Just seed
           , Rep.rhTarget    = Just (argTarget args)
           , Rep.rhNote      = Just ("library " ++ argLib args)
+          , Rep.rhEnv       = Just env
           , Rep.rhAutoBatch = False
           }
     cases <- Rep.withReport rc rnd hdr $ \emit -> do
@@ -366,6 +368,7 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
             , Rep.crResult      = result
             , Rep.crAttribution = mat
             , Rep.crBatch       = Nothing
+            , Rep.crNoise       = Nothing
             , Rep.crTrace       = mfrs
             }
       emit cr

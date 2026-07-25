@@ -11,8 +11,11 @@ import Data.List (isInfixOf, isPrefixOf)
 import qualified Censor as C
 import qualified Censor.FFI as F
 import qualified Censor.Runner as R
+import qualified Censor.Runner.Env as E
+import qualified Censor.Runner.Report as Rep
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Array (peekArray)
+import qualified System.Info as Info
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -40,6 +43,8 @@ main = defaultMain $ testGroup "ppad-censor" [
   , diagnoseTests
   , renderingTests
   , calibReportTests
+  , envTests
+  , reportJSONTests
   ]
 
 -- Test config tuned for fast feedback: less strict alpha and small
@@ -890,8 +895,83 @@ calibReportTests = testGroup "calibrateBatchReport" [
       -- exactly at batch 1024.
       map fst (C.crProbes rep) @?= [1, 4, 16, 64, 256, 1024]
 
-  , testCase "unresolvable meter -> capHit True, batch 1" $ do
+  , testCase "records the noise floor at the selected batch" $ do
+      rep <- C.calibrateBatchReport (linMeter 64) noopHyp
+      -- linMeter is deterministic (reading = batch * 64), so the
+      -- median at the selected batch 1024 is exactly the calibration
+      -- target and the IQR is zero.
+      C.crNoise rep @?= Just (C.Noise 65536 0)
+
+  , testCase "unresolvable meter -> capHit True, batch 1, no noise" $ do
       rep <- C.calibrateBatchReport (linMeter 0) noopHyp
       C.crBatch rep @?= 1
       C.crCapHit rep @?= True
+      C.crNoise rep @?= Nothing
+  ]
+
+envTests :: TestTree
+envTests = testGroup "captureEnv" [
+    testCase "captures platform identity" $ do
+      e <- E.captureEnv
+      E.envOs e @?= Info.os
+      E.envArch e @?= Info.arch
+      assertBool "cores >= 1" (E.envCores e >= 1)
+      assertBool "kernel present" (E.envKernel e /= Nothing)
+      assertBool "time present" (E.envTime e /= Nothing)
+
+  , testCase "load averages are nonnegative when present" $ do
+      e <- E.captureEnv
+      case E.envLoad e of
+        Nothing            -> pure ()
+        Just (l1, l5, l15) ->
+          assertBool "loads >= 0" (l1 >= 0 && l5 >= 0 && l15 >= 0)
+  ]
+
+reportJSONTests :: TestTree
+reportJSONTests = testGroup "reportJSON" [
+    testCase "surfaces env and per-case noise" $ do
+      r   <- C.runCT (constMeter 100) testConfig noopHyp
+      env <- E.captureEnv
+      let hdr = Rep.ReportHeader
+            { Rep.rhMeter     = "wall"
+            , Rep.rhConfig    = testConfig
+            , Rep.rhSeed      = Nothing
+            , Rep.rhTarget    = Just "test"
+            , Rep.rhNote      = Nothing
+            , Rep.rhEnv       = Just env
+            , Rep.rhAutoBatch = False
+            }
+          cr = Rep.CaseReport
+            { Rep.crName        = "case"
+            , Rep.crResult      = r
+            , Rep.crAttribution = Nothing
+            , Rep.crBatch       = Just 3
+            , Rep.crNoise       = Just (C.Noise 100 5)
+            , Rep.crTrace       = Nothing
+            }
+          j = Rep.reportJSON hdr [cr]
+      assertBool ("expected env block in " ++ j)
+        ("\"env\":{\"os\":" `isInfixOf` j)
+      assertBool ("expected cores in " ++ j)
+        ("\"cores\":" `isInfixOf` j)
+      assertBool ("expected noise in " ++ j)
+        ("\"noise\":{\"med\":100,\"iqr\":5}" `isInfixOf` j)
+
+  , testCase "omits env and noise when absent" $ do
+      r <- C.runCT (constMeter 100) testConfig noopHyp
+      let hdr = Rep.ReportHeader
+            { Rep.rhMeter     = "wall"
+            , Rep.rhConfig    = testConfig
+            , Rep.rhSeed      = Nothing
+            , Rep.rhTarget    = Nothing
+            , Rep.rhNote      = Nothing
+            , Rep.rhEnv       = Nothing
+            , Rep.rhAutoBatch = False
+            }
+          cr = Rep.CaseReport "case" r Nothing Nothing Nothing Nothing
+          j  = Rep.reportJSON hdr [cr]
+      assertBool ("unexpected env block in " ++ j)
+        (not ("\"env\":" `isInfixOf` j))
+      assertBool ("unexpected noise in " ++ j)
+        (not ("\"noise\":" `isInfixOf` j))
   ]

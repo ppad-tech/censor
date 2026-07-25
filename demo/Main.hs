@@ -443,7 +443,7 @@ runCase emit meter c name mkH = do
       hD <- mkH
       Just <$> C.attribute meter c hD
     C.Pass{}   -> pure Nothing
-  emit (R.CaseReport name r mat Nothing Nothing)
+  emit (R.CaseReport name r mat Nothing Nothing Nothing)
 
 -- run every case under the given meter.
 runAll
@@ -477,8 +477,9 @@ backfillSecpTraces :: Secp.Context -> FilePath -> IO ()
 backfillSecpTraces tex path = do
   let mkCR name mkH = do
         h <- mkH
-        b <- C.calibrateBatch C.wallClock h
-        let c = cfgHeavy { C.cfgBatch = b }
+        cb <- C.calibrateBatchReport C.wallClock h
+        let b = C.crBatch cb
+            c = cfgHeavy { C.cfgBatch = b }
         t <- CR.record name "wall" C.wallClock c h
         let r = CR.traceResult t
         mat <- case r of
@@ -491,6 +492,7 @@ backfillSecpTraces tex path = do
           , R.crResult      = r
           , R.crAttribution = mat
           , R.crBatch       = Just b
+          , R.crNoise       = C.crNoise cb
           , R.crTrace       = Just (CR.traceFrames t)
           }
   cr1 <- mkCR "positive: Secp.mul_wnaf (wNAF point multiplication)"
@@ -499,6 +501,7 @@ backfillSecpTraces tex path = do
               (posSignSchnorr tex)
   cr3 <- mkCR "positive: Secp.sign_ecdsa' (RFC6979)"
               (posSignECDSA tex)
+  env <- R.captureEnv
   let cases = [cr1, cr2, cr3]
       hdr = R.ReportHeader
         { R.rhMeter     = "wall"
@@ -506,6 +509,7 @@ backfillSecpTraces tex path = do
         , R.rhSeed      = Just fixedSeed
         , R.rhTarget    = Just "ppad-secp256k1 secret-scalar surfaces"
         , R.rhNote      = Just "batch auto-calibrated"
+        , R.rhEnv       = Just env
         , R.rhAutoBatch = True
         }
   writeFile path (R.reportJSON hdr cases)

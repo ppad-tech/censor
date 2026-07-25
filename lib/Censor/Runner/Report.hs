@@ -56,6 +56,10 @@ module Censor.Runner.Report (
   , SuiteArgs(..)
   , parseSuiteArgs
 
+    -- * Host environment (re-exports)
+  , Env(..)
+  , captureEnv
+
     -- * Suite scaffolds
   , TraceCase(..)
   , TraceSuite(..)
@@ -79,11 +83,13 @@ import System.Exit (die)
 import System.IO (BufferMode(..), hIsTerminalDevice, hSetBuffering, stdout)
 import Text.Printf (printf)
 
-import Censor hiding (crBatch)
+import Censor hiding (crBatch, crNoise)
+import qualified Censor as C
 import Censor.Runner
   ( traceResult, traceFrames, record, thin
   , verdictName, resultToJSON, withMeterArg
   )
+import Censor.Runner.Env (Env(..), captureEnv)
 import qualified Paths_ppad_censor as Paths
 
 -- | Package name used in the report brand line (@ppad censor@) and
@@ -134,6 +140,11 @@ data ReportHeader = ReportHeader
     -- ^ short target description, e.g. @\"Poly1305 MAC ==\"@.
   , rhNote      :: !(Maybe String)
     -- ^ optional one-line caveat under the header block.
+  , rhEnv       :: !(Maybe Env)
+    -- ^ host-environment snapshot taken at run start. The suite
+    --   scaffolds ('runTraceSuite', 'runSuite') always populate it;
+    --   'Nothing' when the caller assembled the header by hand
+    --   without capturing one.
   , rhAutoBatch :: !Bool
     -- ^ 'True' when the runner calibrates 'cfgBatch' per case
     --   (see 'runTraceSuite'). Header renders @batch=auto@ and the
@@ -157,6 +168,10 @@ data CaseReport = CaseReport
     -- ^ the 'cfgBatch' the case actually ran under. Populated by
     --   'runTraceSuite' from per-case 'calibrateBatch'; 'Nothing'
     --   when the case ran under a shared 'rhConfig' batch.
+  , crNoise       :: !(Maybe Noise)
+    -- ^ the meter's noise floor at the calibrated batch, from the
+    --   case's t'CalibReport'. 'Nothing' when the case was not
+    --   calibrated per-case.
   , crTrace       :: !(Maybe [Frame])
     -- ^ per-pair 'Frame' trajectory, when the runner recorded one
     --   (via 'record'). Surfaces in the JSON artefact as a thinned
@@ -294,11 +309,42 @@ prettyHeaderBlock rc hdr =
         [ [("meter", meterLine hdr)]
         , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
         , maybe [] (\w -> [("seed",   seedHex w)])   (rhSeed hdr)
+        , maybe [] (envEntries " \183 ") (rhEnv hdr)
         , maybe [] (\n -> [("note",   n)])           (rhNote hdr)
         ]
       keyW = maximum (1 : map (length . fst) entries)
       row (k, v) = "  " ++ cDim rc (padR keyW k) ++ "  " ++ v ++ "\n"
   in  concatMap row entries
+
+-- header rows for a host-environment snapshot: a system line
+-- (os/kernel/arch, CPU model, cores), a knob line when any Linux
+-- tuning knob resolved, the load average, and the capture time.
+envEntries :: String -> Env -> [(String, String)]
+envEntries sep e = concat
+  [ [("system", intercalate sep (systemSegs e))]
+  , case knobSegs e of
+      [] -> []
+      ks -> [("env", intercalate sep ks)]
+  , maybe [] (\(l1, l5, l15) ->
+      [("load", printf "%.2f %.2f %.2f" l1 l5 l15)]) (envLoad e)
+  , maybe [] (\t -> [("time", t)]) (envTime e)
+  ]
+
+systemSegs :: Env -> [String]
+systemSegs e = concat
+  [ [unwords (concat
+      [ [envOs e], maybe [] pure (envKernel e), [envArch e] ])]
+  , maybe [] pure (envCpu e)
+  , [show (envCores e) ++ " cores"]
+  ]
+
+knobSegs :: Env -> [String]
+knobSegs e = concat
+  [ maybe [] (\v -> ["governor=" ++ v]) (envGovernor e)
+  , maybe [] pure (envBoost e)  -- already key=value
+  , maybe [] (\v -> ["smt="      ++ v]) (envSmt e)
+  , maybe [] (\v -> ["paranoid=" ++ v]) (envParanoid e)
+  ]
 
 meterLine :: ReportHeader -> String
 meterLine hdr =
@@ -346,14 +392,27 @@ prettyCase rc cr = do
                      elo ehi (resClipped r) (resPairs r) :: String
       putStrLn $ replicate detailIndent ' ' ++ cDim rc detail
     Pass{} -> pure ()
-  case crBatch cr of
-    Just b  -> putStrLn $ replicate detailIndent ' '
-                          ++ cDim rc ("batch=" ++ show b)
+  case calibText cr of
+    Just t  -> putStrLn $ replicate detailIndent ' ' ++ cDim rc t
     Nothing -> pure ()
   case crAttribution cr of
     Just a  -> putStrLn $ replicate detailIndent ' '
                           ++ cDim rc (attributionText a)
     Nothing -> pure ()
+
+-- the calibration detail line under a case row: resolved batch and,
+-- when recorded, the meter's noise floor at that batch.
+calibText :: CaseReport -> Maybe String
+calibText cr = case segs of
+  [] -> Nothing
+  xs -> Just (unwords xs)
+  where
+    segs = concat
+      [ maybe [] (\b -> ["batch=" ++ show b]) (crBatch cr)
+      , maybe [] (\n -> [ printf "noise med=%d iqr=%d"
+                            (nsMedian n) (nsIqr n) ])
+          (crNoise cr)
+      ]
 
 -- Indent under the evidence column: 4 (row indent) + 6 (verdict)
 -- + 2 + 8 (pairs) + 2 + 6 (driver) + 2 = 30.
@@ -411,6 +470,7 @@ reportJSON hdr cases = concat
   , ",\"version\":", jstr brandVersion
   , ",\"meter\":",   jstr (rhMeter hdr)
   , ",\"config\":",  configJSON hdr
+  , maybe "" (\e -> ",\"env\":"    ++ envJSON e)        (rhEnv hdr)
   , maybe "" (\w -> ",\"seed\":"   ++ jstr (seedHex w)) (rhSeed hdr)
   , maybe "" (\t -> ",\"target\":" ++ jstr t)           (rhTarget hdr)
   , maybe "" (\n -> ",\"note\":"   ++ jstr n)           (rhNote hdr)
@@ -436,10 +496,32 @@ configJSON hdr =
         , "}"
         ]
 
+-- optional keys are omitted (rather than emitted null) when the
+-- corresponding Env field did not resolve on the host.
+envJSON :: Env -> String
+envJSON e = concat
+  [ "{\"os\":",    jstr (envOs e)
+  , ",\"arch\":",  jstr (envArch e)
+  , maybe "" (\v -> ",\"kernel\":"   ++ jstr v) (envKernel e)
+  , maybe "" (\v -> ",\"cpu\":"      ++ jstr v) (envCpu e)
+  , ",\"cores\":", show (envCores e)
+  , maybe "" (\v -> ",\"governor\":" ++ jstr v) (envGovernor e)
+  , maybe "" (\v -> ",\"boost\":"    ++ jstr v) (envBoost e)
+  , maybe "" (\v -> ",\"smt\":"      ++ jstr v) (envSmt e)
+  , maybe "" (\v -> ",\"paranoid\":" ++ jstr v) (envParanoid e)
+  , maybe "" (\(l1, l5, l15) -> ",\"load\":["
+      ++ intercalate "," (map showF [l1, l5, l15]) ++ "]")
+      (envLoad e)
+  , maybe "" (\v -> ",\"time\":"     ++ jstr v) (envTime e)
+  , "}"
+  ]
+
 caseJSON :: CaseReport -> String
 caseJSON cr = concat
   [ "{\"name\":",   jstr (crName cr)
   , maybe "" (\b -> ",\"batch\":" ++ show b) (crBatch cr)
+  , maybe "" (\n -> ",\"noise\":{\"med\":" ++ show (nsMedian n)
+      ++ ",\"iqr\":" ++ show (nsIqr n) ++ "}") (crNoise cr)
   , ",\"result\":", resultToJSON (crResult cr)
   , maybe "" (\a -> ",\"attribution\":" ++ jstr (attribJSONLabel a))
       (crAttribution cr)
@@ -493,6 +575,7 @@ plainOpen _ hdr = do
         [ [("meter", plainMeterLine hdr)]
         , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
         , maybe [] (\w -> [("seed",   seedHex w)])   (rhSeed hdr)
+        , maybe [] (envEntries ", ") (rhEnv hdr)
         , maybe [] (\n -> [("note",   n)])           (rhNote hdr)
         ]
       keyW = maximum (1 : map (length . fst) entries)
@@ -526,8 +609,8 @@ plainCase _ cr = do
       putStrLn $ printf "  effect=[%.1f,%.1f] clipped=%d/%d"
         elo ehi (resClipped r) (resPairs r)
     Pass{} -> pure ()
-  case crBatch cr of
-    Just b  -> putStrLn ("  batch=" ++ show b)
+  case calibText cr of
+    Just t  -> putStrLn ("  " ++ t)
     Nothing -> pure ()
   case crAttribution cr of
     Just a  -> putStrLn ("  " ++ attributionText a)
@@ -675,8 +758,10 @@ data TraceSuite = TraceSuite
 --   @\<progName\>-\<meter\>.json@; it carries the same content the
 --   'json' renderer emits to stdout under @--format json@.
 --
---   Per case: 'calibrateBatch' picks the batch (resolved batch
---   surfaces on the case row and in the JSON), 'record' streams the
+--   A host-environment snapshot ('captureEnv') is taken at run start
+--   and rides on the header. Per case: 'calibrateBatchReport' picks
+--   the batch and records the meter's noise floor at it (both
+--   surface on the case row and in the JSON), 'record' streams the
 --   run and keeps its frames, and on 'Reject' 'attribute' runs the
 --   A\/A + B\/B diagnostics automatically (two extra runs).
 runTraceSuite :: TraceSuite -> IO ()
@@ -692,21 +777,24 @@ runTraceSuite ts = do
         (o:_) -> Just o
         _     -> Nothing
   withMeterArg (saMeter sa) $ \mname meter -> do
+    env <- captureEnv
     let hdr = ReportHeader
           { rhMeter     = mname
           , rhConfig    = tsConfig ts
           , rhSeed      = tsSeed ts
           , rhTarget    = Just (tsTarget ts)
           , rhNote      = tsNote ts
+          , rhEnv       = Just env
           , rhAutoBatch = True
           }
         path = fromMaybe (prog ++ "-" ++ mname ++ ".json") out
     ref <- newIORef ([] :: [CaseReport])
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
       forM_ (tsCases ts) $ \(TraceCase name mkH) -> do
-        h <- mkH
-        b <- calibrateBatch meter h
-        let c = (tsConfig ts) { cfgBatch = b }
+        h  <- mkH
+        cb <- calibrateBatchReport meter h
+        let b = C.crBatch cb
+            c = (tsConfig ts) { cfgBatch = b }
         t <- record name mname meter c h
         let r = traceResult t
         mat <- case r of
@@ -719,6 +807,7 @@ runTraceSuite ts = do
               , crResult      = r
               , crAttribution = mat
               , crBatch       = Just b
+              , crNoise       = C.crNoise cb
               , crTrace       = Just (traceFrames t)
               }
         modifyIORef' ref (cr :)
@@ -766,12 +855,14 @@ runSuite su = do
             ++ "[wall|instructions|cycles|branches])"
   rc <- initReportCfg
   withMeterArg (saMeter sa) $ \mname meter -> do
+    env <- captureEnv
     let hdr = ReportHeader
           { rhMeter     = mname
           , rhConfig    = suConfig su
           , rhSeed      = suSeed su
           , rhTarget    = Just (suTarget su)
           , rhNote      = suNote su
+          , rhEnv       = Just env
           , rhAutoBatch = False
           }
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do

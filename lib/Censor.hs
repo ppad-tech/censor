@@ -61,6 +61,7 @@ module Censor (
   , calibrateBatch
   , CalibReport(..)
   , calibrateBatchReport
+  , Noise(..)
 
     -- * A\/A and B\/B diagnostics
   , toAA
@@ -572,8 +573,9 @@ calibrateBatch meter hyp = fmap crBatch (calibrateBatchReport meter hyp)
 
 -- | The probe history behind a 'calibrateBatchReport' run: which
 --   batches were tried, what the meter reported at each, whether the
---   cap 'terminated the search, and the target reading magnitude
---   used for the refinement.
+--   cap 'terminated the search, the target reading magnitude used
+--   for the refinement, and the meter's noise floor at the selected
+--   batch.
 --
 --   Useful when 'calibrateBatch' picks a batch that surprises you
 --   (or falls back to @1@ on an unresolvable meter): the probe list
@@ -589,7 +591,26 @@ data CalibReport = CalibReport
     --   subsequent 'runCT' will throw 'WarmupZeroDuration'.
   , crTargetMag :: {-# UNPACK #-} !Double
     -- ^ the target per-batch reading magnitude used for refinement.
+  , crNoise     :: !(Maybe Noise)
+    -- ^ the meter's noise floor at 'crBatch', sampled right after
+    --   selection; 'Nothing' on a cap-hit.
   } deriving Show
+
+-- | The meter's noise floor at a calibrated batch size: dispersion
+--   of repeated readings of one fixed class-A input, in per-batch
+--   meter units (the scale of the driver's pair differences and of
+--   'resBound' \/ 'resEffect').
+--
+--   A run-time record of measurement conditions: a 'Pass' obtained
+--   where 'nsIqr' rivals the effect sizes of interest carries less
+--   weight than one from a quiet machine. Deterministic meters
+--   (instructions, branches) read an IQR of @0@.
+data Noise = Noise
+  { nsMedian :: {-# UNPACK #-} !Word64
+    -- ^ median reading at the selected batch.
+  , nsIqr    :: {-# UNPACK #-} !Word64
+    -- ^ interquartile range of readings at the selected batch.
+  } deriving (Eq, Show)
 
 -- | 'calibrateBatch' with a t'CalibReport'. Same probe loop; useful
 --   for understanding /why/ the calibrator picked what it picked
@@ -611,22 +632,24 @@ calibrateBatchReport meter hyp = do
       -- measurement.
       probe !b !ps
         | b > calibCap =
-            pure $! finish 1 True ps
+            pure $! finish 1 True Nothing ps
         | otherwise = do
             !r <- probeReading meter act b
             let !ps' = (b, r) : ps
             if fromIntegral r < calibTarget
               then probe (b * 4) ps'
-              else
+              else do
                 let !b' = ceiling
                        (fromIntegral b * calibTarget / fromIntegral r)
                     !bf = max 1 (min calibCap b')
-                in  pure $! finish bf False ps'
-      finish !bf !cap !ps = CalibReport
+                !ns <- noiseReading meter act bf
+                pure $! finish bf False (Just ns) ps'
+      finish !bf !cap !ns !ps = CalibReport
         { crBatch     = bf
         , crProbes    = reverse ps
         , crCapHit    = cap
         , crTargetMag = calibTarget
+        , crNoise     = ns
         }
   probe 1 []
 
@@ -645,6 +668,33 @@ median :: [Word64] -> Word64
 median xs = case drop (length xs `div` 2) (sort xs) of
   (m : _) -> m
   []      -> 0
+
+-- dispersion of repeated readings at the selected batch: median and
+-- interquartile range (nearest-rank quantiles), in per-batch meter
+-- units. This is the meter's noise floor at the scale the driver
+-- will observe, recorded as a snapshot of measurement conditions.
+noiseReading :: Meter -> IO () -> Int -> IO Noise
+noiseReading meter act b = do
+  rs <- collect noiseSamples
+  let !srt = sort rs
+      !n   = length srt
+      !med = nth (n `div` 2) srt
+      !q1  = nth (n `div` 4) srt
+      !q3  = nth (3 * n `div` 4) srt
+  pure Noise { nsMedian = med, nsIqr = q3 - q1 }
+  where
+    collect 0 = pure []
+    collect i = do
+      !r <- measure meter b act
+      fmap (r :) (collect (i - 1 :: Int))
+
+nth :: Int -> [Word64] -> Word64
+nth k xs = case drop k xs of
+  (v : _) -> v
+  []      -> 0
+
+noiseSamples :: Int
+noiseSamples = 15
 
 -- Target per-batch reading magnitude (meter units) and probe budget.
 -- 65536 matches the known-good hand-tuned batch for nanosecond-scale

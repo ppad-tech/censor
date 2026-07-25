@@ -105,6 +105,7 @@ library
   hs-source-dirs:   lib
   ghc-options:
       -Wall
+  c-sources: cbits/censor_env.c
   if flag(llvm)
     ghc-options: -fllvm -O2
   if !os(windows)
@@ -119,6 +120,7 @@ library
       Censor.Rng
       Censor.Runner
       Censor.Runner.DL
+      Censor.Runner.Env
       Censor.Runner.Report
   other-modules:
       Paths_ppad_censor
