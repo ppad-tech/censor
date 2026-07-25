@@ -339,26 +339,41 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
       seed = maybe defaultSeed id (argSeed args)
   R.withMeterArg (argMeter args) $ \mname meter -> do
     let hdr = Rep.ReportHeader
-          { Rep.rhMeter  = mname
-          , Rep.rhConfig = cfg
-          , Rep.rhSeed   = Just seed
-          , Rep.rhTarget = Just (argTarget args)
-          , Rep.rhNote   = Just ("library " ++ argLib args)
+          { Rep.rhMeter     = mname
+          , Rep.rhConfig    = cfg
+          , Rep.rhSeed      = Just seed
+          , Rep.rhTarget    = Just (argTarget args)
+          , Rep.rhNote      = Just ("library " ++ argLib args)
+          , Rep.rhAutoBatch = False
           }
     cases <- Rep.withReport rc rnd hdr $ \emit -> do
-      result <- F.withFFIHypothesis hyp $ \h -> case argTrace args of
-        Nothing -> C.runCT meter cfg h
-        Just tp -> do
-          t <- R.record (argTarget args) mname meter cfg h
-          writeFile tp (R.renderTrace t)
-          pure (R.traceResult t)
+      (result, mfrs) <- F.withFFIHypothesis hyp $ \h ->
+        case argTrace args of
+          Nothing -> do
+            r <- C.runCT meter cfg h
+            pure (r, Nothing)
+          Just _ -> do
+            t <- R.record (argTarget args) mname meter cfg h
+            pure (R.traceResult t, Just (R.traceFrames t))
       -- run the A/A and B/B diagnostics if the user asked and the
       -- primary run rejected; otherwise skip.
       mat <- case (argAttribute args, result) of
         (True, C.Reject{}) -> F.withFFIHypothesis hyp $ \h ->
           Just <$> C.attribute meter cfg h
         _                  -> pure Nothing
-      emit (Rep.CaseReport (argTarget args) result mat)
+      let cr = Rep.CaseReport
+            { Rep.crName        = argTarget args
+            , Rep.crResult      = result
+            , Rep.crAttribution = mat
+            , Rep.crBatch       = Nothing
+            , Rep.crTrace       = mfrs
+            }
+      emit cr
+      -- the trace artefact is the same censor/report-v1 object the
+      -- json renderer emits, with the frame trajectory embedded.
+      case argTrace args of
+        Just tp -> writeFile tp (Rep.reportJSON hdr [cr])
+        Nothing -> pure ()
       pure (argTrace args)
     let code = case cases of
           [cr] -> verdictExit (Rep.crResult cr)
