@@ -111,7 +111,7 @@ main = do
     { R.tsTarget = "ppad-secp256k1 secret-scalar surfaces"
     , R.tsConfig = secpCfg
     , R.tsSeed   = Just fixedSeed
-    , R.tsNote   = Just "batch auto-calibrated"
+    , R.tsNote   = Nothing
     , R.tsCases  =
         [ R.TraceCase "Secp.mul (constant-time, variable-base)" posMul
         , R.TraceCase "Secp.mul_wnaf (wNAF point multiplication)"

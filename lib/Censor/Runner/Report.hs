@@ -681,35 +681,58 @@ padL n s = replicate (max 0 (n - length s)) ' ' ++ s
 -- shared suite arg surface -------------------------------------------------
 
 -- | The parsed suite argv. All censor suites share the shape
---   @[--format FMT] [METER] [EXTRA...]@; each runner interprets
---   @saExtra@ in its own way (trace suites take the first extra as
---   an output path; plain suites reject them).
+--   @[--format FMT] [--batch N] [METER] [EXTRA...]@; each runner
+--   interprets @saExtra@ in its own way (trace suites take the
+--   first extra as an output path; plain suites reject them).
 data SuiteArgs = SuiteArgs
   { saRenderer :: !Renderer
     -- ^ resolved from @--format@; defaults to 'pretty'.
   , saMeter    :: !(Maybe String)
     -- ^ meter name (@wall@, @instructions@, ...); 'Nothing' means
     --   accept the runner's default.
+  , saBatch    :: !(Maybe Int)
+    -- ^ fixed batch from @--batch@; 'Nothing' means the runner's
+    --   default (trace suites auto-calibrate). Pure Haskell
+    --   targets share the applied thunk across a batch, so reps
+    --   beyond the first are no-ops — @--batch 1@ is the honest
+    --   setting for them (mirrors the dlopen CLI's flag).
   , saExtra    :: ![String]
     -- ^ positional arguments left after meter, in order.
   }
 
 -- | Parse the standard suite argv from 'Env.getArgs'. Dies with a
---   clear message if @--format@ is malformed. The extras list is
---   handed to the runner for further interpretation.
+--   clear message if @--format@ or @--batch@ is malformed. The
+--   extras list is handed to the runner for further interpretation.
 parseSuiteArgs :: IO SuiteArgs
 parseSuiteArgs = do
   raw <- Env.getArgs
-  let (farg, rest) = takeFormatArg raw
+  let (farg, rest0) = takeFormatArg raw
+      (barg, rest)  = takeBatchArg rest0
   rnd <- resolveFormat farg
+  bat <- case barg of
+    Nothing -> pure Nothing
+    Just s  -> case reads s of
+      [(n, "")] | n >= 1 -> pure (Just n)
+      _ -> die $ "unknown --batch " ++ show s
+        ++ " (expected a positive integer)"
   let (marg, extra) = case rest of
         []       -> (Nothing, [])
         (m:more) -> (Just m,  more)
   pure SuiteArgs
     { saRenderer = rnd
     , saMeter    = marg
+    , saBatch    = bat
     , saExtra    = extra
     }
+
+-- | Position-insensitively pluck a @--batch N@ pair out of an argv
+--   list, mirroring 'takeFormatArg'.
+takeBatchArg :: [String] -> (Maybe String, [String])
+takeBatchArg = go []
+  where
+    go pre ("--batch":v:rest) = (Just v, reverse pre ++ rest)
+    go pre (x:xs)             = go (x:pre) xs
+    go pre []                 = (Nothing, reverse pre)
 
 -- trace-recording suite scaffold -------------------------------------------
 
@@ -742,9 +765,9 @@ data TraceSuite = TraceSuite
     -- ^ one-line target description shown in the header block.
   , tsConfig :: !Config
     -- ^ base driver config. 'runTraceSuite' calibrates 'cfgBatch'
-    --   per case, so the value of @cfgBatch@ here is ignored;
-    --   'cfgAlpha', 'cfgWarmup', 'cfgBudget', and 'cfgSeed' are
-    --   applied verbatim.
+    --   per case (or pins it from @--batch@), so the value of
+    --   @cfgBatch@ here is ignored; 'cfgAlpha', 'cfgWarmup',
+    --   'cfgBudget', and 'cfgSeed' are applied verbatim.
   , tsSeed   :: !(Maybe Word64)
     -- ^ user-facing sampler seed shown in the header block.
   , tsNote   :: !(Maybe String)
@@ -761,7 +784,9 @@ data TraceSuite = TraceSuite
 --   A host-environment snapshot ('captureEnv') is taken at run start
 --   and rides on the header. Per case: 'calibrateBatchReport' picks
 --   the batch and records the meter's noise floor at it (both
---   surface on the case row and in the JSON), 'record' streams the
+--   surface on the case row and in the JSON) unless @--batch N@
+--   pins the batch (no probe, no noise floor — the honest setting
+--   for pure Haskell targets is @--batch 1@), 'record' streams the
 --   run and keeps its frames, and on 'Reject' 'attribute' runs the
 --   A\/A + B\/B diagnostics automatically (two extra runs).
 runTraceSuite :: TraceSuite -> IO ()
@@ -780,21 +805,28 @@ runTraceSuite ts = do
     env <- captureEnv
     let hdr = ReportHeader
           { rhMeter     = mname
-          , rhConfig    = tsConfig ts
+          , rhConfig    = (tsConfig ts)
+              { cfgBatch =
+                  fromMaybe (cfgBatch (tsConfig ts)) (saBatch sa) }
           , rhSeed      = tsSeed ts
           , rhTarget    = Just (tsTarget ts)
           , rhNote      = tsNote ts
           , rhEnv       = Just env
-          , rhAutoBatch = True
+          , rhAutoBatch = maybe True (const False) (saBatch sa)
           }
         path = fromMaybe (prog ++ "-" ++ mname ++ ".json") out
     ref <- newIORef ([] :: [CaseReport])
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
       forM_ (tsCases ts) $ \(TraceCase name mkH) -> do
         h  <- mkH
-        cb <- calibrateBatchReport meter h
-        let b = C.crBatch cb
-            c = (tsConfig ts) { cfgBatch = b }
+        -- --batch pins the batch (no calibration probe, no
+        -- noise floor); otherwise calibrate per case.
+        (b, mnoise) <- case saBatch sa of
+          Just n  -> pure (n, Nothing)
+          Nothing -> do
+            cb <- calibrateBatchReport meter h
+            pure (C.crBatch cb, C.crNoise cb)
+        let c = (tsConfig ts) { cfgBatch = b }
         t <- record name mname meter c h
         let r = traceResult t
         mat <- case r of
@@ -807,7 +839,7 @@ runTraceSuite ts = do
               , crResult      = r
               , crAttribution = mat
               , crBatch       = Just b
-              , crNoise       = C.crNoise cb
+              , crNoise       = mnoise
               , crTrace       = Just (traceFrames t)
               }
         modifyIORef' ref (cr :)
@@ -853,6 +885,10 @@ runSuite su = do
             ++ " (usage: " ++ prog
             ++ " [--format pretty|json|plain] "
             ++ "[wall|instructions|cycles|branches])"
+  case saBatch sa of
+    Nothing -> pure ()
+    Just _  -> die $ prog ++ ": --batch is a trace-suite flag; "
+            ++ "plain suites run each case under its own config"
   rc <- initReportCfg
   withMeterArg (saMeter sa) $ \mname meter -> do
     env <- captureEnv
