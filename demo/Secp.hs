@@ -83,49 +83,57 @@ posDerivePub = do
     (randomWider g)
     pure
 
--- RFC6979 ECDSA signing (default, ladder-based mul _CURVE_G); secret
--- key fixed vs random, message public.
-posSignECDSA :: IO (C.Hypothesis (Wider, BS.ByteString))
-posSignECDSA = do
+-- RFC6979 ECDSA signing (default, ladder-based mul _CURVE_G). Secret
+-- key fixed vs random; the message is held FIXED and public across
+-- both classes and every sample, so the RFC6979 nonce
+-- (k = f(key, msg)) is deterministic in the fixed class and the
+-- fix-vs-random axis controls the whole declared secret (key + nonce)
+-- rather than only the key.
+posSignECDSA
+  :: BS.ByteString -> IO (C.Hypothesis (Wider, BS.ByteString))
+posSignECDSA msg = do
   g <- C.mkRng fixedSeed
   C.fixVsRandom
-    (\(!sec, !msg) -> () <$ evaluate (Secp.sign_ecdsa sec msg))
+    (\(!sec, !m) -> () <$ evaluate (Secp.sign_ecdsa sec m))
     (randomWider g)
-    (\sec -> do !msg <- random32 g; pure (sec, msg))
+    (\sec -> pure (sec, msg))
 
 -- RFC6979 ECDSA signing under a precomputed context (wNAF mul_wnaf).
 posSignECDSA'
-  :: Secp.Context -> IO (C.Hypothesis (Wider, BS.ByteString))
-posSignECDSA' tex = do
+  :: Secp.Context -> BS.ByteString
+  -> IO (C.Hypothesis (Wider, BS.ByteString))
+posSignECDSA' tex msg = do
   g <- C.mkRng fixedSeed
   C.fixVsRandom
-    (\(!sec, !msg) -> () <$ evaluate (Secp.sign_ecdsa' tex sec msg))
+    (\(!sec, !m) -> () <$ evaluate (Secp.sign_ecdsa' tex sec m))
     (randomWider g)
-    (\sec -> do !msg <- random32 g; pure (sec, msg))
+    (\sec -> pure (sec, msg))
 
--- BIP0340 Schnorr signing (default, ladder-based mul _CURVE_G); secret
--- key fixed vs random, message + aux public.
+-- BIP0340 Schnorr signing (default, ladder-based mul _CURVE_G). Secret
+-- key fixed vs random; message and aux held fixed and public (see
+-- 'posSignECDSA').
 posSignSchnorr
-  :: IO (C.Hypothesis (Wider, BS.ByteString, BS.ByteString))
-posSignSchnorr = do
+  :: BS.ByteString -> BS.ByteString
+  -> IO (C.Hypothesis (Wider, BS.ByteString, BS.ByteString))
+posSignSchnorr msg aux = do
   g <- C.mkRng fixedSeed
   C.fixVsRandom
-    (\(!sec, !msg, !aux) ->
-       () <$ evaluate (Secp.sign_schnorr sec msg aux))
+    (\(!sec, !m, !a) ->
+       () <$ evaluate (Secp.sign_schnorr sec m a))
     (randomWider g)
-    (\sec -> do !msg <- random32 g; !aux <- random32 g; pure (sec, msg, aux))
+    (\sec -> pure (sec, msg, aux))
 
 -- BIP0340 Schnorr signing under a precomputed context (wNAF).
 posSignSchnorr'
-  :: Secp.Context
+  :: Secp.Context -> BS.ByteString -> BS.ByteString
   -> IO (C.Hypothesis (Wider, BS.ByteString, BS.ByteString))
-posSignSchnorr' tex = do
+posSignSchnorr' tex msg aux = do
   g <- C.mkRng fixedSeed
   C.fixVsRandom
-    (\(!sec, !msg, !aux) ->
-       () <$ evaluate (Secp.sign_schnorr' tex sec msg aux))
+    (\(!sec, !m, !a) ->
+       () <$ evaluate (Secp.sign_schnorr' tex sec m a))
     (randomWider g)
-    (\sec -> do !msg <- random32 g; !aux <- random32 g; pure (sec, msg, aux))
+    (\sec -> pure (sec, msg, aux))
 
 peerScalar :: Wider
 peerScalar = W.wider 0xa1b2c3d4e5f60718 0x1122334455667788
@@ -134,6 +142,12 @@ peerScalar = W.wider 0xa1b2c3d4e5f60718 0x1122334455667788
 main :: IO ()
 main = do
   let !tex = Secp.precompute
+  -- one fixed, public message and aux, drawn once and shared across
+  -- both classes and every sample of the signing cases (see
+  -- 'posSignECDSA' for why).
+  gpub <- C.mkRng 0x0FED0FED0FED0FED
+  !fixedMsg <- random32 gpub
+  !fixedAux <- random32 gpub
   peer <- case Secp.derive_pub peerScalar of
     Just p  -> evaluate p
     Nothing -> error "censor-secp: peer derive failed"
@@ -146,11 +160,14 @@ main = do
         [ R.TraceCase "Secp.mul (constant-time, variable-base)" posMul
         , R.TraceCase "Secp.mul_wnaf (wNAF point multiplication)"
                       (posMulWNAF tex)
-        , R.TraceCase "Secp.sign_ecdsa (RFC6979)" posSignECDSA
-        , R.TraceCase "Secp.sign_ecdsa' (RFC6979)" (posSignECDSA' tex)
-        , R.TraceCase "Secp.sign_schnorr (BIP0340)" posSignSchnorr
+        , R.TraceCase "Secp.sign_ecdsa (RFC6979)"
+                      (posSignECDSA fixedMsg)
+        , R.TraceCase "Secp.sign_ecdsa' (RFC6979)"
+                      (posSignECDSA' tex fixedMsg)
+        , R.TraceCase "Secp.sign_schnorr (BIP0340)"
+                      (posSignSchnorr fixedMsg fixedAux)
         , R.TraceCase "Secp.sign_schnorr' (BIP0340)"
-                      (posSignSchnorr' tex)
+                      (posSignSchnorr' tex fixedMsg fixedAux)
         , R.TraceCase "Secp.ecdh (shared secret)" (posEcdh peer)
         , R.TraceCase "Secp.derive_pub (public key)" posDerivePub
         ]
