@@ -46,8 +46,8 @@ randomWider g = do
 random32 :: C.Rng -> IO BS.ByteString
 random32 g = C.randomBytes g 32
 
--- constant-time variable-base multiplication of a fixed public
--- point by the secret scalar.
+-- constant-time variable-base multiplication of the generator by
+-- the secret scalar (the double-and-add ladder).
 posMul :: IO (C.Hypothesis Wider)
 posMul = do
   g <- C.mkRng fixedSeed
@@ -74,22 +74,52 @@ posEcdh peer = do
     (randomWider g)
     pure
 
--- RFC6979 ECDSA signing; secret key fixed vs random, message public.
-posSignECDSA
+-- public-key derivation from the secret scalar (mul _CURVE_G).
+posDerivePub :: IO (C.Hypothesis Wider)
+posDerivePub = do
+  g <- C.mkRng fixedSeed
+  C.fixVsRandom
+    (\sec -> () <$ evaluate (Secp.derive_pub sec))
+    (randomWider g)
+    pure
+
+-- RFC6979 ECDSA signing (default, ladder-based mul _CURVE_G); secret
+-- key fixed vs random, message public.
+posSignECDSA :: IO (C.Hypothesis (Wider, BS.ByteString))
+posSignECDSA = do
+  g <- C.mkRng fixedSeed
+  C.fixVsRandom
+    (\(!sec, !msg) -> () <$ evaluate (Secp.sign_ecdsa sec msg))
+    (randomWider g)
+    (\sec -> do !msg <- random32 g; pure (sec, msg))
+
+-- RFC6979 ECDSA signing under a precomputed context (wNAF mul_wnaf).
+posSignECDSA'
   :: Secp.Context -> IO (C.Hypothesis (Wider, BS.ByteString))
-posSignECDSA tex = do
+posSignECDSA' tex = do
   g <- C.mkRng fixedSeed
   C.fixVsRandom
     (\(!sec, !msg) -> () <$ evaluate (Secp.sign_ecdsa' tex sec msg))
     (randomWider g)
     (\sec -> do !msg <- random32 g; pure (sec, msg))
 
--- BIP0340 Schnorr signing; secret key fixed vs random, message +
--- aux public.
+-- BIP0340 Schnorr signing (default, ladder-based mul _CURVE_G); secret
+-- key fixed vs random, message + aux public.
 posSignSchnorr
+  :: IO (C.Hypothesis (Wider, BS.ByteString, BS.ByteString))
+posSignSchnorr = do
+  g <- C.mkRng fixedSeed
+  C.fixVsRandom
+    (\(!sec, !msg, !aux) ->
+       () <$ evaluate (Secp.sign_schnorr sec msg aux))
+    (randomWider g)
+    (\sec -> do !msg <- random32 g; !aux <- random32 g; pure (sec, msg, aux))
+
+-- BIP0340 Schnorr signing under a precomputed context (wNAF).
+posSignSchnorr'
   :: Secp.Context
   -> IO (C.Hypothesis (Wider, BS.ByteString, BS.ByteString))
-posSignSchnorr tex = do
+posSignSchnorr' tex = do
   g <- C.mkRng fixedSeed
   C.fixVsRandom
     (\(!sec, !msg, !aux) ->
@@ -116,9 +146,12 @@ main = do
         [ R.TraceCase "Secp.mul (constant-time, variable-base)" posMul
         , R.TraceCase "Secp.mul_wnaf (wNAF point multiplication)"
                       (posMulWNAF tex)
-        , R.TraceCase "Secp.ecdh (shared secret)" (posEcdh peer)
-        , R.TraceCase "Secp.sign_ecdsa' (RFC6979)" (posSignECDSA tex)
+        , R.TraceCase "Secp.sign_ecdsa (RFC6979)" posSignECDSA
+        , R.TraceCase "Secp.sign_ecdsa' (RFC6979)" (posSignECDSA' tex)
+        , R.TraceCase "Secp.sign_schnorr (BIP0340)" posSignSchnorr
         , R.TraceCase "Secp.sign_schnorr' (BIP0340)"
-                      (posSignSchnorr tex)
+                      (posSignSchnorr' tex)
+        , R.TraceCase "Secp.ecdh (shared secret)" (posEcdh peer)
+        , R.TraceCase "Secp.derive_pub (public key)" posDerivePub
         ]
     }
