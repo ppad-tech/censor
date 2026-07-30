@@ -15,7 +15,7 @@
 --   through a 'Renderer'. Three renderers are provided —
 --   'pretty' (the ppad terminal aesthetic: bold brand line, dim
 --   key column, middle-dot separators, ANSI-colored verdicts on a
---   TTY), 'json' (one @censor\/report-v1@ object per run,
+--   TTY), 'json' (one @censor\/report-v2@ object per run,
 --   deterministic key order, per-case trace arrays when present),
 --   and 'plain' (ASCII-only, grep-safe).
 -- * 'withReport' streams cases through the chosen renderer and
@@ -61,6 +61,7 @@ module Censor.Runner.Report (
   , captureEnv
 
     -- * Suite scaffolds
+  , BatchPolicy(..)
   , TraceCase(..)
   , TraceSuite(..)
   , runTraceSuite
@@ -145,13 +146,14 @@ data ReportHeader = ReportHeader
     --   scaffolds ('runTraceSuite', 'runSuite') always populate it;
     --   'Nothing' when the caller assembled the header by hand
     --   without capturing one.
-  , rhAutoBatch :: !Bool
-    -- ^ 'True' when the runner calibrates 'cfgBatch' per case
-    --   (see 'runTraceSuite'). Header renders @batch=auto@ and the
-    --   config JSON emits @\"batch\":\"auto\"@; the resolved batch
-    --   for each case appears on that case's row via 'crBatch'.
-    --   'False' means the run used a single 'cfgBatch' from
-    --   'rhConfig' throughout, rendered as usual.
+  , rhPerCaseBatch :: !Bool
+    -- ^ 'True' when each case picks its own 'cfgBatch' from its
+    --   'BatchPolicy' (see 'runTraceSuite'). Header renders
+    --   @batch=per-case@ and the config JSON emits
+    --   @\"batch\":\"per-case\"@; the resolved batch for each case
+    --   appears on that case's row via 'crBatch'. 'False' means the
+    --   run used a single 'cfgBatch' from 'rhConfig' throughout,
+    --   rendered as usual.
   } deriving Show
 
 -- | A single case row.
@@ -359,8 +361,8 @@ meterLine hdr =
 
 batchText :: ReportHeader -> String
 batchText hdr
-  | rhAutoBatch hdr = "auto"
-  | otherwise       = show (cfgBatch (rhConfig hdr))
+  | rhPerCaseBatch hdr = "per-case"
+  | otherwise          = show (cfgBatch (rhConfig hdr))
 
 -- Row layout: verdict + pairs + driver in fixed-width columns on the
 -- left, evidence in the middle, case name after a dim separator on
@@ -420,19 +422,30 @@ detailIndent :: Int
 detailIndent = 30
 
 prettyClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
-prettyClose rc _ tl = do
+prettyClose rc hdr tl = do
   let cs   = btCases tl
       nrej = length (filter (isReject . crResult) cs)
       npas = length cs - nrej
       pairs = sum (map (resPairs . crResult) cs)
-      parts = [ colorCount cRed   rc nrej " reject"
-              , colorCount cGreen rc npas " pass"
-              , show pairs ++ " pairs" ]
-      parts' = case btOutput tl of
-        Just p  -> parts ++ ["wrote " ++ p]
-        Nothing -> parts
+      parts = concat
+        [ [ colorCount cRed   rc nrej " reject"
+          , colorCount cGreen rc npas " pass"
+          , show pairs ++ " pairs" ]
+        , familySeg hdr cs
+        , maybe [] (\p -> ["wrote " ++ p]) (btOutput tl)
+        ]
   putStrLn ""
-  putStrLn $ "  " ++ cDim rc (intercalate " \183 " parts')
+  putStrLn $ "  " ++ cDim rc (intercalate " \183 " parts)
+
+-- Family-wise alpha, shown only for multi-case batteries (for a
+-- single case it is just alpha, and saying so adds noise).
+familySeg :: ReportHeader -> [CaseReport] -> [String]
+familySeg hdr cs
+  | n <= 1    = []
+  | otherwise = [printf "family alpha<=%.1g" (familyAlpha alpha n)]
+  where
+    n     = length cs
+    alpha = cfgAlpha (rhConfig hdr)
 
 colorCount
   :: (ReportCfg -> String -> String) -> ReportCfg -> Int -> String -> String
@@ -442,7 +455,7 @@ colorCount col rc n suf
 
 -- json renderer ------------------------------------------------------------
 
--- | Emit one @censor\/report-v1@ JSON object per battery,
+-- | Emit one @censor\/report-v2@ JSON object per battery,
 --   deterministic key order. Header and per-case callbacks are
 --   no-ops; the whole object materialises at close, exactly as
 --   'reportJSON' would render it.
@@ -457,7 +470,7 @@ jsonClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
 jsonClose _ hdr tl = putStrLn (reportJSON hdr (btCases tl))
 
 -- | Serialise a header + case list as the canonical
---   @censor\/report-v1@ JSON object. Deterministic key order; the
+--   @censor\/report-v2@ JSON object. Deterministic key order; the
 --   per-case block carries 'crBatch' and 'crTrace' as optional
 --   fields, present exactly when the runner recorded them.
 --
@@ -465,7 +478,7 @@ jsonClose _ hdr tl = putStrLn (reportJSON hdr (btCases tl))
 --   stdout output and the on-disk artefact are byte-identical.
 reportJSON :: ReportHeader -> [CaseReport] -> String
 reportJSON hdr cases = concat
-  [ "{\"schema\":\"censor/report-v1\""
+  [ "{\"schema\":\"censor/report-v2\""
   , ",\"tool\":",    jstr brand
   , ",\"version\":", jstr brandVersion
   , ",\"meter\":",   jstr (rhMeter hdr)
@@ -477,7 +490,7 @@ reportJSON hdr cases = concat
   , ",\"cases\":["
   , intercalate "," (map caseJSON cases)
   , "]"
-  , ",\"totals\":", totalsJSON cases
+  , ",\"totals\":", totalsJSON (cfgAlpha (rhConfig hdr)) cases
   , "}"
   ]
 
@@ -485,8 +498,8 @@ configJSON :: ReportHeader -> String
 configJSON hdr =
   let c = rhConfig hdr
       batchField
-        | rhAutoBatch hdr = ",\"batch\":\"auto\""
-        | otherwise       = ",\"batch\":" ++ show (cfgBatch c)
+        | rhPerCaseBatch hdr = ",\"batch\":\"per-case\""
+        | otherwise          = ",\"batch\":" ++ show (cfgBatch c)
   in  concat
         [ "{\"alpha\":",  showF (cfgAlpha c)
         , ",\"budget\":", show (cfgBudget c)
@@ -523,7 +536,7 @@ caseJSON cr = concat
   , maybe "" (\n -> ",\"noise\":{\"med\":" ++ show (nsMedian n)
       ++ ",\"iqr\":" ++ show (nsIqr n) ++ "}") (crNoise cr)
   , ",\"result\":", resultToJSON (crResult cr)
-  , maybe "" (\a -> ",\"attribution\":" ++ jstr (attribJSONLabel a))
+  , maybe "" (\a -> ",\"controls\":" ++ controlsJSON a)
       (crAttribution cr)
   , maybe "" (\frs -> ",\"trace\":" ++ traceArrayJSON frs) (crTrace cr)
   , "}"
@@ -536,8 +549,8 @@ traceArrayJSON frs =
     frameJSON fr = printf "[%d,%.4f,%.4f,%.1f,%.1f]"
       (frPair fr) (frLogW fr) (frLogWSup fr) (frLo fr) (frHi fr)
 
-totalsJSON :: [CaseReport] -> String
-totalsJSON cs =
+totalsJSON :: Double -> [CaseReport] -> String
+totalsJSON alpha cs =
   let n  = length cs
       nr = length (filter (isReject . crResult) cs)
       np = n - nr
@@ -547,15 +560,38 @@ totalsJSON cs =
         , ",\"reject\":", show nr
         , ",\"pass\":",   show np
         , ",\"pairs\":",  show pr
+        , ",\"alpha\":",  showF alpha
+        , ",\"familyAlpha\":", showF (familyAlpha alpha n)
         , "}"
         ]
 
-attribJSONLabel :: Attribution -> String
-attribJSONLabel a = case a of
-  TargetLeak           -> "target leak"
-  SampleAAsymmetry _   -> "sampleA asymmetry"
-  SampleBAsymmetry _   -> "sampleB asymmetry"
-  PervasiveAsymmetry{} -> "pervasive asymmetry"
+-- Censor's type-I guarantee is per run. A battery that calls
+-- failure when /any/ of its M cells rejects has a family-wise false
+-- alarm probability bounded by M * alpha (union bound), not alpha.
+-- Reported so a reader does not have to reconstruct it; to actually
+-- test at alpha family-wise, run each cell at alpha / M.
+familyAlpha :: Double -> Int -> Double
+familyAlpha !alpha !n = min 1 (alpha * fromIntegral (max 1 n))
+
+-- The controls block: the combined verdict plus both control runs
+-- in full. Serialising the runs (rather than reducing them to a
+-- label) is deliberate — 'ControlsPass' is an absence of evidence,
+-- and a reader should be able to see how much evidence was
+-- actually gathered before accepting it.
+controlsJSON :: Attribution -> String
+controlsJSON a = concat
+  [ "{\"verdict\":", jstr (controlLabel (attVerdict a))
+  , ",\"aa\":",      resultToJSON (attAA a)
+  , ",\"bb\":",      resultToJSON (attBB a)
+  , "}"
+  ]
+
+controlLabel :: ControlVerdict -> String
+controlLabel v = case v of
+  ControlsPass       -> "controls pass"
+  SampleAAsymmetry   -> "sampleA asymmetry"
+  SampleBAsymmetry   -> "sampleB asymmetry"
+  PervasiveAsymmetry -> "pervasive asymmetry"
 
 -- plain renderer -----------------------------------------------------------
 
@@ -617,11 +653,14 @@ plainCase _ cr = do
     Nothing -> pure ()
 
 plainClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
-plainClose _ _ tl = do
+plainClose _ hdr tl = do
   let cs = btCases tl
       nr = length (filter (isReject . crResult) cs)
       np = length cs - nr
       pr = sum (map (resPairs . crResult) cs)
+      fam = case familySeg hdr cs of
+        (s:_) -> " " ++ s
+        []    -> ""
       wrote = case btOutput tl of
         Just p  -> " wrote=" ++ p
         Nothing -> ""
@@ -629,6 +668,7 @@ plainClose _ _ tl = do
   putStrLn $ "summary: reject=" ++ show nr
     ++ " pass=" ++ show np
     ++ " pairs=" ++ show pr
+    ++ fam
     ++ wrote
 
 -- shared helpers -----------------------------------------------------------
@@ -645,18 +685,21 @@ shapeName s = case s of
   MixedShape  -> "mixed"
 
 attributionText :: Attribution -> String
-attributionText a = case a of
-  TargetLeak ->
-    "attribution: target leak (A/A and B/B both pass)"
-  SampleAAsymmetry r ->
-    "attribution: sampleA asymmetry (A/A rejected at "
-    ++ show (resPairs r) ++ ")"
-  SampleBAsymmetry r ->
-    "attribution: sampleB asymmetry (B/B rejected at "
-    ++ show (resPairs r) ++ ")"
-  PervasiveAsymmetry ra rb ->
-    "attribution: pervasive harness asymmetry (A/A at "
-    ++ show (resPairs ra) ++ ", B/B at " ++ show (resPairs rb) ++ ")"
+attributionText a = case attVerdict a of
+  ControlsPass ->
+    "controls: pass (A/A " ++ show (resPairs (attAA a))
+    ++ ", B/B " ++ show (resPairs (attBB a))
+    ++ " pairs; consistent with a target leak, not proof of one)"
+  SampleAAsymmetry ->
+    "controls: sampleA asymmetry (A/A rejected at "
+    ++ show (resPairs (attAA a)) ++ ")"
+  SampleBAsymmetry ->
+    "controls: sampleB asymmetry (B/B rejected at "
+    ++ show (resPairs (attBB a)) ++ ")"
+  PervasiveAsymmetry ->
+    "controls: pervasive harness asymmetry (A/A at "
+    ++ show (resPairs (attAA a)) ++ ", B/B at "
+    ++ show (resPairs (attBB a)) ++ ")"
 
 seedHex :: Word64 -> String
 seedHex w = "0x" ++ showHex w ""
@@ -736,23 +779,48 @@ takeBatchArg = go []
 
 -- trace-recording suite scaffold -------------------------------------------
 
--- | One case in a t'TraceSuite': a display name plus an @IO@ action
---   producing the hypothesis. Existentially quantified over the
---   hypothesis input type so a suite can hold cases with different
---   payload shapes in one list.
+-- | How a case's 'cfgBatch' is chosen. The distinction is a
+--   /repeatability contract/ the case author asserts about the
+--   target, and it cannot be inferred: batching only multiplies
+--   real work when each repetition genuinely recomputes.
+data BatchPolicy
+  = SingleShot
+    -- ^ One execution per timed region. The correct policy for a
+    --   pure Haskell target such as @\\a -> () <$ evaluate (f a)@:
+    --   the @f a@ thunk is shared across the batch and forced once,
+    --   so repetitions beyond the first are no-ops on an
+    --   already-evaluated value and a calibrated batch of @N@ would
+    --   describe one call plus @N-1@ no-ops. If the target is
+    --   sub-quantum under the meter, widen the work rather than
+    --   batching.
+  | RepeatableAuto
+    -- ^ Each repetition genuinely recomputes, so calibrate the
+    --   batch with 'calibrateBatchReport'. Appropriate for foreign
+    --   (FFI) calls and targets driving mutable state — anything
+    --   that cannot be memoised by a thunk.
+  | FixedBatch !Int
+    -- ^ Pin the batch outright, bypassing calibration. Use when
+    --   batches must match across meters for comparability.
+  deriving (Eq, Show)
+
+-- | One case in a t'TraceSuite': a display name, its 'BatchPolicy',
+--   and an @IO@ action producing the hypothesis. Existentially
+--   quantified over the hypothesis input type so a suite can hold
+--   cases with different payload shapes in one list.
 --
---   >>> TraceCase "encrypt" posAeadEncrypt
---   >>> TraceCase "decrypt" posAeadDecrypt
+--   >>> TraceCase "encrypt" SingleShot     posAeadEncrypt
+--   >>> TraceCase "mul"     RepeatableAuto posFfiMul
 --
---   The action is re-executed for the calibration probe, the main
---   run, and (on 'Reject') attribution — three times total on
---   rejecting cases, twice on passing cases — so the builder should
---   be inexpensive and side-effect free.
-data TraceCase = forall a. TraceCase !String !(IO (Hypothesis a))
+--   The action is re-executed for the calibration probe (under
+--   'RepeatableAuto'), the main run, and (on 'Reject') the negative
+--   controls, so the builder should be inexpensive and side-effect
+--   free.
+data TraceCase =
+  forall a. TraceCase !String !BatchPolicy !(IO (Hypothesis a))
 
 -- | A trace-recording suite: iterate a list of hypotheses under a
 --   chosen meter, record each run's per-pair frame trajectory, and
---   write the whole battery as a single @censor\/report-v1@ JSON
+--   write the whole battery as a single @censor\/report-v2@ JSON
 --   artefact alongside the human-facing report.
 --
 --   The tool's @Main.hs@ builds one of these and calls
@@ -812,18 +880,20 @@ runTraceSuite ts = do
           , rhTarget    = Just (tsTarget ts)
           , rhNote      = tsNote ts
           , rhEnv       = Just env
-          , rhAutoBatch = maybe True (const False) (saBatch sa)
+          , rhPerCaseBatch = maybe True (const False) (saBatch sa)
           }
         path = fromMaybe (prog ++ "-" ++ mname ++ ".json") out
     ref <- newIORef ([] :: [CaseReport])
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
-      forM_ (tsCases ts) $ \(TraceCase name mkH) -> do
+      forM_ (tsCases ts) $ \(TraceCase name policy mkH) -> do
         h  <- mkH
-        -- --batch pins the batch (no calibration probe, no
-        -- noise floor); otherwise calibrate per case.
-        (b, mnoise) <- case saBatch sa of
-          Just n  -> pure (n, Nothing)
-          Nothing -> do
+        -- --batch overrides every case's policy; otherwise the
+        -- case's own declared policy governs, and only
+        -- RepeatableAuto runs a calibration probe.
+        (b, mnoise) <- case maybe policy FixedBatch (saBatch sa) of
+          SingleShot     -> pure (1, Nothing)
+          FixedBatch n   -> pure (n, Nothing)
+          RepeatableAuto -> do
             cb <- calibrateBatchReport meter h
             pure (C.crBatch cb, C.crNoise cb)
         let c = (tsConfig ts) { cfgBatch = b }
@@ -899,7 +969,7 @@ runSuite su = do
           , rhTarget    = Just (suTarget su)
           , rhNote      = suNote su
           , rhEnv       = Just env
-          , rhAutoBatch = False
+          , rhPerCaseBatch = False
           }
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
       suRun su mname meter emit

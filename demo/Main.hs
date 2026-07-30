@@ -470,15 +470,19 @@ runAll tex meter emit = do
 
 -- Record the three secp positive controls under the wall meter
 -- with per-pair trajectories, and write the resulting battery as a
--- single censor/report-v1 JSON object to PATH. Reuses the suite's
--- exact hypotheses; batch is calibrated per case and rejections
--- are auto-attributed, matching runTraceSuite's behaviour.
+-- single censor/report-v2 JSON object to PATH. Reuses the suite's
+-- exact hypotheses; rejections are auto-attributed, matching
+-- runTraceSuite's behaviour.
+--
+-- These are pure Haskell targets, so the batch is pinned at 1
+-- ('R.SingleShot'): repeating @evaluate (f x)@ on one pre-drawn
+-- sample forces the thunk once and no-ops thereafter, so a
+-- calibrated batch would count no-ops as work.
 backfillSecpTraces :: Secp.Context -> FilePath -> IO ()
 backfillSecpTraces tex path = do
   let mkCR name mkH = do
         h <- mkH
-        cb <- C.calibrateBatchReport C.wallClock h
-        let b = C.crBatch cb
+        let b = 1
             c = cfgHeavy { C.cfgBatch = b }
         t <- CR.record name "wall" C.wallClock c h
         let r = CR.traceResult t
@@ -492,7 +496,7 @@ backfillSecpTraces tex path = do
           , R.crResult      = r
           , R.crAttribution = mat
           , R.crBatch       = Just b
-          , R.crNoise       = C.crNoise cb
+          , R.crNoise       = Nothing
           , R.crTrace       = Just (CR.traceFrames t)
           }
   cr1 <- mkCR "positive: Secp.mul_wnaf (wNAF point multiplication)"
@@ -508,9 +512,9 @@ backfillSecpTraces tex path = do
         , R.rhConfig    = cfgHeavy
         , R.rhSeed      = Just fixedSeed
         , R.rhTarget    = Just "ppad-secp256k1 secret-scalar surfaces"
-        , R.rhNote      = Just "batch auto-calibrated"
+        , R.rhNote      = Just "pure targets: batch=1"
         , R.rhEnv       = Just env
-        , R.rhAutoBatch = True
+        , R.rhPerCaseBatch = False
         }
   writeFile path (R.reportJSON hdr cases)
   putStrLn ("wrote " ++ show (length cases) ++ " secp cases to " ++ path)

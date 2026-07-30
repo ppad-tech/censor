@@ -157,18 +157,19 @@ main = do
     , R.tsSeed   = Just fixedSeed
     , R.tsNote   = Nothing
     , R.tsCases  =
-        [ R.TraceCase "Secp.mul (constant-time, variable-base)" posMul
-        , R.TraceCase "Secp.mul_wnaf (wNAF point multiplication)"
+        [ R.TraceCase "Secp.mul (constant-time, variable-base)"
+                      R.SingleShot posMul
+        , R.TraceCase "Secp.mul_wnaf (wNAF point multiplication)" R.SingleShot
                       (posMulWNAF tex)
-        , R.TraceCase "Secp.sign_ecdsa (RFC6979)"
+        , R.TraceCase "Secp.sign_ecdsa (RFC6979)" R.SingleShot
                       (posSignECDSA fixedMsg)
-        , R.TraceCase "Secp.sign_ecdsa' (RFC6979)"
+        , R.TraceCase "Secp.sign_ecdsa' (RFC6979)" R.SingleShot
                       (posSignECDSA' tex fixedMsg)
-        , R.TraceCase "Secp.sign_schnorr (BIP0340)"
+        , R.TraceCase "Secp.sign_schnorr (BIP0340)" R.SingleShot
                       (posSignSchnorr fixedMsg fixedAux)
-        , R.TraceCase "Secp.sign_schnorr' (BIP0340)"
+        , R.TraceCase "Secp.sign_schnorr' (BIP0340)" R.SingleShot
                       (posSignSchnorr' tex fixedMsg fixedAux)
-        , R.TraceCase "Secp.ecdh (shared secret)" (posEcdh peer)
-        , R.TraceCase "Secp.derive_pub (public key)" posDerivePub
+        , R.TraceCase "Secp.ecdh (shared secret)" R.SingleShot (posEcdh peer)
+        , R.TraceCase "Secp.derive_pub (public key)" R.SingleShot posDerivePub
         ]
     }

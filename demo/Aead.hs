@@ -134,11 +134,11 @@ main = R.runTraceSuite R.TraceSuite
   { R.tsTarget = "ppad-aead ChaCha20-Poly1305 (secret-key fix-vs-random)"
   , R.tsConfig = aeadCfg
   , R.tsSeed   = Just fixedSeed
-  , R.tsNote   = Just "batch auto-calibrated"
+  , R.tsNote   = Just "pure targets: batch=1 (no inner repetition)"
   , R.tsCases  =
-      [ R.TraceCase "AEAD.encrypt (256 B)" posAeadEncrypt
-      , R.TraceCase "AEAD.decrypt accept (256 B)" posAeadDecrypt
-      , R.TraceCase "AEAD.decrypt reject (tag mismatch @0 vs @15)"
+      [ R.TraceCase "AEAD.encrypt (256 B)" R.SingleShot posAeadEncrypt
+      , R.TraceCase "AEAD.decrypt accept (256 B)" R.SingleShot posAeadDecrypt
+      , R.TraceCase "AEAD.decrypt reject (tag mismatch @0 vs @15)" R.SingleShot
                     (posAeadDecryptReject (0, 15))
       ]
   }

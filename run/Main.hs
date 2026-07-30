@@ -6,8 +6,14 @@
 --     [--secret off:len]... [--public off:len]...
 --     [--meter wall|instructions|cycles|branches]
 --     [--alpha FLOAT] [--budget INT] [--warmup INT] [--batch INT]
---     [--seed HEX] [--format pretty|json|plain]
+--     [--seed HEX] [--order-seed HEX] [--format pretty|json|plain]
 --     [--trace PATH] [--attribute]
+--
+-- --seed pins the input samplers only. The per-pair A/B order bit
+-- is seeded separately by --order-seed, defaulting to fresh OS
+-- entropy; the value it resolves to is reported, so a randomised
+-- run stays exactly replayable. Keeping the two independent is
+-- what the conditional null requires.
 --
 -- Workspace layout: every pair starts with a workspace of --workspace
 -- bytes filled with fresh pseudorandom bytes (independent per-class
@@ -61,6 +67,7 @@ data Args = Args
   , argWarmup     :: !(Maybe Int)
   , argBatch      :: !(Maybe Int)
   , argSeed       :: !(Maybe Word64)
+  , argOrderSeed  :: !(Maybe Word64)
   , argFormat     :: !(Maybe String)
   , argTrace      :: !(Maybe FilePath)
   , argAttribute  :: !Bool
@@ -78,6 +85,7 @@ data ArgAcc = ArgAcc
   , accWarmup     :: !(Maybe Int)
   , accBatch      :: !(Maybe Int)
   , accSeed       :: !(Maybe Word64)
+  , accOrderSeed  :: !(Maybe Word64)
   , accFormat     :: !(Maybe String)
   , accTrace      :: !(Maybe FilePath)
   , accAttribute  :: !Bool
@@ -85,7 +93,7 @@ data ArgAcc = ArgAcc
 
 emptyAcc :: ArgAcc
 emptyAcc = ArgAcc Nothing Nothing Nothing [] [] Nothing Nothing Nothing
-  Nothing Nothing Nothing Nothing Nothing False
+  Nothing Nothing Nothing Nothing Nothing Nothing False
 
 -- exit codes ------------------------------------------------------------------
 
@@ -101,12 +109,15 @@ usage = unlines
   , "              [--secret off:len]... [--public off:len]..."
   , "              [--meter wall|instructions|cycles|branches]"
   , "              [--alpha FLOAT] [--budget INT] [--warmup INT]"
-  , "              [--batch INT] [--seed HEX]"
+  , "              [--batch INT] [--seed HEX] [--order-seed HEX]"
   , "              [--format pretty|json|plain]"
   , "              [--trace PATH] [--attribute]"
   , ""
   , "--secret pins class A only (fix vs. random axis)."
   , "--public pins BOTH classes (shared public context)."
+  , ""
+  , "--seed pins the input samplers; --order-seed pins the A/B"
+  , "order bit (default: fresh OS entropy, reported on the run)."
   , ""
   , "Exit codes: 0 Pass, 1 Reject, 2 usage error, 3 load/symbol error."
   ]
@@ -159,6 +170,9 @@ go acc (x:xs)        = case x of
   "--seed"       -> withVal x xs $ \v ys -> do
     w <- parseHex x v
     go acc { accSeed = Just w } ys
+  "--order-seed" -> withVal x xs $ \v ys -> do
+    w <- parseHex x v
+    go acc { accOrderSeed = Just w } ys
   "--format"     -> withVal x xs $ \v ys ->
     onceStr x (accFormat acc) $
       go acc { accFormat = Just v } ys
@@ -245,6 +259,7 @@ finish acc = do
     , argWarmup    = accWarmup acc
     , argBatch     = accBatch acc
     , argSeed      = accSeed acc
+    , argOrderSeed = accOrderSeed acc
     , argFormat    = accFormat acc
     , argTrace     = accTrace acc
     , argAttribute = accAttribute acc
@@ -306,7 +321,10 @@ buildConfig args = C.defaultConfig
   , C.cfgBudget = maybe (C.cfgBudget C.defaultConfig) id (argBudget args)
   , C.cfgWarmup = maybe (C.cfgWarmup C.defaultConfig) id (argWarmup args)
   , C.cfgBatch  = maybe (C.cfgBatch  C.defaultConfig) id (argBatch args)
-  , C.cfgSeed   = argSeed args
+  , C.cfgSeed   = argOrderSeed args
+    -- deliberately NOT argSeed: the order bit must be independent
+    -- of the sampler stream. Nothing here means fresh OS entropy,
+    -- and the resolved value comes back as 'resSeed'.
   }
 
 verdictExit :: C.Result -> Int
@@ -345,8 +363,8 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
           , Rep.rhSeed      = Just seed
           , Rep.rhTarget    = Just (argTarget args)
           , Rep.rhNote      = Just ("library " ++ argLib args)
-          , Rep.rhEnv       = Just env
-          , Rep.rhAutoBatch = False
+          , Rep.rhEnv          = Just env
+          , Rep.rhPerCaseBatch = False
           }
     cases <- Rep.withReport rc rnd hdr $ \emit -> do
       (result, mfrs) <- F.withFFIHypothesis hyp $ \h ->
@@ -372,7 +390,7 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
             , Rep.crTrace       = mfrs
             }
       emit cr
-      -- the trace artefact is the same censor/report-v1 object the
+      -- the trace artefact is the same censor/report-v2 object the
       -- json renderer emits, with the frame trajectory embedded.
       case argTrace args of
         Just tp -> writeFile tp (Rep.reportJSON hdr [cr])

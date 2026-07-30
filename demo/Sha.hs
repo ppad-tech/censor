@@ -55,11 +55,11 @@ main = R.runTraceSuite R.TraceSuite
       , C.cfgBudget = 50000
       }
   , R.tsSeed   = Just fixedSeed
-  , R.tsNote   = Just "batch auto-calibrated"
+  , R.tsNote   = Just "pure targets: batch=1 (no inner repetition)"
   , R.tsCases  =
-      [ R.TraceCase "H0 control @0 vs @0" (posCase (0, 0))
-      , R.TraceCase "position @0 vs @7"   (posCase (0, 7))
-      , R.TraceCase "position @0 vs @15"  (posCase (0, 15))
-      , R.TraceCase "position @0 vs @31"  (posCase (0, 31))
+      [ R.TraceCase "H0 control @0 vs @0" R.SingleShot (posCase (0, 0))
+      , R.TraceCase "position @0 vs @7" R.SingleShot   (posCase (0, 7))
+      , R.TraceCase "position @0 vs @15" R.SingleShot  (posCase (0, 15))
+      , R.TraceCase "position @0 vs @31" R.SingleShot  (posCase (0, 31))
       ]
   }
