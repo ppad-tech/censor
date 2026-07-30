@@ -121,6 +121,7 @@ mkSyntheticMeter !nextA !nextB = do
           ClassB -> nextB
       !hyp = C.Hypothesis
         { C.target  = writeIORef ref
+        , C.prepare = pure ()
         , C.sampleA = pure ClassA
         , C.sampleB = pure ClassB
         }

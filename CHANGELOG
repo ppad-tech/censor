@@ -52,6 +52,17 @@
     per run; a battery that fails when any cell rejects has the
     family bound, not alpha.
 
+  * `Hypothesis` gains a `prepare` field: a per-pair prologue run
+    before either sampler and outside the timed region. New
+    `fixVsRandomCtx` uses it to draw one fresh public context per
+    pair and build both classes around that same context, so the
+    tested axis is secret dependence conditional on identical
+    fresh public input. Previously the completion ran independently
+    per class, so public inputs were either independently random
+    across the pair (adding nuisance variance to `d`) or fixed for
+    the whole run (testing one public input). `FFIHypothesis`
+    gains the matching `ffiPrepare`.
+
   * Report schema bumped to `censor/report-v2`.
 
 - 0.3.1 (2026-07-09)

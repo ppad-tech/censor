@@ -125,6 +125,7 @@ posAeadDecryptReject (i0, i1) = do
         case r of
           Right !_ -> pure ()   -- unreachable: tag is corrupted
           Left _   -> pure ()
+    , C.prepare = pure ()
     , C.sampleA = mk i0
     , C.sampleB = mk i1
     }

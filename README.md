@@ -159,6 +159,38 @@ failure was found" — which is why it is not called `TargetLeak`.
 Establishing that a rejection really is the target's requires
 harness symmetry argued by construction, or an independent harness.
 
+### Paired public context
+
+`fixVsRandom` runs its completion independently for each class, so
+per-pair public inputs (message, nonce, AAD, modulus) end up either
+independently random across the pair — injecting nuisance variance
+into `d` that has nothing to do with the secret — or pinned for the
+whole run, which tests exactly one public input.
+
+`fixVsRandomCtx` takes the third option: draw one fresh public
+context per pair, then build both classes around *that same*
+context.
+
+```haskell
+hyp <- C.fixVsRandomCtx
+  (\(k, m) -> () <$ evaluate (mac k m))  -- target
+  (C.randomBytes g 32)                   -- secret sampler
+  (C.randomBytes g 256)                  -- public context, per pair
+  (\msg key -> pure (key, msg))          -- build the input
+```
+
+The tested axis is then secret dependence *conditional on identical
+fresh public input*. Conditioning on the context removes it as a
+source of paired variance, which sharpens power, and states the
+intended axis explicitly rather than leaving it implicit in how the
+completion was written. The null is unaffected: under H_0 the timing
+law does not depend on the secret, so given the context the two
+readings are conditionally i.i.d. and the pair stays exchangeable.
+
+The mechanism is a `prepare` field on `Hypothesis` — a per-pair
+prologue run before either sampler and outside the timed region.
+It is `pure ()` for an ordinary hypothesis.
+
 ### Reproducibility
 
 `cfgSeed :: Maybe Word64` in `Config` controls the per-pair A/B

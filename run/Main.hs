@@ -299,6 +299,7 @@ buildHypothesis args target = do
       publics = argPublic args
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = ws
+    , F.ffiPrepare = pure ()
     , F.ffiSampleA = \p -> do
         F.fillRandom ga p ws
         overlay p fixPub publics

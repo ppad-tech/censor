@@ -55,6 +55,7 @@ module Censor (
     -- * Hypothesis
     Hypothesis(..)
   , fixVsRandom
+  , fixVsRandomCtx
 
     -- * Configuration
   , Config(..)
@@ -111,6 +112,7 @@ import Control.Exception (Exception, IOException, throwIO, try)
 import Control.Monad (unless)
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (sort, sortBy)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -127,8 +129,14 @@ import Censor.Rng (Rng, mkRng, nextWord, randomBytes, splitMix)
 -- | A constant-time hypothesis.
 --
 --   * @target@: the @IO@ action under test, parameterised on input.
---   * @sampleA@, @sampleB@: independent samplers for two input
---     classes (typically a \"fixed\" class and a \"random\" class).
+--   * @prepare@: a per-pair prologue, run once before either
+--     sampler and outside the timed region. 'pure' @()@ for an
+--     ordinary hypothesis; 'fixVsRandomCtx' uses it to draw one
+--     fresh public context that both classes are then built
+--     around.
+--   * @sampleA@, @sampleB@: samplers for two input classes
+--     (typically a \"fixed\" class and a \"random\" class), drawn
+--     after @prepare@ and independently of each other given it.
 --
 --   The null asserts that the measured pair @(ta, tb)@ is
 --   conditionally exchangeable — swapping the class labels leaves
@@ -149,6 +157,7 @@ import Censor.Rng (Rng, mkRng, nextWord, randomBytes, splitMix)
 --   found evidence\", not as proof of constant time.
 data Hypothesis a = Hypothesis
   { target  :: !(a -> IO ())
+  , prepare :: !(IO ())
   , sampleA :: !(IO a)
   , sampleB :: !(IO a)
   }
@@ -187,12 +196,67 @@ fixVsRandom tgt sec embed = do
   !fix <- sec
   pure Hypothesis
     { target  = tgt
+    , prepare = pure ()
     , sampleA = do
         !_ <- sec        -- draw and discard: balance class B
         embed fix
     , sampleB = do
         !s <- sec
         embed s
+    }
+
+-- | A /fix-vs-random/ t'Hypothesis' in which both classes are built
+--   around one shared, freshly drawn public context.
+--
+--   'fixVsRandom' runs its completion independently for each class,
+--   so per-pair public inputs (message, nonce, associated data,
+--   modulus) are either independently random across the pair —
+--   injecting nuisance variance into @d@ that has nothing to do
+--   with the secret — or held fixed for the whole run, which tests
+--   only one public input. This constructor takes the third option:
+--   draw one fresh context per pair in 'prepare', then build both
+--   class A and class B around /that same/ context.
+--
+--   The tested axis is then secret dependence conditional on
+--   identical fresh public input. Conditioning on the context
+--   removes it as a source of paired variance, which sharpens
+--   power, and makes the intended axis explicit rather than
+--   implicit in how the completion was written.
+--
+--   The null is unaffected: under H_0 the timing law does not
+--   depend on the secret, so given the context the two readings are
+--   conditionally i.i.d. and the pair stays exchangeable.
+--
+--   > hyp <- fixVsRandomCtx
+--   >   (\(k, m) -> () <$ evaluate (mac k m))  -- target
+--   >   (randomBytes g 32)                     -- secret sampler
+--   >   (randomBytes g 256)                    -- public context
+--   >   (\msg key -> pure (key, msg))          -- build the input
+fixVsRandomCtx
+  :: (a -> IO ())      -- ^ target
+  -> IO s              -- ^ secret sampler
+  -> IO c              -- ^ public-context sampler (once per pair)
+  -> (c -> s -> IO a)  -- ^ build an input from context and secret
+  -> IO (Hypothesis a)
+fixVsRandomCtx tgt sec ctx embed = do
+  !fix <- sec
+  -- seeded with a real draw so the ref is total; 'prepare'
+  -- overwrites it before the first pair is ever measured.
+  !c0  <- ctx
+  ref  <- newIORef c0
+  pure Hypothesis
+    { target  = tgt
+    , prepare = do
+        !c <- ctx
+        writeIORef ref c
+    , sampleA = do
+        !_ <- sec        -- draw and discard: balance class B
+        !c <- readIORef ref
+        embed c fix
+    , sampleB = do
+        !s <- sec
+        !c <- readIORef ref
+        embed c s
     }
 
 -- | Driver configuration.
@@ -913,16 +977,24 @@ validateConfig Config{..}
 -- | Run one (sampleA, measure, sampleB, measure) pair, in the chosen
 --   order, and return (measurement-of-A, measurement-of-B). The
 --   returned pair is independent of execution order.
+--
+--   The hypothesis's 'prepare' prologue runs first, before either
+--   sampler and outside the timed region, so anything it
+--   establishes (a shared public context) is common to both classes
+--   and its cost is not charged to whichever class happens to run
+--   first.
 runPair
   :: Meter -> Config -> Hypothesis a -> Bool -> IO (Word64, Word64)
-runPair meter cfg hyp flipOrder
-  | flipOrder = do
+runPair meter cfg hyp flipOrder = do
+  prepare hyp
+  if flipOrder
+    then do
       !b <- sampleB hyp
       !y <- measure meter (cfgBatch cfg) (target hyp b)
       !a <- sampleA hyp
       !x <- measure meter (cfgBatch cfg) (target hyp a)
       pure (x, y)
-  | otherwise = do
+    else do
       !a <- sampleA hyp
       !x <- measure meter (cfgBatch cfg) (target hyp a)
       !b <- sampleB hyp

@@ -85,6 +85,11 @@ import Foreign.Ptr (Ptr)
 data FFIHypothesis = FFIHypothesis
   { ffiWorkspaceBytes :: !Int
     -- ^ size of the pinned workspace, in bytes.
+  , ffiPrepare :: !(IO ())
+    -- ^ per-pair prologue, run before either sampler and outside
+    --   the timed region. @pure ()@ for an ordinary hypothesis; a
+    --   shared-context hypothesis uses it to refresh a scratch
+    --   buffer that both samplers then overlay into the workspace.
   , ffiSampleA :: !(Ptr Word8 -> IO ())
     -- ^ populate the workspace for an input drawn from class A.
   , ffiSampleB :: !(Ptr Word8 -> IO ())
@@ -108,6 +113,7 @@ withFFIHypothesis
 withFFIHypothesis h k =
   allocaBytes (ffiWorkspaceBytes h) $ \p -> k Hypothesis
     { target  = ffiTarget h
+    , prepare = ffiPrepare h
     , sampleA = ffiSampleA h p >> pure p
     , sampleB = ffiSampleB h p >> pure p
     }

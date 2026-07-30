@@ -285,6 +285,7 @@ posMACEq = do
     { C.target = \(!a, !b) -> do
         !_ <- evaluate (a == b)
         pure ()
+    , C.prepare = pure ()
     , C.sampleA = do
         -- A: two byte-equal but structurally distinct tags, built
         -- by hmac'ing the same key/message twice in the same
@@ -340,6 +341,7 @@ posMACPos = do
     { C.target  = \(!a, !b) -> do
         !_ <- evaluate (a == b)
         pure ()
+    , C.prepare = pure ()
     , C.sampleA = mk 0
     , C.sampleB = mk 31
     }
@@ -380,6 +382,7 @@ negLeakyPopcount = do
     { C.target  = \(!w) -> do
         let !n = B.popCount (W.from_vartime w :: Integer)
         replicateM_ (10 * n) (evaluate ())
+    , C.prepare = pure ()
     , C.sampleA = pure fixZero
     , C.sampleB = randomWider g
     }
@@ -394,6 +397,7 @@ negFromVartime = do
     { C.target  = \(!w) -> do
         !_ <- evaluate (W.from_vartime w :: Integer)
         pure ()
+    , C.prepare = pure ()
     , C.sampleA = pure fixZero
     , C.sampleB = randomWider g
     }

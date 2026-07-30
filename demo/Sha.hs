@@ -42,6 +42,7 @@ posCase (i0, i1) = do
         pure (t, u)
   pure C.Hypothesis
     { C.target  = \(!a, !b) -> () <$ evaluate (a == b)
+    , C.prepare = pure ()
     , C.sampleA = mk i0
     , C.sampleB = mk i1
     }

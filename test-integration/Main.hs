@@ -125,6 +125,7 @@ buildHyp target = do
   gb <- R.mkRng (seed `xor` 0x0B0B0B0B0B0B0B0B)
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = wsBytes
+    , F.ffiPrepare = pure ()
     , F.ffiSampleA = \p -> do
         F.fillRandom ga p wsBytes
         copyBytes p fixSec secretLen

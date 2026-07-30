@@ -36,6 +36,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , attributedTests
   , signOnlyLeakTests
   , fixVsRandomTests
+  , fixVsRandomCtxTests
   , rngTests
   , randomBytesTests
   , fillRandomTests
@@ -74,6 +75,7 @@ wallClockTests = testGroup "wall-clock" [
       let hyp = C.Hypothesis
             { C.target  = \_ ->
                 replicateM_ 1000 (modifyIORef' ref (+ 1))
+            , C.prepare = pure ()
             , C.sampleA = pure (2000 :: Int)
             , C.sampleB = pure (100  :: Int)
             }
@@ -90,6 +92,7 @@ wallClockTests = testGroup "wall-clock" [
       let hyp = C.Hypothesis
             { C.target  = \n ->
                 replicateM_ n (modifyIORef' ref (+ 1))
+            , C.prepare = pure ()
             , C.sampleA = pure (2000 :: Int)
             , C.sampleB = pure (100  :: Int)
             }
@@ -105,6 +108,7 @@ wallClockTests = testGroup "wall-clock" [
 noopHyp :: C.Hypothesis ()
 noopHyp = C.Hypothesis
   { C.target  = \_ -> pure ()
+  , C.prepare = pure ()
   , C.sampleA = pure ()
   , C.sampleB = pure ()
   }
@@ -305,6 +309,7 @@ leakHyp = do
         in  go k >> readIORef ref
       hyp = C.Hypothesis
         { C.target  = \n -> writeIORef ref n
+        , C.prepare = pure ()
         , C.sampleA = pure 100
         , C.sampleB = pure 200
         }
@@ -416,6 +421,7 @@ signOnlyLeakTests = testGroup "sign-only leak" [
             in  go k >> readIORef ref
           hyp = C.Hypothesis
             { C.target  = writeIORef ref
+            , C.prepare = pure ()
             , C.sampleA = do
                 n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
                 pure $! if n `mod` 4 == 0 then 97 else 101
@@ -504,6 +510,52 @@ attributeTests = testGroup "attribute" [
 -- first draw differs from all later draws leaks deterministically,
 -- while the A/A collapse of the same hypothesis is null by
 -- construction.
+-- The shared per-pair public context must be exactly that: one
+-- draw, visible identically to both classes, refreshed every pair.
+-- The context sampler here is a counter, and the completion returns
+-- the context itself, so each sampler's return value *is* what it
+-- saw.
+fixVsRandomCtxTests :: TestTree
+fixVsRandomCtxTests = testGroup "fixVsRandomCtx" [
+    testCase "one context per pair, shared by both classes" $ do
+      ctr  <- newIORef (0 :: Int)
+      seen <- newIORef ([] :: [(Char, Int)])
+      base <- C.fixVsRandomCtx
+        (\_ -> pure ())
+        (pure ())
+        (atomicModifyIORef' ctr (\n -> (n + 1, n)))
+        (\c _ -> pure c)
+      let note t act = do
+            c <- act
+            modifyIORef' seen ((t, c) :)
+            pure c
+          hyp = base
+            { C.sampleA = note 'A' (C.sampleA base)
+            , C.sampleB = note 'B' (C.sampleB base)
+            }
+          cfg = C.defaultConfig
+            { C.cfgWarmup = 5, C.cfgBudget = 5, C.cfgBatch = 1 }
+      _  <- C.runCT (constMeter 100) cfg hyp
+      xs <- fmap reverse (readIORef seen)
+      let pairs = chunk2 xs
+      assertBool "expected 10 pairs of samples" (length pairs == 10)
+      mapM_ checkPair pairs
+      -- Contexts advance by exactly one per pair: each pair drew a
+      -- fresh one, and drew it only once. They start at 1, not 0:
+      -- the constructor's seeding draw takes 0 and 'prepare'
+      -- overwrites it before the first pair, so that draw is never
+      -- observed by either class.
+      let ctxs = map (snd . fst) pairs
+      ctxs @?= take 10 [1 ..]
+  ]
+  where
+    chunk2 (a : b : rest) = (a, b) : chunk2 rest
+    chunk2 _              = []
+    checkPair ((t1, c1), (t2, c2)) = do
+      assertBool ("both halves of a pair ran the same class: " ++ [t1, t2])
+        (t1 /= t2)
+      assertEqual "classes saw different contexts in one pair" c1 c2
+
 fixVsRandomTests :: TestTree
 fixVsRandomTests = testGroup "fixVsRandom" [
     testCase "pinned-vs-random divergence is rejected" $ do
@@ -643,6 +695,7 @@ mkSynthMeter nextA nextB = do
           ClassB -> nextB
       hyp = C.Hypothesis
         { C.target  = writeIORef ref
+        , C.prepare = pure ()
         , C.sampleA = pure ClassA
         , C.sampleB = pure ClassB
         }
@@ -736,6 +789,7 @@ clipCountTests = testGroup "clip counts" [
           warmupPairs = 20
           hyp = C.Hypothesis
             { C.target  = writeIORef ref
+            , C.prepare = pure ()
             , C.sampleA = pure 100
             , C.sampleB = do
                 n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
@@ -793,6 +847,7 @@ diagnoseTests = testGroup "diagnose" [
             in  go k >> readIORef ref
           hyp = C.Hypothesis
             { C.target  = writeIORef ref
+            , C.prepare = pure ()
             , C.sampleA = do
                 n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
                 pure $! if n `mod` 4 == 0 then 97 else 101
@@ -852,6 +907,7 @@ diagnoseTests = testGroup "diagnose" [
           warmupPairs = 20
           hyp = C.Hypothesis
             { C.target  = writeIORef ref
+            , C.prepare = pure ()
             , C.sampleA = pure 100
             , C.sampleB = do
                 n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
