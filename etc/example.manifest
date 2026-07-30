@@ -1,0 +1,41 @@
+# A censor battery manifest. Run with:
+#
+#   censor libfoo.dylib --manifest etc/example.manifest \
+#     --format json --attribute
+#
+# One dlopen, one censor/report-v2 object covering every case.
+
+# Run-wide directives. A command-line flag overrides any of these.
+meter          wall
+alpha          1e-6
+budget         20000
+warmup         500
+batch          1
+target-prefix  censor_target_
+workspace      128
+
+# The sampler seed. The A/B order-bit seed is deliberately NOT set
+# here: it defaults to fresh OS entropy per run, and the value it
+# resolves to is reported, so an audit is randomised yet replayable.
+seed           0xc0ffee5eed0beef7
+
+# case NAME [key=value ...]
+#
+#   secret=off:len   pinned in class A only -- the fix-vs-random axis
+#                    (repeatable; at least one is required)
+#   public=off:len   pinned in BOTH classes -- shared public context
+#                    (repeatable)
+#   workspace=N      override the run-wide workspace
+#   target=SYMBOL    override target-prefix ++ NAME
+#   batch=N|auto     override the run-wide batch
+#   replicates=N     run N independent fixed secrets as N cases
+#   label=TEXT       display name, if it should differ from NAME
+
+case mul       secret=0:32
+case ecdh      secret=0:32 public=32:64
+case sign      workspace=96 secret=0:32 public=32:32
+
+# One fixed secret answers "does *this* secret time differently from
+# random". Replicating guards against an unlucky draw; each replicate
+# is its own case row and counts toward the family-wise alpha.
+case inv       secret=0:32 replicates=3

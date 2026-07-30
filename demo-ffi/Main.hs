@@ -96,6 +96,7 @@ bOff = 32
 posCTNeq32 :: C.Rng -> C.Rng -> F.FFIHypothesis
 posCTNeq32 ga gb = F.FFIHypothesis
   { F.ffiWorkspaceBytes = workspaceBytes
+  , F.ffiPrepare = pure ()
   , F.ffiSampleA = \p -> do
       F.fillRandom ga (p `plusPtr` aOff) 32
       copyBytes (p `plusPtr` bOff) (p `plusPtr` aOff) 32
@@ -115,6 +116,7 @@ posCTNeq32 ga gb = F.FFIHypothesis
 negNaiveNeq32 :: C.Rng -> C.Rng -> F.FFIHypothesis
 negNaiveNeq32 ga gb = F.FFIHypothesis
   { F.ffiWorkspaceBytes = workspaceBytes
+  , F.ffiPrepare = pure ()
   , F.ffiSampleA = \p -> do
       F.fillRandom ga (p `plusPtr` aOff) 32
       copyBytes (p `plusPtr` bOff) (p `plusPtr` aOff) 32
@@ -159,6 +161,7 @@ negFastcryptoSign _ga gb = do
   F.fillRandom gFix fixMsgPtr 32
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = 8 + 32
+    , F.ffiPrepare = pure ()
     , F.ffiSampleA = \p -> do
         poke (castPtr p) sharedKp
         copyBytes (p `plusPtr` 8) fixMsgPtr 32
@@ -195,6 +198,7 @@ negBYInvFr ga gb = do
   F.fillRandom gFix fixBuf 32
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = 64
+    , F.ffiPrepare = pure ()
     , F.ffiSampleA = \p -> do
         F.fillRandom ga (p `plusPtr` 0) 32     -- draw, discard for symmetry
         copyBytes (p `plusPtr` 0) fixBuf 32    -- overwrite with fixed

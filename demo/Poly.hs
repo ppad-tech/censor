@@ -46,6 +46,7 @@ posCase (i0, i1) = do
         pure (t, u)
   pure C.Hypothesis
     { C.target  = \(!a, !b) -> () <$ evaluate (a == b)
+    , C.prepare = pure ()
     , C.sampleA = mk i0
     , C.sampleB = mk i1
     }
@@ -59,11 +60,10 @@ main = R.runTraceSuite R.TraceSuite
       , C.cfgBudget = 50000
       }
   , R.tsSeed   = Just fixedSeed
-  , R.tsNote   = Just "batch auto-calibrated"
-  , R.tsBuild  = posCase
+  , R.tsNote   = Just "pure targets: batch=1 (no inner repetition)"
   , R.tsCases  =
-      [ ("H0 control @0 vs @0",  (0, 0))
-      , ("same-lane @0 vs @7",   (0, 7))
-      , ("cross-lane @0 vs @15", (0, 15))
+      [ R.TraceCase "H0 control @0 vs @0" R.SingleShot  (posCase (0, 0))
+      , R.TraceCase "same-lane @0 vs @7" R.SingleShot   (posCase (0, 7))
+      , R.TraceCase "cross-lane @0 vs @15" R.SingleShot (posCase (0, 15))
       ]
   }

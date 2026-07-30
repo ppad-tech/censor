@@ -65,6 +65,22 @@ flag sha512
   default:     False
   manual:      True
 
+flag aead
+  description: Build the censor-aead executable, which records
+               ppad-aead ChaCha20-Poly1305 encrypt/decrypt traces
+               under a selectable meter (depends on ppad-aead).
+  default:     False
+  manual:      True
+
+flag secp
+  description: Build the censor-secp executable, which records
+               ppad-secp256k1 secret-scalar surface traces (mul,
+               mul_wnaf, ecdh, ECDSA/Schnorr signing) under a
+               selectable meter (depends on ppad-secp256k1,
+               ppad-fixed).
+  default:     False
+  manual:      True
+
 flag run
   description: Build the `censor` executable, a dlopen-based runner
                that drives a constant-time hypothesis against a
@@ -89,6 +105,7 @@ library
   hs-source-dirs:   lib
   ghc-options:
       -Wall
+  c-sources: cbits/censor_env.c
   if flag(llvm)
     ghc-options: -fllvm -O2
   if !os(windows)
@@ -103,6 +120,8 @@ library
       Censor.Rng
       Censor.Runner
       Censor.Runner.DL
+      Censor.Runner.Env
+      Censor.Runner.Manifest
       Censor.Runner.Report
   other-modules:
       Paths_ppad_censor
@@ -251,6 +270,39 @@ executable censor-sha512
       , ppad-censor
       , ppad-eproc
       , ppad-sha512
+
+executable censor-aead
+  default-language: Haskell2010
+  hs-source-dirs:   demo
+  main-is:          Aead.hs
+  ghc-options:
+    -O2 -rtsopts -Wall
+
+  if !flag(aead)
+    buildable: False
+  else
+    build-depends:
+        base
+      , bytestring
+      , ppad-censor
+      , ppad-aead
+
+executable censor-secp
+  default-language: Haskell2010
+  hs-source-dirs:   demo
+  main-is:          Secp.hs
+  ghc-options:
+    -O2 -rtsopts -Wall
+
+  if !flag(secp)
+    buildable: False
+  else
+    build-depends:
+        base
+      , bytestring
+      , ppad-censor
+      , ppad-secp256k1
+      , ppad-fixed
 
 executable censor-demo-ffi
   default-language: Haskell2010

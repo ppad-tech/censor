@@ -11,8 +11,12 @@ import Data.List (isInfixOf, isPrefixOf)
 import qualified Censor as C
 import qualified Censor.FFI as F
 import qualified Censor.Runner as R
+import qualified Censor.Runner.Env as E
+import qualified Censor.Runner.Manifest as M
+import qualified Censor.Runner.Report as Rep
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Array (peekArray)
+import qualified System.Info as Info
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -33,6 +37,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , attributedTests
   , signOnlyLeakTests
   , fixVsRandomTests
+  , fixVsRandomCtxTests
   , rngTests
   , randomBytesTests
   , fillRandomTests
@@ -40,14 +45,28 @@ main = defaultMain $ testGroup "ppad-censor" [
   , diagnoseTests
   , renderingTests
   , calibReportTests
+  , envTests
+  , reportJSONTests
+  , manifestTests
   ]
 
--- Test config tuned for fast feedback: less strict alpha and small
--- budget, since both fixtures produce strong signals (CT: identical
--- work, leaky: 20x work imbalance).
+-- Test config for the wall-clock fixtures: a small budget, since
+-- both produce strong signals (CT: identical work, leaky: 20x work
+-- imbalance).
+--
+-- alpha stays at the library default. A looser one is tempting for
+-- the leaky fixture, which rejects under any alpha worth naming,
+-- but it is the CT fixture that sets the floor: these are real
+-- wall-clock measurements, and on a loaded machine the scheduler
+-- leaves enough residual non-exchangeability to cross a 1e-3
+-- threshold over 5000 pairs. That is censor working, not censor
+-- broken -- but it makes an H_0 assertion depend on ambient load.
+-- Calibration proper belongs to censor-validate and its synthetic
+-- meters; what these two fixtures check is that the wall-clock
+-- meter and driver are wired together at all.
 testConfig :: C.Config
 testConfig = C.defaultConfig
-  { C.cfgAlpha  = 1.0e-3
+  { C.cfgAlpha  = 1.0e-6
   , C.cfgBudget = 5000
   , C.cfgWarmup = 100
   , C.cfgBatch  = 1
@@ -69,6 +88,7 @@ wallClockTests = testGroup "wall-clock" [
       let hyp = C.Hypothesis
             { C.target  = \_ ->
                 replicateM_ 1000 (modifyIORef' ref (+ 1))
+            , C.prepare = pure ()
             , C.sampleA = pure (2000 :: Int)
             , C.sampleB = pure (100  :: Int)
             }
@@ -85,6 +105,7 @@ wallClockTests = testGroup "wall-clock" [
       let hyp = C.Hypothesis
             { C.target  = \n ->
                 replicateM_ n (modifyIORef' ref (+ 1))
+            , C.prepare = pure ()
             , C.sampleA = pure (2000 :: Int)
             , C.sampleB = pure (100  :: Int)
             }
@@ -100,6 +121,7 @@ wallClockTests = testGroup "wall-clock" [
 noopHyp :: C.Hypothesis ()
 noopHyp = C.Hypothesis
   { C.target  = \_ -> pure ()
+  , C.prepare = pure ()
   , C.sampleA = pure ()
   , C.sampleB = pure ()
   }
@@ -244,13 +266,14 @@ attributedTests = testGroup "runCTAttributed" [
         (C.Pass{}, Nothing) -> pure ()
         _                   -> assertFailure "expected (Pass, Nothing)"
 
-  , testCase "reject attributes a target leak" $ do
+  , testCase "reject runs controls, and they pass" $ do
       (hyp, meter) <- leakHyp
       (r, ma) <- C.runCTAttributed meter leakCfg hyp
       case (r, ma) of
-        (C.Reject{}, Just C.TargetLeak) -> pure ()
-        (C.Reject{}, Just other)        -> assertFailure $
-          "expected TargetLeak, got " ++ show other
+        (C.Reject{}, Just att)
+          | C.attVerdict att == C.ControlsPass -> pure ()
+        (C.Reject{}, Just other)               -> assertFailure $
+          "expected ControlsPass, got " ++ show (C.attVerdict other)
         _ -> assertFailure "leak fixture did not reject"
   ]
 
@@ -299,6 +322,7 @@ leakHyp = do
         in  go k >> readIORef ref
       hyp = C.Hypothesis
         { C.target  = \n -> writeIORef ref n
+        , C.prepare = pure ()
         , C.sampleA = pure 100
         , C.sampleB = pure 200
         }
@@ -410,6 +434,7 @@ signOnlyLeakTests = testGroup "sign-only leak" [
             in  go k >> readIORef ref
           hyp = C.Hypothesis
             { C.target  = writeIORef ref
+            , C.prepare = pure ()
             , C.sampleA = do
                 n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
                 pure $! if n `mod` 4 == 0 then 97 else 101
@@ -471,14 +496,25 @@ aaDiagnosticTests = testGroup "A/A and B/B diagnostics" [
 -- rejection attributes to the target.
 attributeTests :: TestTree
 attributeTests = testGroup "attribute" [
-    testCase "symmetric-harness leak attributes to the target" $ do
+    testCase "symmetric harness: neither control convicts" $ do
       (hyp, meter) <- leakHyp
       let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
       att <- C.attribute meter c hyp
-      case att of
-        C.TargetLeak -> pure ()
+      case C.attVerdict att of
+        C.ControlsPass -> pure ()
         other -> assertFailure $
-          "expected TargetLeak, got " ++ show other
+          "expected ControlsPass, got " ++ show other
+
+  , testCase "controls carry both full runs, not just a label" $ do
+      (hyp, meter) <- leakHyp
+      let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
+      att <- C.attribute meter c hyp
+      -- both control runs must be present and non-degenerate, so a
+      -- reader can weigh how much evidence backs ControlsPass.
+      assertBool "A/A control consumed no pairs"
+        (C.resPairs (C.attAA att) > 0)
+      assertBool "B/B control consumed no pairs"
+        (C.resPairs (C.attBB att) > 0)
   ]
 
 -- fixVsRandom pins the first secret draw as class A's input and
@@ -487,6 +523,52 @@ attributeTests = testGroup "attribute" [
 -- first draw differs from all later draws leaks deterministically,
 -- while the A/A collapse of the same hypothesis is null by
 -- construction.
+-- The shared per-pair public context must be exactly that: one
+-- draw, visible identically to both classes, refreshed every pair.
+-- The context sampler here is a counter, and the completion returns
+-- the context itself, so each sampler's return value *is* what it
+-- saw.
+fixVsRandomCtxTests :: TestTree
+fixVsRandomCtxTests = testGroup "fixVsRandomCtx" [
+    testCase "one context per pair, shared by both classes" $ do
+      ctr  <- newIORef (0 :: Int)
+      seen <- newIORef ([] :: [(Char, Int)])
+      base <- C.fixVsRandomCtx
+        (\_ -> pure ())
+        (pure ())
+        (atomicModifyIORef' ctr (\n -> (n + 1, n)))
+        (\c _ -> pure c)
+      let note t act = do
+            c <- act
+            modifyIORef' seen ((t, c) :)
+            pure c
+          hyp = base
+            { C.sampleA = note 'A' (C.sampleA base)
+            , C.sampleB = note 'B' (C.sampleB base)
+            }
+          cfg = C.defaultConfig
+            { C.cfgWarmup = 5, C.cfgBudget = 5, C.cfgBatch = 1 }
+      _  <- C.runCT (constMeter 100) cfg hyp
+      xs <- fmap reverse (readIORef seen)
+      let pairs = chunk2 xs
+      assertBool "expected 10 pairs of samples" (length pairs == 10)
+      mapM_ checkPair pairs
+      -- Contexts advance by exactly one per pair: each pair drew a
+      -- fresh one, and drew it only once. They start at 1, not 0:
+      -- the constructor's seeding draw takes 0 and 'prepare'
+      -- overwrites it before the first pair, so that draw is never
+      -- observed by either class.
+      let ctxs = map (snd . fst) pairs
+      ctxs @?= take 10 [1 ..]
+  ]
+  where
+    chunk2 (a : b : rest) = (a, b) : chunk2 rest
+    chunk2 _              = []
+    checkPair ((t1, c1), (t2, c2)) = do
+      assertBool ("both halves of a pair ran the same class: " ++ [t1, t2])
+        (t1 /= t2)
+      assertEqual "classes saw different contexts in one pair" c1 c2
+
 fixVsRandomTests :: TestTree
 fixVsRandomTests = testGroup "fixVsRandom" [
     testCase "pinned-vs-random divergence is rejected" $ do
@@ -626,6 +708,7 @@ mkSynthMeter nextA nextB = do
           ClassB -> nextB
       hyp = C.Hypothesis
         { C.target  = writeIORef ref
+        , C.prepare = pure ()
         , C.sampleA = pure ClassA
         , C.sampleB = pure ClassB
         }
@@ -649,15 +732,18 @@ countRejects = go 0
 
 smokeCalibrationTests :: TestTree
 smokeCalibrationTests = testGroup "smoke calibration" [
-    -- two H_0 fixtures, alpha = 0.1, N = 200, loose bound: a true
+    -- an H_0 fixture, alpha = 0.1, N = 200, loose bound: a true
     -- 0.1-FPR test would produce ~20 +/- ~10 rejections; a broken
     -- driver flips this to 100+ rejections. The 0.30 bound is a
     -- regression tripwire, not a real calibration check.
     testCase "sym-uniform H_0 stays under 30%" $
       assertCalibrated symUniformTrial
 
-  , testCase "asym-uniform-equal-mean H_0 stays under 30%" $
-      assertCalibrated asymUniformTrial
+    -- the mirror-image tripwire: a variance-only alternative must
+    -- be detected, not tolerated. This is the channel that a null
+    -- of "d is symmetric" cannot see and exchangeability can.
+  , testCase "asym-uniform-equal-mean H_1 detected above 90%" $
+      assertDetected asymUniformTrial
   ]
   where
     cfg = C.defaultConfig
@@ -672,6 +758,10 @@ smokeCalibrationTests = testGroup "smoke calibration" [
       (m, h) <- mkSynthMeter (uniformInRange ra 0 200)
                              (uniformInRange rb 0 200)
       C.runCT m cfg h
+    -- equal means, different variances. Under exchangeability this
+    -- is a genuine alternative: d stays symmetric (so sign and
+    -- magnitude see nothing), but the class CDFs differ, which the
+    -- indicator components detect.
     asymUniformTrial = do
       ra <- C.mkRng 0x5EED03
       rb <- C.mkRng 0x5EED04
@@ -686,45 +776,91 @@ smokeCalibrationTests = testGroup "smoke calibration" [
                   ++ "/" ++ show n ++ " rejections (rate "
                   ++ show rate ++ ")")
                  (rate <= 0.30)
+    assertDetected trial = do
+      let n = 200
+      rejects <- countRejects n trial
+      let rate = fromIntegral rejects / (fromIntegral n :: Double)
+      assertBool ("variance-only detection regressed: " ++ show rejects
+                  ++ "/" ++ show n ++ " rejections (rate "
+                  ++ show rate ++ ")")
+                 (rate >= 0.90)
 
--- clip count rises when |ta - tb| exceeds the warmup-derived bound.
--- fixture: target writes its input to an IORef, meter reads it;
--- class A always writes 100, class B writes 200 during warmup (|d|
--- = 100, so bound = 2 * 100 = 200) and 1000000 during the main loop
--- (|d| ~= 999900, well above the bound).
 clipCountTests :: TestTree
 clipCountTests = testGroup "clip counts" [
     testCase "clip count rises when |d| exceeds bound" $ do
-      ref <- newIORef (0 :: Word64)
-      ctr <- newIORef (0 :: Int)
-      let leakMeter = C.Meter $ \k act ->
-            let go 0 = pure ()
-                go i = act >> go (i - 1)
-            in  go k >> readIORef ref
-          warmupPairs = 20
-          hyp = C.Hypothesis
-            { C.target  = writeIORef ref
-            , C.sampleA = pure 100
-            , C.sampleB = do
-                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
-                pure $! if n < warmupPairs
-                          then 200
-                          else 1000000
-            }
-          c = C.defaultConfig
-            { C.cfgAlpha  = 1.0e-3
-            , C.cfgBudget = 50
-            , C.cfgWarmup = warmupPairs
-            , C.cfgBatch  = 1
-            }
-      r <- C.runCT leakMeter c hyp
+      r <- runClipping 1000000
       -- every warmup |d| is exactly 100, so the bound is pinned at
       -- 2 * p99(|d|) = 200.
       C.resBound r @?= 200
       assertBool ("expected nonzero clip count, got "
                   ++ show (C.resClipped r))
                  (C.resClipped r > 0)
+
+  , testCase "|d| past every bound is counted at every bound" $ do
+      -- main-loop |d| ~= 999900, past c = 200, 4c = 800, 16c = 3200
+      r <- runClipping 1000000
+      C.resClipped4 r  @?= C.resClipped r
+      C.resClipped16 r @?= C.resClipped r
+
+  , testCase "|d| between 4c and 16c leaves the widest count at 0" $ do
+      -- main-loop |d| = 900: past c and 4c, under 16c. The tight
+      -- components are starved while the effect interval's own
+      -- input is untouched -- the two readings the counts separate.
+      r <- runClipping 1000
+      assertBool ("expected clipping at c, got "
+                  ++ show (C.resClipped r))
+                 (C.resClipped r > 0)
+      assertBool ("expected clipping at 4c, got "
+                  ++ show (C.resClipped4 r))
+                 (C.resClipped4 r > 0)
+      C.resClipped16 r @?= 0
+
+  , testCase "the counts nest" $ do
+      r <- runClipping 1000
+      assertBool "clipped4 exceeded clipped"
+        (C.resClipped4 r <= C.resClipped r)
+      assertBool "clipped16 exceeded clipped4"
+        (C.resClipped16 r <= C.resClipped4 r)
+
+  , testCase "an unclipped run reports zero at every bound" $ do
+      r <- runFlatPass
+      C.resClipped r   @?= 0
+      C.resClipped4 r  @?= 0
+      C.resClipped16 r @?= 0
   ]
+
+-- Clipping fixture: the target writes its input to an IORef and the
+-- meter reads it back, so a sample value /is/ the reading. Class A
+-- always writes 100; class B writes 200 through warmup (every
+-- |d| = 100, pinning the bound at 2 * p99(|d|) = 200) and @big@
+-- thereafter. Choosing @big@ places the main-loop |d| relative to
+-- c = 200, 4c = 800, and 16c = 3200.
+runClipping :: Word64 -> IO C.Result
+runClipping big = do
+  ref <- newIORef (0 :: Word64)
+  ctr <- newIORef (0 :: Int)
+  let leakMeter = C.Meter $ \k act ->
+        let go 0 = pure ()
+            go i = act >> go (i - 1)
+        in  go k >> readIORef ref
+      warmupPairs = 20
+      hyp = C.Hypothesis
+        { C.target  = writeIORef ref
+        , C.prepare = pure ()
+        , C.sampleA = pure 100
+        , C.sampleB = do
+            n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
+            pure $! if n < warmupPairs
+                      then 200
+                      else big
+        }
+      c = C.defaultConfig
+        { C.cfgAlpha  = 1.0e-3
+        , C.cfgBudget = 50
+        , C.cfgWarmup = warmupPairs
+        , C.cfgBatch  = 1
+        }
+  C.runCT leakMeter c hyp
 
 -- deterministic constant-mean bulk shift, seeded for reproducibility.
 -- Reused as a "reliably-rejects" fixture across diagnose / rendering
@@ -752,7 +888,7 @@ isHighClipRate _                  = False
 
 diagnoseTests :: TestTree
 diagnoseTests = testGroup "diagnose" [
-    testCase "sign-only leak -> RejectionDriver ShapeLeak" $ do
+    testCase "equal-mean shape leak -> a shape driver, not bulk" $ do
       ref <- newIORef (0 :: Word64)
       ctr <- newIORef (0 :: Int)
       let leakMeter = C.Meter $ \k act ->
@@ -761,6 +897,7 @@ diagnoseTests = testGroup "diagnose" [
             in  go k >> readIORef ref
           hyp = C.Hypothesis
             { C.target  = writeIORef ref
+            , C.prepare = pure ()
             , C.sampleA = do
                 n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
                 pure $! if n `mod` 4 == 0 then 97 else 101
@@ -775,11 +912,20 @@ diagnoseTests = testGroup "diagnose" [
             }
       r <- C.runCT leakMeter c hyp
       case r of
-        C.Reject{} ->
+        C.Reject{} -> do
           let advs = C.diagnose r
-          in  assertBool
-                ("expected RejectionDriver ShapeLeak in " ++ show advs)
-                (C.RejectionDriver C.ShapeLeak `elem` advs)
+              -- class A averages 100, as class B always does, so no
+              -- mean shift exists for the magnitude channel to find.
+              -- The leak lives in the shape, which both the sign and
+              -- the CDF-indicator channels can see; which of the two
+              -- dominates depends on where the pooled cut points
+              -- land, so accept either.
+              shapeDriven = C.RejectionDriver C.ShapeLeak `elem` advs
+                         || C.RejectionDriver C.CdfShift  `elem` advs
+          assertBool ("expected a shape driver in " ++ show advs)
+            shapeDriven
+          assertBool "sign component saw no evidence at all"
+            (C.resPeakSign r > 0)
         C.Pass{} -> assertFailure "shape leak fixture did not reject"
 
   , testCase "bulk leak -> some RejectionDriver" $ do
@@ -802,32 +948,33 @@ diagnoseTests = testGroup "diagnose" [
         C.Reject{} -> assertFailure "flat meter unexpectedly rejected"
 
   , testCase "heavy clipping -> HighClipRate advisory" $ do
-      ref <- newIORef (0 :: Word64)
-      ctr <- newIORef (0 :: Int)
-      let leakMeter = C.Meter $ \k act ->
-            let go 0 = pure ()
-                go i = act >> go (i - 1)
-            in  go k >> readIORef ref
-          warmupPairs = 20
-          hyp = C.Hypothesis
-            { C.target  = writeIORef ref
-            , C.sampleA = pure 100
-            , C.sampleB = do
-                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
-                pure $! if n < warmupPairs
-                          then 200
-                          else 1000000
-            }
-          c = C.defaultConfig
-            { C.cfgAlpha  = 1.0e-3
-            , C.cfgBudget = 50
-            , C.cfgWarmup = warmupPairs
-            , C.cfgBatch  = 1
-            }
-      r <- C.runCT leakMeter c hyp
+      r <- runClipping 1000000
       let advs = C.diagnose r
       assertBool ("expected HighClipRate in " ++ show advs)
         (any isHighClipRate advs)
+
+  , testCase "HighClipRate carries the rate at all three bounds" $ do
+      r <- runClipping 1000000
+      case [ cr | C.HighClipRate cr <- C.diagnose r ] of
+        []       -> assertFailure "no HighClipRate advisory"
+        (cr : _) -> do
+          assertBool ("expected a positive tight rate: " ++ show cr)
+            (C.clipTight cr > 0.05)
+          -- this fixture clips past 16c, so every rate is equal
+          C.clipWide cr   @?= C.clipTight cr
+          C.clipWidest cr @?= C.clipTight cr
+
+  , testCase "HighClipRate separates a starved component from a \
+             \truncated interval" $ do
+      r <- runClipping 1000
+      case [ cr | C.HighClipRate cr <- C.diagnose r ] of
+        []       -> assertFailure "no HighClipRate advisory"
+        (cr : _) -> do
+          assertBool ("expected a positive tight rate: " ++ show cr)
+            (C.clipTight cr > 0.05)
+          -- the tight component is starved, but resEffect's own
+          -- input never hit its bound
+          C.clipWidest cr @?= 0
   ]
 
 renderingTests :: TestTree
@@ -857,6 +1004,8 @@ renderingTests = testGroup "summary / resultToJSON" [
         , "\"pvalue\":"
         , "\"effect\":"
         , "\"clipped\":"
+        , "\"clipped4\":"
+        , "\"clipped16\":"
         , "\"bound\":"
         , "\"peaks\":"
         , "\"sign\":"
@@ -873,6 +1022,30 @@ renderingTests = testGroup "summary / resultToJSON" [
         ("\"verdict\":\"REJECT\"" `isInfixOf` j)
       assertBool ("expected RejectionDriver in " ++ j)
         ("RejectionDriver" `isInfixOf` j)
+
+  , testCase "a HighClipRate advisory serialises all three rates" $ do
+      r <- runClipping 1000000
+      let j = R.resultToJSON r
+      mapM_ (\k -> assertBool ("expected " ++ k ++ " in " ++ j)
+                              (k `isInfixOf` j))
+        [ "\"clipFraction\":", "\"clipFraction4\":", "\"clipFraction16\":" ]
+
+  , testCase "clipText stays terse when only the tight bound clipped" $ do
+      -- main-loop |d| = 400: past c = 200, under 4c = 800
+      r <- runClipping 500
+      let t = R.clipText r
+      assertBool ("expected a clipped= field, got: " ++ t)
+        ("clipped=" `isPrefixOf` t)
+      assertBool ("expected no wider-bound annotation, got: " ++ t)
+        (not ("16c" `isInfixOf` t))
+
+  , testCase "clipText names the wider bounds once they clip" $ do
+      r <- runClipping 1000000
+      let t = R.clipText r
+      assertBool ("expected a 4c annotation, got: " ++ t)
+        ("4c" `isInfixOf` t)
+      assertBool ("expected a 16c annotation, got: " ++ t)
+        ("16c" `isInfixOf` t)
   ]
 
 calibReportTests :: TestTree
@@ -890,8 +1063,167 @@ calibReportTests = testGroup "calibrateBatchReport" [
       -- exactly at batch 1024.
       map fst (C.crProbes rep) @?= [1, 4, 16, 64, 256, 1024]
 
-  , testCase "unresolvable meter -> capHit True, batch 1" $ do
+  , testCase "records the noise floor at the selected batch" $ do
+      rep <- C.calibrateBatchReport (linMeter 64) noopHyp
+      -- linMeter is deterministic (reading = batch * 64), so the
+      -- median at the selected batch 1024 is exactly the calibration
+      -- target and the IQR is zero.
+      C.crNoise rep @?= Just (C.Noise 65536 0)
+
+  , testCase "unresolvable meter -> capHit True, batch 1, no noise" $ do
       rep <- C.calibrateBatchReport (linMeter 0) noopHyp
       C.crBatch rep @?= 1
       C.crCapHit rep @?= True
+      C.crNoise rep @?= Nothing
   ]
+
+envTests :: TestTree
+envTests = testGroup "captureEnv" [
+    testCase "captures platform identity" $ do
+      e <- E.captureEnv
+      E.envOs e @?= Info.os
+      E.envArch e @?= Info.arch
+      assertBool "cores >= 1" (E.envCores e >= 1)
+      assertBool "kernel present" (E.envKernel e /= Nothing)
+      assertBool "time present" (E.envTime e /= Nothing)
+
+  , testCase "load averages are nonnegative when present" $ do
+      e <- E.captureEnv
+      case E.envLoad e of
+        Nothing            -> pure ()
+        Just (l1, l5, l15) ->
+          assertBool "loads >= 0" (l1 >= 0 && l5 >= 0 && l15 >= 0)
+  ]
+
+reportJSONTests :: TestTree
+reportJSONTests = testGroup "reportJSON" [
+    testCase "surfaces env and per-case noise" $ do
+      r   <- C.runCT (constMeter 100) testConfig noopHyp
+      env <- E.captureEnv
+      let hdr = Rep.ReportHeader
+            { Rep.rhMeter     = "wall"
+            , Rep.rhConfig    = testConfig
+            , Rep.rhSeed      = Nothing
+            , Rep.rhTarget    = Just "test"
+            , Rep.rhNote      = Nothing
+            , Rep.rhEnv       = Just env
+            , Rep.rhPerCaseBatch = False
+            }
+          cr = Rep.CaseReport
+            { Rep.crName        = "case"
+            , Rep.crResult      = r
+            , Rep.crAttribution = Nothing
+            , Rep.crBatch       = Just 3
+            , Rep.crNoise       = Just (C.Noise 100 5)
+            , Rep.crTrace       = Nothing
+            }
+          j = Rep.reportJSON hdr [cr]
+      assertBool ("expected env block in " ++ j)
+        ("\"env\":{\"os\":" `isInfixOf` j)
+      assertBool ("expected cores in " ++ j)
+        ("\"cores\":" `isInfixOf` j)
+      assertBool ("expected noise in " ++ j)
+        ("\"noise\":{\"med\":100,\"iqr\":5}" `isInfixOf` j)
+
+  , testCase "omits env and noise when absent" $ do
+      r <- C.runCT (constMeter 100) testConfig noopHyp
+      let hdr = Rep.ReportHeader
+            { Rep.rhMeter     = "wall"
+            , Rep.rhConfig    = testConfig
+            , Rep.rhSeed      = Nothing
+            , Rep.rhTarget    = Nothing
+            , Rep.rhNote      = Nothing
+            , Rep.rhEnv       = Nothing
+            , Rep.rhPerCaseBatch = False
+            }
+          cr = Rep.CaseReport "case" r Nothing Nothing Nothing Nothing
+          j  = Rep.reportJSON hdr [cr]
+      assertBool ("unexpected env block in " ++ j)
+        (not ("\"env\":" `isInfixOf` j))
+      assertBool ("unexpected noise in " ++ j)
+        (not ("\"noise\":" `isInfixOf` j))
+  ]
+
+-- manifest parsing -----------------------------------------------------------
+
+manifestTests :: TestTree
+manifestTests = testGroup "manifest" [
+    testCase "directives, cases, comments, and inheritance" $ do
+      let src = unlines
+            [ "# a battery"
+            , "meter          cycles"
+            , "alpha          1e-6"
+            , "budget         20000"
+            , "warmup         500   # trailing comment"
+            , "target-prefix  censor_target_"
+            , "workspace      128"
+            , ""
+            , "case mul   secret=0:32"
+            , "case sign  workspace=96 secret=0:32 public=32:32"
+            ]
+      case M.parseManifest src of
+        Left err -> assertFailure ("unexpected parse error: " ++ err)
+        Right mf -> do
+          let d = M.mfDefaults mf
+          M.dfMeter  d @?= Just "cycles"
+          M.dfBudget d @?= Just 20000
+          M.dfWarmup d @?= Just 500
+          case M.mfCases mf of
+            [a, b] -> do
+              -- order preserved, prefix applied, workspace inherited
+              M.mcName      a @?= "mul"
+              M.mcTarget    a @?= "censor_target_mul"
+              M.mcWorkspace a @?= 128
+              M.mcSecret    a @?= [M.Range 0 32]
+              M.mcPublic    a @?= []
+              -- per-case workspace overrides the run-wide default
+              M.mcName      b @?= "sign"
+              M.mcWorkspace b @?= 96
+              M.mcPublic    b @?= [M.Range 32 32]
+            cs -> assertFailure ("expected 2 cases, got " ++ show (length cs))
+
+  , testCase "replicates and explicit target override the defaults" $ do
+      let src = unlines
+            [ "workspace 64"
+            , "case k secret=0:8 replicates=3 target=raw_sym batch=auto"
+            ]
+      case M.parseManifest src of
+        Left err -> assertFailure ("unexpected parse error: " ++ err)
+        Right mf -> case M.mfCases mf of
+          [c] -> do
+            M.mcReplicates c @?= 3
+            M.mcTarget     c @?= "raw_sym"
+            M.mcBatch      c @?= Just M.BatchAuto
+          cs -> assertFailure ("expected 1 case, got " ++ show (length cs))
+
+    -- Every rejection below is a manifest that would otherwise run
+    -- and produce a confidently wrong report.
+  , testCase "a case with no secret range is rejected" $
+      assertLeft "no fix-vs-random axis without a secret"
+        (M.parseManifest "workspace 32\ncase k\n")
+
+  , testCase "a case with no workspace is rejected" $
+      assertLeft "workspace must be set somewhere"
+        (M.parseManifest "case k secret=0:8\n")
+
+  , testCase "a range overflowing the workspace is rejected" $
+      assertLeft "range past the end of the workspace"
+        (M.parseManifest "workspace 16\ncase k secret=0:32\n")
+
+  , testCase "an empty manifest is rejected" $
+      assertLeft "no cases declared"
+        (M.parseManifest "# nothing here\nworkspace 32\n")
+
+  , testCase "unknown keys are rejected, with the line number" $ do
+      case M.parseManifest "workspace 32\ncase k secret=0:8 wat=1\n" of
+        Right _  -> assertFailure "expected a parse failure"
+        Left err -> do
+          assertBool ("no line number in " ++ show err)
+            ("line 2" `isInfixOf` err)
+          assertBool ("key not named in " ++ show err)
+            ("wat" `isInfixOf` err)
+  ]
+  where
+    assertLeft what r = case r of
+      Left _  -> pure ()
+      Right _ -> assertFailure ("expected rejection: " ++ what)

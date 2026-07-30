@@ -23,8 +23,6 @@ module Censor.Runner (
   , Trace(..)
   , record
   , thin
-  , renderTrace
-  , renderTracesJSON
 
     -- * Batteries
   , Case(..)
@@ -36,7 +34,9 @@ module Censor.Runner (
 
     -- * Verdicts and rendering
   , verdictName
+  , shapeName
   , summary
+  , clipText
   , resultToJSON
   ) where
 
@@ -44,6 +44,7 @@ import Control.Exception (try)
 import Control.Monad (forM)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.List (intercalate)
+import Numeric (showHex)
 import System.Exit (die)
 import System.IO (hFlush, stdout)
 import Text.Printf (printf)
@@ -129,44 +130,6 @@ thin frs =
              || frPair fr == m
   in  filter keep frs
 
--- | Render a t'Trace' as a JSON object (the frame array is 'thin'ned).
---   Each trace entry is @[pair, logW, logWSup, lo, hi]@.
-renderTrace :: Trace -> String
-renderTrace t = concat
-  [ "{\"name\":",    jstr (traceName t)
-  , ",\"meter\":",   jstr (traceMeter t)
-  , ",\"verdict\":", jstr (verdictName r)
-  , ",\"pairs\":",   show (resPairs r)
-  , printf ",\"pvalue\":%.6g" (resPValue r)
-  , printf ",\"bound\":%.6g"  (resBound r)
-  , printf ",\"effect\":[%.1f,%.1f]" (fst (resEffect r)) (snd (resEffect r))
-  , ",\"trace\":["
-  , intercalate "," (map frameJSON (thin (traceFrames t)))
-  , "]}"
-  ]
-  where
-    r = traceResult t
-    frameJSON fr = printf "[%d,%.4f,%.4f,%.1f,%.1f]"
-      (frPair fr) (frLogW fr) (frLogWSup fr) (frLo fr) (frHi fr)
-
-jstr :: String -> String
-jstr s = "\"" ++ s ++ "\""
-
--- | Wrap a battery of recorded 'Trace's in the plot-artifact JSON
---   envelope used by the ppad plotting frontends:
---
---   > {"meter":..., "alpha":..., "thresh":..., "cases":[<renderTrace> ...]}
---
---   @thresh@ is @log(1 \/ alpha)@ — the log e-value rejection level
---   the plot renders as a horizontal line.
-renderTracesJSON :: String -> Double -> [Trace] -> String
-renderTracesJSON mname alpha traces = concat
-  [ "{\"meter\":\"", mname, "\""
-  , printf ",\"alpha\":%.1g"  alpha
-  , printf ",\"thresh\":%.6f" (log (1 / alpha))
-  , ",\"cases\":[", intercalate "," (map renderTrace traces), "]}"
-  ]
-
 -- batteries -------------------------------------------------------------------
 
 -- | A named hypothesis to run. The hypothesis is built in @IO@ so each
@@ -193,11 +156,11 @@ runBattery meter cfg cs = forM cs $ \(Case name mkH) -> do
   pure (name, r, ma)
 
 attribLabel :: Attribution -> String
-attribLabel a = case a of
-  TargetLeak           -> "target leak"
-  SampleAAsymmetry{}   -> "sampleA asymmetry"
-  SampleBAsymmetry{}   -> "sampleB asymmetry"
-  PervasiveAsymmetry{} -> "harness asymmetry"
+attribLabel a = case attVerdict a of
+  ControlsPass         -> "controls pass"
+  SampleAAsymmetry     -> "sampleA asymmetry"
+  SampleBAsymmetry     -> "sampleB asymmetry"
+  PervasiveAsymmetry   -> "harness asymmetry"
 
 -- sweeps ----------------------------------------------------------------------
 
@@ -240,9 +203,8 @@ summary :: Result -> String
 summary r =
   let !effLo = fst (resEffect r)
       !effHi = snd (resEffect r)
-      base = printf "peakLogW=%.2f effect=[%.1f,%.1f] clipped=%d/%d"
-               (resPeakLogW r) effLo effHi
-               (resClipped r) (resPairs r)
+      base = printf "peakLogW=%.2f effect=[%.1f,%.1f] %s"
+               (resPeakLogW r) effLo effHi (clipText r)
   in  case r of
         Reject{} ->
           printf "REJECT after %d pairs; driver=%s %s p=%.2g"
@@ -252,10 +214,26 @@ summary r =
           printf "PASS at %d pairs; %s"
             (resPairs r) (base :: String)
 
+-- | Render a t'Result'\'s clipping as one field. The tight count is
+--   always shown; the wider bounds are appended only when clipping
+--   actually reached them, so the common case stays as terse as it
+--   was and a run whose effect interval saw truncated input says so.
+--
+--   > clipped=6/342
+--   > clipped=129/138 (4c 44, 16c 3)
+clipText :: Result -> String
+clipText r
+  | resClipped4 r == 0 && resClipped16 r == 0 = tight
+  | otherwise = tight ++ printf " (4c %d, 16c %d)"
+      (resClipped4 r) (resClipped16 r)
+  where
+    tight = printf "clipped=%d/%d" (resClipped r) (resPairs r) :: String
+
 -- | Serialise a t'Result' as a stable JSON object. Includes verdict,
 --   pairs, mixture peak log e-value, anytime-valid p-value, effect
---   interval, clip count, warmup bound, per-component peaks, and the
---   'diagnose' advisories.
+--   interval, clip counts at each of the three magnitude bounds,
+--   warmup bound, per-component peaks, and the 'diagnose'
+--   advisories.
 --
 --   The object is a single line; pipe multiple runs into a
 --   line-oriented store and diff or filter with @jq@.
@@ -268,12 +246,19 @@ resultToJSON r = concat
   , printf ",\"effect\":[%.6g,%.6g]"
       (fst (resEffect r)) (snd (resEffect r))
   , ",\"clipped\":",    show (resClipped r)
+  , ",\"clipped4\":",   show (resClipped4 r)
+  , ",\"clipped16\":",  show (resClipped16 r)
   , printf ",\"bound\":%.6g" (resBound r)
+  , ",\"seed\":",       jstr ("0x" ++ showHex (resSeed r) "")
+  , ",\"cutPoints\":["
+  , intercalate "," (map (printf "%.6g") (resCutPoints r))
+  , "]"
   , ",\"peaks\":{"
   ,       printf "\"sign\":%.6g"    (resPeakSign r)
   , printf ",\"magn\":%.6g"         (resPeakMagn r)
   , printf ",\"magn4\":%.6g"        (resPeakMagn4 r)
   , printf ",\"magn16\":%.6g"       (resPeakMagn16 r)
+  , printf ",\"cdf\":%.6g"          (resPeakCdf r)
   , "}"
   , ",\"advisories\":["
   , intercalate "," (map advisoryJSON (diagnose r))
@@ -282,8 +267,10 @@ resultToJSON r = concat
 
 advisoryJSON :: Advisory -> String
 advisoryJSON a = case a of
-  HighClipRate f -> printf
-    "{\"kind\":\"HighClipRate\",\"clipFraction\":%.4g}" f
+  HighClipRate cr -> printf
+    ("{\"kind\":\"HighClipRate\",\"clipFraction\":%.4g"
+      ++ ",\"clipFraction4\":%.4g,\"clipFraction16\":%.4g}")
+    (clipTight cr) (clipWide cr) (clipWidest cr)
   LowPower h -> printf
     "{\"kind\":\"LowPower\",\"widthOverBound\":%.4g}" h
   RejectionDriver s -> concat
@@ -291,9 +278,15 @@ advisoryJSON a = case a of
     , jstr (shapeName s), "}"
     ]
 
+-- | The short label for a 'LeakShape', as it appears on a case row
+--   and in the @advisories@ block of 'resultToJSON'.
 shapeName :: LeakShape -> String
 shapeName s = case s of
   BulkShift   -> "bulk"
   ShapeLeak   -> "shape"
   RareOutlier -> "tail"
+  CdfShift    -> "cdf"
   MixedShape  -> "mixed"
+
+jstr :: String -> String
+jstr s = "\"" ++ s ++ "\""

@@ -285,6 +285,7 @@ posMACEq = do
     { C.target = \(!a, !b) -> do
         !_ <- evaluate (a == b)
         pure ()
+    , C.prepare = pure ()
     , C.sampleA = do
         -- A: two byte-equal but structurally distinct tags, built
         -- by hmac'ing the same key/message twice in the same
@@ -340,6 +341,7 @@ posMACPos = do
     { C.target  = \(!a, !b) -> do
         !_ <- evaluate (a == b)
         pure ()
+    , C.prepare = pure ()
     , C.sampleA = mk 0
     , C.sampleB = mk 31
     }
@@ -380,6 +382,7 @@ negLeakyPopcount = do
     { C.target  = \(!w) -> do
         let !n = B.popCount (W.from_vartime w :: Integer)
         replicateM_ (10 * n) (evaluate ())
+    , C.prepare = pure ()
     , C.sampleA = pure fixZero
     , C.sampleB = randomWider g
     }
@@ -394,6 +397,7 @@ negFromVartime = do
     { C.target  = \(!w) -> do
         !_ <- evaluate (W.from_vartime w :: Integer)
         pure ()
+    , C.prepare = pure ()
     , C.sampleA = pure fixZero
     , C.sampleB = randomWider g
     }
@@ -443,7 +447,7 @@ runCase emit meter c name mkH = do
       hD <- mkH
       Just <$> C.attribute meter c hD
     C.Pass{}   -> pure Nothing
-  emit (R.CaseReport name r mat)
+  emit (R.CaseReport name r mat Nothing Nothing Nothing)
 
 -- run every case under the given meter.
 runAll
@@ -468,41 +472,63 @@ runAll tex meter emit = do
   rc "negative: deliberately leaky popcount-driven loop"         negLeakyPopcount
   rc "negative: Wider.from_vartime (Integer conversion)"         negFromVartime
 
--- Record the three secp positive controls under the wall meter with
--- per-pair trajectories, and write a consistent samples.jsonl +
--- trace.jsonl pair (censor/report-v1 + the measure trace format) into
--- DIR. Reuses the suite's exact hypotheses; only the meter output
--- differs. Used to backfill a bundle's censor tree with trace data.
+-- Record the three secp positive controls under the wall meter
+-- with per-pair trajectories, and write the resulting battery as a
+-- single censor/report-v2 JSON object to PATH. Reuses the suite's
+-- exact hypotheses; rejections are auto-attributed, matching
+-- runTraceSuite's behaviour.
+--
+-- These are pure Haskell targets, so the batch is pinned at 1
+-- ('R.SingleShot'): repeating @evaluate (f x)@ on one pre-drawn
+-- sample forces the thunk once and no-ops thereafter, so a
+-- calibrated batch would count no-ops as work.
 backfillSecpTraces :: Secp.Context -> FilePath -> IO ()
-backfillSecpTraces tex dir = do
-  -- the three hypotheses have distinct payload types, so they cannot
-  -- share a list; record each individually (Trace is monomorphic).
-  t1 <- rec "positive: Secp.mul_wnaf (wNAF point multiplication)" (posMulWNAF tex)
-  t2 <- rec "positive: Secp.sign_schnorr' (BIP0340)"    (posSignSchnorr tex)
-  t3 <- rec "positive: Secp.sign_ecdsa' (RFC6979)"      (posSignECDSA tex)
-  let traces = [t1, t2, t3]
-      meta = "{\"schema\":\"censor/report-v1\",\"tool\":\"censor\","
-          ++ "\"version\":\"0.3.1\",\"meter\":\"wall\","
-          ++ "\"config\":{\"alpha\":0.001,\"budget\":50000,\"batch\":1,"
-          ++ "\"warmup\":500},\"seed\":\"0x5eed5eed5eed5eed\","
-          ++ "\"target\":\"dudect-style fix-vs-random against ppad-secp256k1\","
-          ++ "\"note\":\"secp targets only, batch=1, recorded with --trace\","
-          ++ "\"kind\":\"meta\"}"
-      caseLine t = "{\"name\":" ++ show (CR.traceName t)
-                ++ ",\"result\":" ++ CR.resultToJSON (CR.traceResult t)
-                ++ ",\"kind\":\"case\"}"
-  writeFile (dir ++ "/samples.jsonl") (unlines (meta : map caseLine traces))
-  writeFile (dir ++ "/trace.jsonl")  (unlines (map CR.renderTrace traces))
-  putStrLn ("wrote " ++ show (length traces) ++ " secp cases + traces to " ++ dir)
-  where
-    rec nm mkH = mkH >>= CR.record nm "wall" C.wallClock cfgHeavy
+backfillSecpTraces tex path = do
+  let mkCR name mkH = do
+        h <- mkH
+        let b = 1
+            c = cfgHeavy { C.cfgBatch = b }
+        t <- CR.record name "wall" C.wallClock c h
+        let r = CR.traceResult t
+        mat <- case r of
+          C.Reject{} -> do
+            hAtt <- mkH
+            Just <$> C.attribute C.wallClock c hAtt
+          C.Pass{}   -> pure Nothing
+        pure R.CaseReport
+          { R.crName        = name
+          , R.crResult      = r
+          , R.crAttribution = mat
+          , R.crBatch       = Just b
+          , R.crNoise       = Nothing
+          , R.crTrace       = Just (CR.traceFrames t)
+          }
+  cr1 <- mkCR "positive: Secp.mul_wnaf (wNAF point multiplication)"
+              (posMulWNAF tex)
+  cr2 <- mkCR "positive: Secp.sign_schnorr' (BIP0340)"
+              (posSignSchnorr tex)
+  cr3 <- mkCR "positive: Secp.sign_ecdsa' (RFC6979)"
+              (posSignECDSA tex)
+  env <- R.captureEnv
+  let cases = [cr1, cr2, cr3]
+      hdr = R.ReportHeader
+        { R.rhMeter     = "wall"
+        , R.rhConfig    = cfgHeavy
+        , R.rhSeed      = Just fixedSeed
+        , R.rhTarget    = Just "ppad-secp256k1 secret-scalar surfaces"
+        , R.rhNote      = Just "pure targets: batch=1"
+        , R.rhEnv       = Just env
+        , R.rhPerCaseBatch = False
+        }
+  writeFile path (R.reportJSON hdr cases)
+  putStrLn ("wrote " ++ show (length cases) ++ " secp cases to " ++ path)
 
 main :: IO ()
 main = do
   args <- getArgs
   let !tex = Secp.precompute
   case args of
-    ("backfill-trace" : dir : _) -> backfillSecpTraces tex dir
+    ("backfill-trace" : path : _) -> backfillSecpTraces tex path
     _ -> R.runSuite R.Suite
       { R.suTarget = "dudect-style fix-vs-random against ppad-* and controls"
       , R.suConfig = cfg
