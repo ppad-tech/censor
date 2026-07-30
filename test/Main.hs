@@ -785,45 +785,82 @@ smokeCalibrationTests = testGroup "smoke calibration" [
                   ++ show rate ++ ")")
                  (rate >= 0.90)
 
--- clip count rises when |ta - tb| exceeds the warmup-derived bound.
--- fixture: target writes its input to an IORef, meter reads it;
--- class A always writes 100, class B writes 200 during warmup (|d|
--- = 100, so bound = 2 * 100 = 200) and 1000000 during the main loop
--- (|d| ~= 999900, well above the bound).
 clipCountTests :: TestTree
 clipCountTests = testGroup "clip counts" [
     testCase "clip count rises when |d| exceeds bound" $ do
-      ref <- newIORef (0 :: Word64)
-      ctr <- newIORef (0 :: Int)
-      let leakMeter = C.Meter $ \k act ->
-            let go 0 = pure ()
-                go i = act >> go (i - 1)
-            in  go k >> readIORef ref
-          warmupPairs = 20
-          hyp = C.Hypothesis
-            { C.target  = writeIORef ref
-            , C.prepare = pure ()
-            , C.sampleA = pure 100
-            , C.sampleB = do
-                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
-                pure $! if n < warmupPairs
-                          then 200
-                          else 1000000
-            }
-          c = C.defaultConfig
-            { C.cfgAlpha  = 1.0e-3
-            , C.cfgBudget = 50
-            , C.cfgWarmup = warmupPairs
-            , C.cfgBatch  = 1
-            }
-      r <- C.runCT leakMeter c hyp
+      r <- runClipping 1000000
       -- every warmup |d| is exactly 100, so the bound is pinned at
       -- 2 * p99(|d|) = 200.
       C.resBound r @?= 200
       assertBool ("expected nonzero clip count, got "
                   ++ show (C.resClipped r))
                  (C.resClipped r > 0)
+
+  , testCase "|d| past every bound is counted at every bound" $ do
+      -- main-loop |d| ~= 999900, past c = 200, 4c = 800, 16c = 3200
+      r <- runClipping 1000000
+      C.resClipped4 r  @?= C.resClipped r
+      C.resClipped16 r @?= C.resClipped r
+
+  , testCase "|d| between 4c and 16c leaves the widest count at 0" $ do
+      -- main-loop |d| = 900: past c and 4c, under 16c. The tight
+      -- components are starved while the effect interval's own
+      -- input is untouched -- the two readings the counts separate.
+      r <- runClipping 1000
+      assertBool ("expected clipping at c, got "
+                  ++ show (C.resClipped r))
+                 (C.resClipped r > 0)
+      assertBool ("expected clipping at 4c, got "
+                  ++ show (C.resClipped4 r))
+                 (C.resClipped4 r > 0)
+      C.resClipped16 r @?= 0
+
+  , testCase "the counts nest" $ do
+      r <- runClipping 1000
+      assertBool "clipped4 exceeded clipped"
+        (C.resClipped4 r <= C.resClipped r)
+      assertBool "clipped16 exceeded clipped4"
+        (C.resClipped16 r <= C.resClipped4 r)
+
+  , testCase "an unclipped run reports zero at every bound" $ do
+      r <- runFlatPass
+      C.resClipped r   @?= 0
+      C.resClipped4 r  @?= 0
+      C.resClipped16 r @?= 0
   ]
+
+-- Clipping fixture: the target writes its input to an IORef and the
+-- meter reads it back, so a sample value /is/ the reading. Class A
+-- always writes 100; class B writes 200 through warmup (every
+-- |d| = 100, pinning the bound at 2 * p99(|d|) = 200) and @big@
+-- thereafter. Choosing @big@ places the main-loop |d| relative to
+-- c = 200, 4c = 800, and 16c = 3200.
+runClipping :: Word64 -> IO C.Result
+runClipping big = do
+  ref <- newIORef (0 :: Word64)
+  ctr <- newIORef (0 :: Int)
+  let leakMeter = C.Meter $ \k act ->
+        let go 0 = pure ()
+            go i = act >> go (i - 1)
+        in  go k >> readIORef ref
+      warmupPairs = 20
+      hyp = C.Hypothesis
+        { C.target  = writeIORef ref
+        , C.prepare = pure ()
+        , C.sampleA = pure 100
+        , C.sampleB = do
+            n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
+            pure $! if n < warmupPairs
+                      then 200
+                      else big
+        }
+      c = C.defaultConfig
+        { C.cfgAlpha  = 1.0e-3
+        , C.cfgBudget = 50
+        , C.cfgWarmup = warmupPairs
+        , C.cfgBatch  = 1
+        }
+  C.runCT leakMeter c hyp
 
 -- deterministic constant-mean bulk shift, seeded for reproducibility.
 -- Reused as a "reliably-rejects" fixture across diagnose / rendering
@@ -911,33 +948,33 @@ diagnoseTests = testGroup "diagnose" [
         C.Reject{} -> assertFailure "flat meter unexpectedly rejected"
 
   , testCase "heavy clipping -> HighClipRate advisory" $ do
-      ref <- newIORef (0 :: Word64)
-      ctr <- newIORef (0 :: Int)
-      let leakMeter = C.Meter $ \k act ->
-            let go 0 = pure ()
-                go i = act >> go (i - 1)
-            in  go k >> readIORef ref
-          warmupPairs = 20
-          hyp = C.Hypothesis
-            { C.target  = writeIORef ref
-            , C.prepare = pure ()
-            , C.sampleA = pure 100
-            , C.sampleB = do
-                n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
-                pure $! if n < warmupPairs
-                          then 200
-                          else 1000000
-            }
-          c = C.defaultConfig
-            { C.cfgAlpha  = 1.0e-3
-            , C.cfgBudget = 50
-            , C.cfgWarmup = warmupPairs
-            , C.cfgBatch  = 1
-            }
-      r <- C.runCT leakMeter c hyp
+      r <- runClipping 1000000
       let advs = C.diagnose r
       assertBool ("expected HighClipRate in " ++ show advs)
         (any isHighClipRate advs)
+
+  , testCase "HighClipRate carries the rate at all three bounds" $ do
+      r <- runClipping 1000000
+      case [ cr | C.HighClipRate cr <- C.diagnose r ] of
+        []       -> assertFailure "no HighClipRate advisory"
+        (cr : _) -> do
+          assertBool ("expected a positive tight rate: " ++ show cr)
+            (C.clipTight cr > 0.05)
+          -- this fixture clips past 16c, so every rate is equal
+          C.clipWide cr   @?= C.clipTight cr
+          C.clipWidest cr @?= C.clipTight cr
+
+  , testCase "HighClipRate separates a starved component from a \
+             \truncated interval" $ do
+      r <- runClipping 1000
+      case [ cr | C.HighClipRate cr <- C.diagnose r ] of
+        []       -> assertFailure "no HighClipRate advisory"
+        (cr : _) -> do
+          assertBool ("expected a positive tight rate: " ++ show cr)
+            (C.clipTight cr > 0.05)
+          -- the tight component is starved, but resEffect's own
+          -- input never hit its bound
+          C.clipWidest cr @?= 0
   ]
 
 renderingTests :: TestTree
@@ -967,6 +1004,8 @@ renderingTests = testGroup "summary / resultToJSON" [
         , "\"pvalue\":"
         , "\"effect\":"
         , "\"clipped\":"
+        , "\"clipped4\":"
+        , "\"clipped16\":"
         , "\"bound\":"
         , "\"peaks\":"
         , "\"sign\":"
@@ -983,6 +1022,30 @@ renderingTests = testGroup "summary / resultToJSON" [
         ("\"verdict\":\"REJECT\"" `isInfixOf` j)
       assertBool ("expected RejectionDriver in " ++ j)
         ("RejectionDriver" `isInfixOf` j)
+
+  , testCase "a HighClipRate advisory serialises all three rates" $ do
+      r <- runClipping 1000000
+      let j = R.resultToJSON r
+      mapM_ (\k -> assertBool ("expected " ++ k ++ " in " ++ j)
+                              (k `isInfixOf` j))
+        [ "\"clipFraction\":", "\"clipFraction4\":", "\"clipFraction16\":" ]
+
+  , testCase "clipText stays terse when only the tight bound clipped" $ do
+      -- main-loop |d| = 400: past c = 200, under 4c = 800
+      r <- runClipping 500
+      let t = R.clipText r
+      assertBool ("expected a clipped= field, got: " ++ t)
+        ("clipped=" `isPrefixOf` t)
+      assertBool ("expected no wider-bound annotation, got: " ++ t)
+        (not ("16c" `isInfixOf` t))
+
+  , testCase "clipText names the wider bounds once they clip" $ do
+      r <- runClipping 1000000
+      let t = R.clipText r
+      assertBool ("expected a 4c annotation, got: " ++ t)
+        ("4c" `isInfixOf` t)
+      assertBool ("expected a 16c annotation, got: " ++ t)
+        ("16c" `isInfixOf` t)
   ]
 
 calibReportTests :: TestTree

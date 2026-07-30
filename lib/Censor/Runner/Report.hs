@@ -88,7 +88,7 @@ import Censor hiding (crBatch, crNoise)
 import qualified Censor as C
 import Censor.Runner
   ( traceResult, traceFrames, record, thin
-  , verdictName, shapeName, resultToJSON, withMeterArg
+  , verdictName, shapeName, clipText, resultToJSON, withMeterArg
   )
 import Censor.Runner.Env (Env(..), captureEnv)
 import qualified Paths_ppad_censor as Paths
@@ -390,8 +390,8 @@ prettyCase rc cr = do
   case r of
     Reject{} -> do
       let (elo, ehi) = resEffect r
-          detail = printf "effect=[%.1f,%.1f]  clipped=%d/%d"
-                     elo ehi (resClipped r) (resPairs r) :: String
+          detail = printf "effect=[%.1f,%.1f]  %s"
+                     elo ehi (clipText r) :: String
       putStrLn $ replicate detailIndent ' ' ++ cDim rc detail
     Pass{} -> pure ()
   case calibText cr of
@@ -642,8 +642,8 @@ plainCase _ cr = do
   case r of
     Reject{} -> do
       let (elo, ehi) = resEffect r
-      putStrLn $ printf "  effect=[%.1f,%.1f] clipped=%d/%d"
-        elo ehi (resClipped r) (resPairs r)
+      putStrLn $ printf "  effect=[%.1f,%.1f] %s"
+        elo ehi (clipText r)
     Pass{} -> pure ()
   case calibText cr of
     Just t  -> putStrLn ("  " ++ t)

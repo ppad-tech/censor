@@ -1,6 +1,27 @@
 # Changelog
 
 - 0.4.0 (unreleased)
+  * Clipping is counted at each of the hedge's three magnitude
+    bounds, not only the tight one. `Result` gains `resClipped4`
+    (`|d| > 4c`) and `resClipped16` (`|d| > 16c`) alongside
+    `resClipped`, and `resultToJSON` emits them as `clipped4` and
+    `clipped16`. The counts nest, and they qualify different
+    quantities: `resClipped` bounds what the tight magnitude
+    component could see, while `resClipped16` qualifies
+    `resEffect`, `16c` being the bound the effect interval's own
+    input is clipped to. A consumer quoting that interval
+    previously had no way to tell a starved tight component from a
+    truncated interval.
+
+    `HighClipRate` accordingly carries a `ClipRates` record with
+    the fraction at all three bounds rather than a bare `Double`
+    (`clipFraction`, `clipFraction4`, `clipFraction16` in JSON).
+    Its trigger is unchanged — the counts nest, so the tight rate
+    is the largest of the three and one trigger covers the
+    profile. `Censor.Runner` exports `clipText`, which renders the
+    profile for the one-line and terminal reports and stays as
+    terse as it was when nothing clipped past `c`.
+
   * The null is now stated, and tested, as conditional
     *exchangeability* of the measured pair `(ta, tb)` rather than
     symmetry of `d = ta - tb`. Every hedge component is an

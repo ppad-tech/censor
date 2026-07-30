@@ -36,6 +36,7 @@ module Censor.Runner (
   , verdictName
   , shapeName
   , summary
+  , clipText
   , resultToJSON
   ) where
 
@@ -202,9 +203,8 @@ summary :: Result -> String
 summary r =
   let !effLo = fst (resEffect r)
       !effHi = snd (resEffect r)
-      base = printf "peakLogW=%.2f effect=[%.1f,%.1f] clipped=%d/%d"
-               (resPeakLogW r) effLo effHi
-               (resClipped r) (resPairs r)
+      base = printf "peakLogW=%.2f effect=[%.1f,%.1f] %s"
+               (resPeakLogW r) effLo effHi (clipText r)
   in  case r of
         Reject{} ->
           printf "REJECT after %d pairs; driver=%s %s p=%.2g"
@@ -214,10 +214,26 @@ summary r =
           printf "PASS at %d pairs; %s"
             (resPairs r) (base :: String)
 
+-- | Render a t'Result'\'s clipping as one field. The tight count is
+--   always shown; the wider bounds are appended only when clipping
+--   actually reached them, so the common case stays as terse as it
+--   was and a run whose effect interval saw truncated input says so.
+--
+--   > clipped=6/342
+--   > clipped=129/138 (4c 44, 16c 3)
+clipText :: Result -> String
+clipText r
+  | resClipped4 r == 0 && resClipped16 r == 0 = tight
+  | otherwise = tight ++ printf " (4c %d, 16c %d)"
+      (resClipped4 r) (resClipped16 r)
+  where
+    tight = printf "clipped=%d/%d" (resClipped r) (resPairs r) :: String
+
 -- | Serialise a t'Result' as a stable JSON object. Includes verdict,
 --   pairs, mixture peak log e-value, anytime-valid p-value, effect
---   interval, clip count, warmup bound, per-component peaks, and the
---   'diagnose' advisories.
+--   interval, clip counts at each of the three magnitude bounds,
+--   warmup bound, per-component peaks, and the 'diagnose'
+--   advisories.
 --
 --   The object is a single line; pipe multiple runs into a
 --   line-oriented store and diff or filter with @jq@.
@@ -230,6 +246,8 @@ resultToJSON r = concat
   , printf ",\"effect\":[%.6g,%.6g]"
       (fst (resEffect r)) (snd (resEffect r))
   , ",\"clipped\":",    show (resClipped r)
+  , ",\"clipped4\":",   show (resClipped4 r)
+  , ",\"clipped16\":",  show (resClipped16 r)
   , printf ",\"bound\":%.6g" (resBound r)
   , ",\"seed\":",       jstr ("0x" ++ showHex (resSeed r) "")
   , ",\"cutPoints\":["
@@ -249,8 +267,10 @@ resultToJSON r = concat
 
 advisoryJSON :: Advisory -> String
 advisoryJSON a = case a of
-  HighClipRate f -> printf
-    "{\"kind\":\"HighClipRate\",\"clipFraction\":%.4g}" f
+  HighClipRate cr -> printf
+    ("{\"kind\":\"HighClipRate\",\"clipFraction\":%.4g"
+      ++ ",\"clipFraction4\":%.4g,\"clipFraction16\":%.4g}")
+    (clipTight cr) (clipWide cr) (clipWidest cr)
   LowPower h -> printf
     "{\"kind\":\"LowPower\",\"widthOverBound\":%.4g}" h
   RejectionDriver s -> concat

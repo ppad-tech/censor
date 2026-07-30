@@ -66,6 +66,7 @@ module Censor (
 
     -- * Advisories
   , Advisory(..)
+  , ClipRates(..)
   , LeakShape(..)
   , diagnose
   , leakShape
@@ -335,12 +336,21 @@ defaultConfig = Config
 --   stopping time, and at or below @alpha@ exactly when the verdict
 --   is 'Reject'.
 --
---   A clip count that is a substantial fraction of 'resPairs'
---   indicates the warmup bound 'resBound' was too tight for the
---   tight component; raise 'cfgWarmup', enlarge 'cfgBatch', or
---   treat the run with suspicion (the wider (@4c@, @16c@) magnitude
---   components in the hedge still see the pre-clip @d@, but their
---   @lambda_max@ is proportionally smaller).
+--   Clipping is counted at each of the hedge's three magnitude
+--   bounds: 'resClipped' at @c@, 'resClipped4' at @4c@,
+--   'resClipped16' at @16c@. The counts nest by construction
+--   (@resClipped >= resClipped4 >= resClipped16@), and each
+--   qualifies a different quantity. A 'resClipped' that is a
+--   substantial fraction of 'resPairs' indicates the warmup bound
+--   'resBound' was too tight for the tight component; raise
+--   'cfgWarmup', enlarge 'cfgBatch', or treat the run with
+--   suspicion (the wider components still see the pre-clip @d@, but
+--   their @lambda_max@ is proportionally smaller).
+--   'resClipped16' is the count that qualifies 'resEffect', @16c@
+--   being the bound the interval's own input is clipped to. A run
+--   can starve the tight component heavily while leaving the
+--   interval's input untouched, so the two readings should not be
+--   conflated.
 --
 --   The per-component peaks identify which evidence channel drove a
 --   rejection: 'resPeakSign' growing points at an asymmetry of @d@
@@ -378,10 +388,22 @@ data Result
         --   true mean under the same time-uniform guarantee, since
         --   the sequence's intervals are nested. The interval's
         --   coverage and the verdict's type-I control are separate
-        --   marginal guarantees, each at 'cfgAlpha'.
+        --   marginal guarantees, each at 'cfgAlpha'. It is an
+        --   interval for the mean of the /clipped/ difference:
+        --   'resClipped16' says on how many pairs that clipping
+        --   actually bit, and so how far the interval can be read
+        --   as bounding the unrestricted effect.
       , resClipped    :: {-# UNPACK #-} !Int
         -- ^ pairs whose @|d|@ exceeded 'resBound' and was clipped
         --   before reaching the tight magnitude component.
+      , resClipped4   :: {-# UNPACK #-} !Int
+        -- ^ pairs whose @|d|@ exceeded @4 * 'resBound'@, clipped
+        --   before reaching the middle magnitude component.
+      , resClipped16  :: {-# UNPACK #-} !Int
+        -- ^ pairs whose @|d|@ exceeded @16 * 'resBound'@, clipped
+        --   before reaching the widest magnitude component and the
+        --   effect-estimating confidence sequence behind
+        --   'resEffect'.
       , resBound      :: {-# UNPACK #-} !Double
         -- ^ the tight clip bound @c@ estimated during warmup
         --   (@max 1 (2 * p99(|d|))@).
@@ -412,6 +434,8 @@ data Result
       , resPValue     :: {-# UNPACK #-} !Double
       , resEffect     :: !(Double, Double)
       , resClipped    :: {-# UNPACK #-} !Int
+      , resClipped4   :: {-# UNPACK #-} !Int
+      , resClipped16  :: {-# UNPACK #-} !Int
       , resBound      :: {-# UNPACK #-} !Double
       , resPeakSign   :: {-# UNPACK #-} !Double
       , resPeakMagn   :: {-# UNPACK #-} !Double
@@ -428,12 +452,21 @@ data Result
 --   the report and points to the corresponding remedy in prose you
 --   would otherwise have to reconstruct from the 'Result' docstring.
 data Advisory
-  = HighClipRate !Double
+  = HighClipRate !ClipRates
     -- ^ Fraction @resClipped \/ resPairs@ exceeded @0.05@: the tight
     --   magnitude component saw its input truncated on a nontrivial
     --   share of pairs, hurting power against small consistent
     --   shifts. Raise 'cfgWarmup' for a better @c@ estimate, enlarge
     --   'cfgBatch', or treat the run with suspicion.
+    --
+    --   The payload carries the rate at all three bounds, not only
+    --   the one that tripped the advisory, because they say
+    --   different things: 'clipTight' bounds what the tight
+    --   component could see, 'clipWidest' how much of the effect
+    --   interval's own input was truncated. A rate that is high at
+    --   @c@ and zero at @16c@ is a power problem with an intact
+    --   interval; one that is nonzero at @16c@ means 'resEffect'
+    --   describes a genuinely truncated variable.
   | LowPower !Double
     -- ^ On 'Pass' only: the effect-interval half-width exceeded the
     --   tight clip bound @c@ (the ratio is carried here, in units of
@@ -444,6 +477,20 @@ data Advisory
     -- ^ On 'Reject' only: which channel of the K=4 hedge drove the
     --   detection, i.e. what shape of leak was found.
   deriving (Eq, Show)
+
+-- | The share of pairs clipped at each of the hedge's three
+--   magnitude bounds, carried by 'HighClipRate'. Nested by
+--   construction: @clipWidest <= clipWide <= clipTight@, since
+--   @|d| > 16c@ implies @|d| > 4c@ implies @|d| > c@.
+data ClipRates = ClipRates
+  { clipTight  :: {-# UNPACK #-} !Double
+    -- ^ fraction of pairs with @|d| > c@.
+  , clipWide   :: {-# UNPACK #-} !Double
+    -- ^ fraction of pairs with @|d| > 4c@.
+  , clipWidest :: {-# UNPACK #-} !Double
+    -- ^ fraction of pairs with @|d| > 16c@ — the bound behind
+    --   'resEffect'.
+  } deriving (Eq, Show)
 
 -- | The qualitative shape of a leak, inferred from the per-component
 --   peaks of the hedge. Reported by 'RejectionDriver' and available
@@ -478,11 +525,14 @@ data LeakShape
 --   so downstream tooling can pattern-match by position.
 diagnose :: Result -> [Advisory]
 diagnose r =
-  let !frac = if resPairs r == 0
-                then 0
-                else fromIntegral (resClipped r)
-                     / (fromIntegral (resPairs r) :: Double)
-      clipA = [HighClipRate frac | frac > 0.05]
+  let rate n = if resPairs r == 0
+                 then 0
+                 else fromIntegral n / (fromIntegral (resPairs r) :: Double)
+      !rates = ClipRates (rate (resClipped r)) (rate (resClipped4 r))
+                         (rate (resClipped16 r))
+      -- the counts nest, so the tight rate is the largest of the
+      -- three and one trigger covers the profile
+      clipA = [HighClipRate rates | clipTight rates > 0.05]
       powerA = case r of
         Pass{} ->
           let !hw = (snd (resEffect r) - fst (resEffect r)) / 2
@@ -633,11 +683,11 @@ runCTWith meter cfg hyp observe = do
     Left  e -> throwIO (InvalidEprocConfig e)
     Right x -> pure x
   let !mixc = hcMix hcfg
-      finish ctor !n !st !iv !nclip = ctor
+      finish ctor !n !st !iv !cl = ctor
         n (EPMix.log_evalue_sup mixc (hsMix st))
         (EPMix.p_value mixc (hsMix st))
         iv
-        nclip c
+        (clAtC cl) (clAt4C cl) (clAt16C cl) c
         (EPSign.log_evalue_sup (hsSign st))
         (EPMagn.log_evalue_sup (hsMagn1 st))
         (EPMagn.log_evalue_sup (hsMagn2 st))
@@ -650,9 +700,9 @@ runCTWith meter cfg hyp observe = do
       -- and the last resolvable interval (nested within all earlier
       -- ones, so still covered by the time-uniform guarantee) is
       -- what finish reports.
-      go !n !st !cs !iv !rng !nclip
+      go !n !st !cs !iv !rng !cl
         | n >= cfgBudget cfg =
-            pure $! finish Pass n st iv nclip
+            pure $! finish Pass n st iv cl
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!ta, !tb) <- runPair meter cfg hyp flipOrder
@@ -665,7 +715,7 @@ runCTWith meter cfg hyp observe = do
                 !iv'     = case EPCS.interval cscfg cs' of
                              Just x  -> x
                              Nothing -> iv
-                !nclip'  = if clipped then nclip + 1 else nclip
+                !cl'     = bumpClips hcfg cl d
                 !n'      = n + 1
             -- lazy: the frame's fields (mixture reads) are forced
             -- only if the observer forces them, so runCT pays nothing.
@@ -674,10 +724,10 @@ runCTWith meter cfg hyp observe = do
                        (EPMix.log_evalue_sup mixc (hsMix st'))
                        (fst iv') (snd iv') clipped)
             case EPMix.decide mixc (hsMix st') of
-              EPMix.Reject -> pure $! finish Reject n' st' iv' nclip'
-              _            -> go n' st' cs' iv' rng' nclip'
+              EPMix.Reject -> pure $! finish Reject n' st' iv' cl'
+              _            -> go n' st' cs' iv' rng' cl'
       !iv0 = (negate (hcC3 hcfg), hcC3 hcfg)
-  go 0 (initialHedge hcfg) (EPCS.initial cscfg) iv0 mSeed 0
+  go 0 (initialHedge hcfg) (EPCS.initial cscfg) iv0 mSeed noClips
 
 -- | Run a constant-time test. See 'runCTWith' for the phase-by-phase
 --   description; this is that driver with the per-pair observer
@@ -1094,6 +1144,28 @@ mkHedgeCfg !alpha !c qs = do
     , hcC2    = c2
     , hcC3    = c3
     }
+
+-- Running clipped-pair tallies at the hedge's three magnitude
+-- bounds. Kept as one strict record rather than three accumulator
+-- arguments so the driver loop's arity does not grow with them.
+data Clips = Clips
+  { clAtC   :: {-# UNPACK #-} !Int
+  , clAt4C  :: {-# UNPACK #-} !Int
+  , clAt16C :: {-# UNPACK #-} !Int
+  }
+
+noClips :: Clips
+noClips = Clips 0 0 0
+
+-- Tally one pair's difference against each bound. Sits outside the
+-- timed region, alongside the e-process updates.
+bumpClips :: HedgeCfg -> Clips -> Double -> Clips
+bumpClips HedgeCfg{..} (Clips !a !b !c) !d = Clips
+  (bump hcC1 a) (bump hcC2 b) (bump hcC3 c)
+  where
+    !m = abs d
+    bump !lim !n = if m > lim then n + 1 else n
+{-# INLINE bumpClips #-}
 
 initialHedge :: HedgeCfg -> HedgeState
 initialHedge HedgeCfg{..} = HedgeState

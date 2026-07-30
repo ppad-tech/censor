@@ -80,20 +80,33 @@ verdict is `Reject`, and valid at any data-dependent stopping
 time), an effect-size interval (`resEffect`, below), per-component
 peak log e-values (`resPeakSign`, `resPeakMagn`, `resPeakMagn4`,
 `resPeakMagn16`), the warmup-estimated clip bound (`resBound`), and
-a clip count (`resClipped`): the number of pairs whose absolute
-difference `|d| = |ta - tb|` exceeded the bound and was truncated
-before being fed to the tight magnitude component. Clipping
-preserves the type-I error guarantee but reduces power against
-tail-shifting leaks, so a clip count that is a substantial fraction
-of `resPairs` indicates the warmup bound was too tight. Raise
-`cfgWarmup`, enlarge `cfgBatch`, or treat the run with suspicion.
+a clip count at each of the three magnitude bounds (`resClipped` at
+`c`, `resClipped4` at `4c`, `resClipped16` at `16c`): the number of
+pairs whose absolute difference `|d| = |ta - tb|` exceeded that
+bound and was truncated before being fed to the component behind
+it. Clipping preserves the type-I error guarantee but reduces power
+against tail-shifting leaks, so a `resClipped` that is a
+substantial fraction of `resPairs` indicates the warmup bound was
+too tight. Raise `cfgWarmup`, enlarge `cfgBatch`, or treat the run
+with suspicion.
+
+The counts nest — `|d| > 16c` implies `|d| > 4c` implies `|d| > c`
+— and they answer different questions. `resClipped` bounds what the
+tight component could see; `resClipped16` is the count that
+qualifies `resEffect`, `16c` being the bound the effect interval's
+own input is clipped to. A run can starve the tight component
+heavily and leave the interval's input untouched, so a consumer
+quoting the interval should read `resClipped16`, not `resClipped`.
 
 ### Effect size
 
 `resEffect` is an anytime-valid `1 - alpha` confidence interval
 (the hedged-capital construction of Waudby-Smith & Ramdas, via
 `Numeric.Eproc.ConfSeq`) for the mean of `d` clipped to the widest
-hedge interval `[-16c, 16c]`, in meter units per batch. On a truly
+hedge interval `[-16c, 16c]` — `resClipped16` says on how many
+pairs that clipping actually bit, and so how far the interval can
+be read as bounding the unrestricted effect — in meter units per
+batch. On a truly
 constant-time target it covers zero; on a `Pass` at full budget it
 bounds the size of any undetected effect ("no leak found, and the
 mean effect is within ±X"). On a `Reject` it covers the true
