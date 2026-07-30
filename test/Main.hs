@@ -1007,6 +1007,8 @@ renderingTests = testGroup "summary / resultToJSON" [
         , "\"clipped4\":"
         , "\"clipped16\":"
         , "\"bound\":"
+        , "\"orderSeed\":"
+        , "\"cdf\":"
         , "\"peaks\":"
         , "\"sign\":"
         , "\"magn\":"
@@ -1075,6 +1077,36 @@ calibReportTests = testGroup "calibrateBatchReport" [
       C.crBatch rep @?= 1
       C.crCapHit rep @?= True
       C.crNoise rep @?= Nothing
+
+    -- the driver runs 'prepare' before every measured pair, so a
+    -- sampler may depend on it. Calibrating without it would probe
+    -- uninitialised state.
+  , testCase "runs the prologue before drawing its probe sample" $ do
+      ref  <- newIORef (0 :: Int)
+      seen <- newIORef (0 :: Int)
+      let hyp = C.Hypothesis
+            { C.target  = \_ -> pure ()
+            , C.prepare = modifyIORef' ref (+ 1)
+            , C.sampleA = readIORef ref >>= writeIORef seen
+            , C.sampleB = pure ()
+            }
+      _ <- C.calibrateBatchReport (linMeter 64) hyp
+      n <- readIORef seen
+      assertBool "sampleA ran before any prepare" (n > 0)
+
+  , testCase "consumes exactly one prologue and one class-A draw" $ do
+      preps <- newIORef (0 :: Int)
+      draws <- newIORef (0 :: Int)
+      let hyp = C.Hypothesis
+            { C.target  = \_ -> pure ()
+            , C.prepare = modifyIORef' preps (+ 1)
+            , C.sampleA = modifyIORef' draws (+ 1)
+            , C.sampleB = pure ()
+            }
+      -- six probes, but the sample is drawn once and reused.
+      _ <- C.calibrateBatchReport (linMeter 64) hyp
+      readIORef preps >>= (@?= 1)
+      readIORef draws >>= (@?= 1)
   ]
 
 envTests :: TestTree
@@ -1213,6 +1245,38 @@ manifestTests = testGroup "manifest" [
   , testCase "an empty manifest is rejected" $
       assertLeft "no cases declared"
         (M.parseManifest "# nothing here\nworkspace 32\n")
+
+  , testCase "context ranges parse and stay distinct from public" $ do
+      let src = unlines
+            [ "workspace 128"
+            , "case ecdh secret=0:32 context=32:64 public=96:16"
+            ]
+      case M.parseManifest src of
+        Left err -> assertFailure ("unexpected parse error: " ++ err)
+        Right mf -> case M.mfCases mf of
+          [c] -> do
+            M.mcSecret  c @?= [M.Range 0 32]
+            M.mcContext c @?= [M.Range 32 64]
+            M.mcPublic  c @?= [M.Range 96 16]
+          cs -> assertFailure ("expected 1 case, got " ++ show (length cs))
+
+    -- the secret overlay lands after the context one, so an overlap
+    -- means the range is not actually shared across the pair.
+  , testCase "a context range overlapping a secret is rejected" $
+      assertLeft "context cannot overlap a secret range"
+        (M.parseManifest "workspace 64\ncase k secret=0:32 context=16:8\n")
+
+  , testCase "family-alpha parses on and off" $ do
+      let parse v = fmap (M.dfFamilyAlpha . M.mfDefaults)
+            (M.parseManifest
+              ("workspace 32\nfamily-alpha " ++ v ++ "\ncase k secret=0:8\n"))
+      parse "on"  @?= Right (Just True)
+      parse "off" @?= Right (Just False)
+
+  , testCase "a non-boolean family-alpha is rejected" $
+      assertLeft "family-alpha takes on or off"
+        (M.parseManifest
+          "workspace 32\nfamily-alpha 0.5\ncase k secret=0:8\n")
 
   , testCase "unknown keys are rejected, with the line number" $ do
       case M.parseManifest "workspace 32\ncase k secret=0:8 wat=1\n" of

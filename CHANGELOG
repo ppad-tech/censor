@@ -1,5 +1,74 @@
 # Changelog
 
+- 0.5.0 (unreleased)
+  * **`prepare` now runs during batch calibration.** `runPair` has
+    always run the prologue before either sampler, but
+    `calibrateBatchReport` drew its probe sample without one, so a
+    hypothesis whose sampler depends on its prologue calibrated
+    against uninitialised state. It now runs exactly one prologue
+    and one class-A draw.
+
+  * **Calibration and the main run no longer share a hypothesis
+    instance.** `runTraceSuite` and the manifest runner built one
+    instance, calibrated it, then ran it — advancing its sampler
+    state, and contradicting `TraceCase`'s documented contract that
+    the builder is re-executed per phase. Each phase now gets its
+    own instance, as documented.
+
+  * **Paired public context reaches the manifest.** A new
+    `context=off:len` case range (and matching `--context` flag) is
+    redrawn once per *pair* and written into both classes, so a
+    manifest can express a shared fresh public input. Previously
+    `fixVsRandomCtx` existed in the library with no route to it from
+    the foreign runner, whose public ranges were pinned for the
+    whole cell. A context range overlapping a secret range is
+    rejected: the secret overlay lands second, so the range would
+    not actually be shared.
+
+  * **Replicate identity is stable.** `replicates=1` and
+    `replicates=2` now agree on cell #1: replicate #1 keeps the
+    unreplicated case's seed, so adding coverage extends a battery
+    instead of redefining the cell already in it. Each case also
+    mixes its own name into the run-wide seed, so cases no longer
+    all begin from identical fixed bytes.
+
+  * **`family-alpha on`** runs each of the M expanded cells at
+    `alpha / M`, making the battery a test at `alpha` family-wise
+    rather than only reporting the union bound. Off by default.
+
+  * **Report schema is now `censor/report-v3`.** The two seeds are
+    named apart — `samplerSeed` in the header, `orderSeed` in each
+    case result — where v2 called both `seed`. The resolved order
+    seed also appears in pretty and plain output, not only in JSON;
+    it is what replays a case, and a reader should not have to
+    reach for the JSON to find it.
+
+  * **The CDF channel reports per-cut-point detail.** `resCutPoints`
+    and the `resPeakCdf` field are replaced by `resCdf ::
+    [(Double, Double)]`, pairing each cut point with its
+    component's peak log e-value, so a CDF-driven rejection names
+    the threshold that found the difference. `resPeakCdf` remains,
+    as a function taking the maximum. In JSON, `cutPoints` becomes
+    `cdf` as `[cut point, peak]` pairs.
+
+  * Documentation corrections. The null is *stronger* than "the two
+    classes induce the same timing distribution", not weaker:
+    exchangeability implies equal marginals, and equal marginals
+    alone do not imply an exchangeable joint law. What delivers it
+    is the randomised order, given class-blind within-pair nuisance
+    dynamics — an assumption now stated rather than elided. The
+    order-bit seed's OS-entropy source is documented as the normal
+    path, not an unconditional one, since `/dev/urandom` failure
+    falls back to the monotonic clock. Stale `K=4` claims are
+    corrected to `K = 4 + n`.
+
+  * `censor-viz` uses `runCTWith` instead of a hand-rolled copy of
+    the driver, which had drifted: it omitted the CDF components and
+    the prologue while claiming to mirror `runCT`. The AEAD suite
+    draws its public input (nonce, AAD, plaintext) once per pair and
+    shares it across both classes, rather than independently per
+    class.
+
 - 0.4.0 (2026-07-30)
   * The null is now stated, and tested, as conditional
     *exchangeability* of the measured pair `(ta, tb)` rather than

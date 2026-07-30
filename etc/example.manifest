@@ -3,7 +3,7 @@
 #   censor libfoo.dylib --manifest etc/example.manifest \
 #     --format json --attribute
 #
-# One dlopen, one censor/report-v2 object covering every case.
+# One dlopen, one censor/report-v3 object covering every case.
 
 # Run-wide directives. A command-line flag overrides any of these.
 meter          wall
@@ -14,17 +14,28 @@ batch          1
 target-prefix  censor_target_
 workspace      128
 
-# The sampler seed. The A/B order-bit seed is deliberately NOT set
-# here: it defaults to fresh OS entropy per run, and the value it
-# resolves to is reported, so an audit is randomised yet replayable.
+# The sampler seed. Each case mixes its own name into this, so cases
+# do not all start from identical bytes. The A/B order-bit seed is
+# deliberately NOT set here: it defaults to fresh OS entropy per run,
+# and the value it resolves to is reported per case, so an audit is
+# randomised yet replayable.
 seed           0xc0ffee5eed0beef7
+
+# 'on' runs each of the M expanded cells at alpha/M, so the battery
+# as a whole tests at alpha family-wise rather than merely reporting
+# the union bound. Off by default: it costs power per cell.
+family-alpha   off
 
 # case NAME [key=value ...]
 #
 #   secret=off:len   pinned in class A only -- the fix-vs-random axis
 #                    (repeatable; at least one is required)
-#   public=off:len   pinned in BOTH classes -- shared public context
+#   public=off:len   pinned in BOTH classes for the whole run
 #                    (repeatable)
+#   context=off:len  redrawn once per PAIR, written into both classes
+#                    -- one shared fresh public input per pair, so
+#                    the tested axis is secret dependence given
+#                    identical public bytes (repeatable)
 #   workspace=N      override the run-wide workspace
 #   target=SYMBOL    override target-prefix ++ NAME
 #   batch=N|auto     override the run-wide batch
@@ -32,7 +43,7 @@ seed           0xc0ffee5eed0beef7
 #   label=TEXT       display name, if it should differ from NAME
 
 case mul       secret=0:32
-case ecdh      secret=0:32 public=32:64
+case ecdh      secret=0:32 context=32:64
 case sign      workspace=96 secret=0:32 public=32:32
 
 # One fixed secret answers "does *this* secret time differently from
