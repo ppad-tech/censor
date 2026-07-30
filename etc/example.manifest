@@ -40,7 +40,14 @@ family-alpha   off
 #   target=SYMBOL    override target-prefix ++ NAME
 #   batch=N|auto     override the run-wide batch
 #   replicates=N     run N independent fixed secrets as N cases
-#   label=TEXT       display name, if it should differ from NAME
+#   label=TEXT       display name, if it should differ from NAME.
+#                    Presentation only: NAME remains the case's
+#                    identity, so relabelling never changes the
+#                    secret a case draws.
+#
+# The three range roles must not overlap: a byte is pinned in class A,
+# pinned in both, refreshed per pair in both, or freshly random in
+# each -- never two of those at once.
 
 case mul       secret=0:32
 case ecdh      secret=0:32 context=32:64

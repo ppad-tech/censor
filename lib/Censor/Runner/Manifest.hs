@@ -51,6 +51,9 @@ module Censor.Runner.Manifest (
     -- * Parsing
   , parseManifest
   , emptyDefaults
+
+    -- * Layout validation
+  , checkLayout
   ) where
 
 import Data.Char (isSpace)
@@ -113,7 +116,17 @@ emptyDefaults = Defaults
 -- | One case: a display name, the symbol to resolve, the workspace
 --   layout, and how many times to replicate it.
 data ManifestCase = ManifestCase
-  { mcName       :: !String
+  { mcId         :: !String
+    -- ^ the case token as written in the manifest, before any
+    --   @label=@ override. This is the case's /identity/: the
+    --   runner mixes it into the run-wide seed to give each case
+    --   its own fixed secret.
+    --
+    --   Kept apart from 'mcName' so that renaming a case for
+    --   presentation does not change the experiment it runs.
+  , mcName       :: !String
+    -- ^ the display name: 'mcId', or whatever @label=@ set. Used
+    --   for rendering only.
   , mcTarget     :: !String
   , mcWorkspace  :: !Int
   , mcSecret     :: ![Range]
@@ -236,7 +249,8 @@ parseCase n d toks = case toks of
   [] -> Left (at n "case needs a name")
   (name : kvs) -> do
     let c0 = ManifestCase
-          { mcName       = name
+          { mcId         = name
+          , mcName       = name
           , mcTarget     = maybe "" id (dfPrefix d) ++ name
           , mcWorkspace  = maybe 0 id (dfWorkspace d)
           , mcSecret     = []
@@ -291,22 +305,62 @@ validateCase n c
   | null (mcSecret c) =
       Left (at n ("case " ++ mcName c ++ " declares no secret range; "
                   ++ "there is no fix-vs-random axis without one"))
-  | otherwise = case filter (overflows (mcWorkspace c)) rs of
-      (Range o l : _) ->
-        Left (at n ("case " ++ mcName c ++ " range " ++ show o ++ ":"
-                    ++ show l ++ " overflows its workspace of "
-                    ++ show (mcWorkspace c) ++ " bytes"))
-      [] -> case [ (x, y) | x <- mcContext c, y <- mcSecret c
-                          , overlaps x y ] of
-        -- the secret overlay lands after the context one, so class A
-        -- would keep its fixed secret there while class B kept the
-        -- context bytes: the range is no longer shared, and the
-        -- declaration cannot mean what it says.
-        ((Range o l, _) : _) ->
-          Left (at n ("case " ++ mcName c ++ " context " ++ show o
-                      ++ ":" ++ show l ++ " overlaps a secret range"))
-        [] -> Right c
+  | otherwise =
+      case checkLayout (mcWorkspace c) (mcSecret c) (mcPublic c)
+             (mcContext c) of
+        Just msg -> Left (at n ("case " ++ mcName c ++ " " ++ msg))
+        Nothing  -> Right c
+
+-- | Check a workspace layout: every declared range must fit inside
+--   the workspace, and the three roles must be pairwise disjoint.
+--   'Nothing' when the layout is sound; otherwise a message naming
+--   the first problem, for the caller to place in context.
+--
+--   Both entry points validate through this — a manifest case and
+--   the single-case command line — so the two cannot drift on what
+--   they accept.
+--
+--   Overlapping roles are rejected rather than resolved by
+--   precedence. A byte is pinned in class A only ('mcSecret'),
+--   pinned in both for the run ('mcPublic'), refreshed per pair in
+--   both ('mcContext'), or freshly random in each class; asking for
+--   two of those at once has no coherent reading, and whichever
+--   overlay happened to land last would silently pick one. That is
+--   how a public range could mask the context it overlapped,
+--   turning a per-pair refresh into a constant without saying so.
+checkLayout
+  :: Int      -- ^ workspace bytes
+  -> [Range]  -- ^ secret ranges
+  -> [Range]  -- ^ public ranges
+  -> [Range]  -- ^ context ranges
+  -> Maybe String
+checkLayout ws secrets publics contexts =
+  case filter (overflows . snd) tagged of
+    ((role, r) : _) -> Just
+      (role ++ " " ++ showRange r ++ " overflows the workspace of "
+       ++ show ws ++ " bytes")
+    [] -> case clashes of
+      ((ra, r, rb) : _) -> Just
+        (ra ++ " " ++ showRange r ++ " overlaps a " ++ rb ++ " range")
+      [] -> Nothing
   where
-    rs = mcSecret c ++ mcPublic c ++ mcContext c
-    overflows ws (Range o l) = o + l > ws
-    overlaps (Range o1 l1) (Range o2 l2) = o1 < o2 + l2 && o2 < o1 + l1
+    tagged = concat
+      [ [("secret",  r) | r <- secrets]
+      , [("public",  r) | r <- publics]
+      , [("context", r) | r <- contexts]
+      ]
+    clashes =
+      [ (ra, a, rb)
+      | (ra, as, rb, bs) <-
+          [ ("secret",  secrets,  "public",  publics)
+          , ("secret",  secrets,  "context", contexts)
+          , ("context", contexts, "public",  publics)
+          ]
+      , a <- as, b <- bs, overlaps a b
+      ]
+    overflows (Range o l) = o + l > ws
+    overlaps (Range o1 l1) (Range o2 l2) =
+      o1 < o2 + l2 && o2 < o1 + l1
+
+showRange :: Range -> String
+showRange (Range o l) = show o ++ ":" ++ show l

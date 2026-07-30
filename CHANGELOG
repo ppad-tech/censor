@@ -21,9 +21,30 @@
     manifest can express a shared fresh public input. Previously
     `fixVsRandomCtx` existed in the library with no route to it from
     the foreign runner, whose public ranges were pinned for the
-    whole cell. A context range overlapping a secret range is
-    rejected: the secret overlay lands second, so the range would
-    not actually be shared.
+    whole cell.
+
+  * **One layout validator for both entry points.** `checkLayout`
+    requires every range to fit the workspace and the three roles —
+    secret, public, context — to be pairwise disjoint. The manifest
+    and the single-case command line now share it; previously the
+    command line bounds-checked only, so `--secret 0:8 --context
+    0:8` ran a layout the manifest rejected, and the manifest in
+    turn accepted a public range that masked the context it
+    overlapped. A byte belongs to exactly one role, so an overlap
+    has no coherent reading and is an error rather than a
+    precedence question.
+
+  * **`label=` is presentation only.** It set `mcName`, from which
+    the per-case seed was derived, so renaming a case for display
+    silently re-rolled the secret it tested against. `ManifestCase`
+    now carries `mcId` — the case token as written — and seeds
+    derive from that.
+
+  * **The foreign runner no longer strands its buffers.** The three
+    per-hypothesis workspaces were raw `mallocBytes` with no
+    release; phase isolation multiplied that to as many as nine
+    workspaces per cell. They are now `ForeignPtr`s held by the
+    sampler closures, reclaimed with the hypothesis.
 
   * **Replicate identity is stable.** `replicates=1` and
     `replicates=2` now agree on cell #1: replicate #1 keeps the
