@@ -63,6 +63,16 @@
     the whole run (testing one public input). `FFIHypothesis`
     gains the matching `ffiPrepare`.
 
+  * New `Censor.Runner.Manifest` and a `--manifest PATH` mode on the
+    `censor` CLI: a declarative battery of cases, driven by one
+    dlopen and emitted as a single report carrying every case, its
+    controls, the host environment, and the family-wise alpha.
+    Replaces the per-symbol process loop with hand-stitched output,
+    which duplicated the tool version and config in every script.
+    Cases support `replicates=N` to run several independent fixed
+    secrets, since a single pinned secret answers only whether
+    *that* secret times differently from random.
+
   * Report schema bumped to `censor/report-v2`.
 
 - 0.3.1 (2026-07-09)

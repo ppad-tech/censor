@@ -88,7 +88,7 @@ import Censor hiding (crBatch, crNoise)
 import qualified Censor as C
 import Censor.Runner
   ( traceResult, traceFrames, record, thin
-  , verdictName, resultToJSON, withMeterArg
+  , verdictName, shapeName, resultToJSON, withMeterArg
   )
 import Censor.Runner.Env (Env(..), captureEnv)
 import qualified Paths_ppad_censor as Paths
@@ -676,13 +676,6 @@ plainClose _ hdr tl = do
 isReject :: Result -> Bool
 isReject Reject{} = True
 isReject Pass{}   = False
-
-shapeName :: LeakShape -> String
-shapeName s = case s of
-  BulkShift   -> "bulk"
-  ShapeLeak   -> "shape"
-  RareOutlier -> "tail"
-  MixedShape  -> "mixed"
 
 attributionText :: Attribution -> String
 attributionText a = case attVerdict a of

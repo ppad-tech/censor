@@ -12,6 +12,7 @@ import qualified Censor as C
 import qualified Censor.FFI as F
 import qualified Censor.Runner as R
 import qualified Censor.Runner.Env as E
+import qualified Censor.Runner.Manifest as M
 import qualified Censor.Runner.Report as Rep
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Array (peekArray)
@@ -46,14 +47,26 @@ main = defaultMain $ testGroup "ppad-censor" [
   , calibReportTests
   , envTests
   , reportJSONTests
+  , manifestTests
   ]
 
--- Test config tuned for fast feedback: less strict alpha and small
--- budget, since both fixtures produce strong signals (CT: identical
--- work, leaky: 20x work imbalance).
+-- Test config for the wall-clock fixtures: a small budget, since
+-- both produce strong signals (CT: identical work, leaky: 20x work
+-- imbalance).
+--
+-- alpha stays at the library default. A looser one is tempting for
+-- the leaky fixture, which rejects under any alpha worth naming,
+-- but it is the CT fixture that sets the floor: these are real
+-- wall-clock measurements, and on a loaded machine the scheduler
+-- leaves enough residual non-exchangeability to cross a 1e-3
+-- threshold over 5000 pairs. That is censor working, not censor
+-- broken -- but it makes an H_0 assertion depend on ambient load.
+-- Calibration proper belongs to censor-validate and its synthetic
+-- meters; what these two fixtures check is that the wall-clock
+-- meter and driver are wired together at all.
 testConfig :: C.Config
 testConfig = C.defaultConfig
-  { C.cfgAlpha  = 1.0e-3
+  { C.cfgAlpha  = 1.0e-6
   , C.cfgBudget = 5000
   , C.cfgWarmup = 100
   , C.cfgBatch  = 1
@@ -1067,3 +1080,87 @@ reportJSONTests = testGroup "reportJSON" [
       assertBool ("unexpected noise in " ++ j)
         (not ("\"noise\":" `isInfixOf` j))
   ]
+
+-- manifest parsing -----------------------------------------------------------
+
+manifestTests :: TestTree
+manifestTests = testGroup "manifest" [
+    testCase "directives, cases, comments, and inheritance" $ do
+      let src = unlines
+            [ "# a battery"
+            , "meter          cycles"
+            , "alpha          1e-6"
+            , "budget         20000"
+            , "warmup         500   # trailing comment"
+            , "target-prefix  censor_target_"
+            , "workspace      128"
+            , ""
+            , "case mul   secret=0:32"
+            , "case sign  workspace=96 secret=0:32 public=32:32"
+            ]
+      case M.parseManifest src of
+        Left err -> assertFailure ("unexpected parse error: " ++ err)
+        Right mf -> do
+          let d = M.mfDefaults mf
+          M.dfMeter  d @?= Just "cycles"
+          M.dfBudget d @?= Just 20000
+          M.dfWarmup d @?= Just 500
+          case M.mfCases mf of
+            [a, b] -> do
+              -- order preserved, prefix applied, workspace inherited
+              M.mcName      a @?= "mul"
+              M.mcTarget    a @?= "censor_target_mul"
+              M.mcWorkspace a @?= 128
+              M.mcSecret    a @?= [M.Range 0 32]
+              M.mcPublic    a @?= []
+              -- per-case workspace overrides the run-wide default
+              M.mcName      b @?= "sign"
+              M.mcWorkspace b @?= 96
+              M.mcPublic    b @?= [M.Range 32 32]
+            cs -> assertFailure ("expected 2 cases, got " ++ show (length cs))
+
+  , testCase "replicates and explicit target override the defaults" $ do
+      let src = unlines
+            [ "workspace 64"
+            , "case k secret=0:8 replicates=3 target=raw_sym batch=auto"
+            ]
+      case M.parseManifest src of
+        Left err -> assertFailure ("unexpected parse error: " ++ err)
+        Right mf -> case M.mfCases mf of
+          [c] -> do
+            M.mcReplicates c @?= 3
+            M.mcTarget     c @?= "raw_sym"
+            M.mcBatch      c @?= Just M.BatchAuto
+          cs -> assertFailure ("expected 1 case, got " ++ show (length cs))
+
+    -- Every rejection below is a manifest that would otherwise run
+    -- and produce a confidently wrong report.
+  , testCase "a case with no secret range is rejected" $
+      assertLeft "no fix-vs-random axis without a secret"
+        (M.parseManifest "workspace 32\ncase k\n")
+
+  , testCase "a case with no workspace is rejected" $
+      assertLeft "workspace must be set somewhere"
+        (M.parseManifest "case k secret=0:8\n")
+
+  , testCase "a range overflowing the workspace is rejected" $
+      assertLeft "range past the end of the workspace"
+        (M.parseManifest "workspace 16\ncase k secret=0:32\n")
+
+  , testCase "an empty manifest is rejected" $
+      assertLeft "no cases declared"
+        (M.parseManifest "# nothing here\nworkspace 32\n")
+
+  , testCase "unknown keys are rejected, with the line number" $ do
+      case M.parseManifest "workspace 32\ncase k secret=0:8 wat=1\n" of
+        Right _  -> assertFailure "expected a parse failure"
+        Left err -> do
+          assertBool ("no line number in " ++ show err)
+            ("line 2" `isInfixOf` err)
+          assertBool ("key not named in " ++ show err)
+            ("wat" `isInfixOf` err)
+  ]
+  where
+    assertLeft what r = case r of
+      Left _  -> pure ()
+      Right _ -> assertFailure ("expected rejection: " ++ what)

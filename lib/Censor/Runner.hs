@@ -34,6 +34,7 @@ module Censor.Runner (
 
     -- * Verdicts and rendering
   , verdictName
+  , shapeName
   , summary
   , resultToJSON
   ) where
@@ -257,6 +258,8 @@ advisoryJSON a = case a of
     , jstr (shapeName s), "}"
     ]
 
+-- | The short label for a 'LeakShape', as it appears on a case row
+--   and in the @advisories@ block of 'resultToJSON'.
 shapeName :: LeakShape -> String
 shapeName s = case s of
   BulkShift   -> "bulk"

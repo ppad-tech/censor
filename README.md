@@ -191,6 +191,46 @@ The mechanism is a `prepare` field on `Hypothesis` — a per-pair
 prologue run before either sampler and outside the timed region.
 It is `pure ()` for an ordinary hypothesis.
 
+### Battery manifests
+
+Auditing a library one symbol at a time means one `censor` process
+per symbol plus a shell loop to stitch the single-case reports back
+together — which duplicates the tool version and config by hand in
+every script and produces no single artefact covering the battery.
+
+`--manifest` replaces that with a declarative file:
+
+```
+meter          wall
+alpha          1e-6
+budget         20000
+warmup         500
+target-prefix  censor_target_
+workspace      128
+
+case mul   secret=0:32
+case ecdh  secret=0:32 public=32:64
+case inv   secret=0:32 replicates=3
+```
+
+```
+$ censor libfoo.dylib --manifest battery.manifest --attribute
+```
+
+One dlopen, one `censor/report-v2` object containing every case,
+its controls, the host environment, and the family-wise alpha. The
+per-case layout flags (`--workspace`, `--target`, `--secret`,
+`--public`, `--trace`) are rejected in this mode rather than
+silently ignored; run-wide flags still override manifest
+directives. See `etc/example.manifest` for the annotated format.
+
+`replicates=N` runs a case against N independent fixed secrets, as
+N ordinary case rows. A dudect-style cell pins *one* fixed secret,
+so on its own it answers "does this secret time differently from
+random", not "does any secret"; replicating guards against an
+unlucky draw, and each replicate counts toward the family-wise
+alpha as it should.
+
 ### Reproducibility
 
 `cfgSeed :: Maybe Word64` in `Config` controls the per-pair A/B

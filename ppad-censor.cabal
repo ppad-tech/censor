@@ -121,6 +121,7 @@ library
       Censor.Runner
       Censor.Runner.DL
       Censor.Runner.Env
+      Censor.Runner.Manifest
       Censor.Runner.Report
   other-modules:
       Paths_ppad_censor
