@@ -5,6 +5,10 @@
 -- decrypt accept paths, plus a mismatch-position independence probe
 -- of the decrypt reject path.
 --
+-- Every case draws its public input (nonce, AAD, plaintext) once
+-- per pair and shares it across both classes, so the measured
+-- difference is not diluted by message-to-message variation.
+--
 -- Usage: censor-aead [--format pretty|json|plain]
 --                    [wall|instructions|cycles|branches] [OUT.json]
 --
@@ -21,6 +25,7 @@ import qualified Censor.Runner.Report as R
 import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Word (Word64)
 
 fixedSeed :: Word64
@@ -39,24 +44,34 @@ random32, random12 :: C.Rng -> IO BS.ByteString
 random32 g = C.randomBytes g 32
 random12 g = C.randomBytes g 12
 
--- encrypt: fix-vs-random on the key; nonce, AAD, plaintext public.
+-- one pair's shared public input: nonce, AAD, plaintext. Drawn once
+-- per pair by the prologue and handed to both classes, so the only
+-- thing that differs across the pair is the key.
+type Ctx = (BS.ByteString, BS.ByteString, BS.ByteString)
+
+publicCtx :: C.Rng -> IO Ctx
+publicCtx g = do
+  !nonce <- random12 g
+  !aad   <- random32 g
+  !pt    <- C.randomBytes g 256
+  pure (nonce, aad, pt)
+
+-- encrypt: fix-vs-random on the key, conditional on one shared
+-- fresh (nonce, AAD, plaintext) per pair.
 posAeadEncrypt
   :: IO (C.Hypothesis
            (BS.ByteString, BS.ByteString, BS.ByteString, BS.ByteString))
 posAeadEncrypt = do
   g <- C.mkRng fixedSeed
-  C.fixVsRandom
+  C.fixVsRandomCtx
     (\(!key, !nonce, !aad, !pt) -> do
         r <- evaluate (AEAD.encrypt aad key nonce pt)
         case r of
           Right (!_, !_) -> pure ()
           Left _         -> pure ())
     (random32 g)
-    (\key -> do
-        !nonce <- random12 g
-        !aad   <- random32 g
-        !pt    <- C.randomBytes g 256
-        pure (key, nonce, aad, pt))
+    (publicCtx g)
+    (\(!nonce, !aad, !pt) !key -> pure (key, nonce, aad, pt))
 
 -- decrypt accept path: (cip, mac) precomputed at sample time, so
 -- the timed region exercises keystream regen, Poly1305 recompute,
@@ -67,23 +82,21 @@ posAeadDecrypt
            , BS.ByteString, BS.ByteString ))
 posAeadDecrypt = do
   g <- C.mkRng fixedSeed
-  let mkSample !key = do
-        !nonce <- random12 g
-        !aad   <- random32 g
-        !pt    <- C.randomBytes g 256
+  let mkSample (!nonce, !aad, !pt) !key =
         case AEAD.encrypt aad key nonce pt of
           Left _ -> error "censor-aead: encrypt failed during sample setup"
           Right (cip, mac) -> do
             !c <- evaluate cip
             !m <- evaluate mac
             pure (key, nonce, aad, c, m)
-  C.fixVsRandom
+  C.fixVsRandomCtx
     (\(!key, !nonce, !aad, !cip, !mac) -> do
         r <- evaluate (AEAD.decrypt aad key nonce (cip, mac))
         case r of
           Right !_ -> pure ()
           Left _   -> pure ())
     (random32 g)
+    (publicCtx g)
     mkSample
 
 -- flip one byte (XOR 0xff) of a bytestring at the given index, so
@@ -99,8 +112,13 @@ flipByte i bs = BS.pack
 -- (class A at i0, class B at i1) so decrypt rejects; the timed
 -- region runs the full Poly1305 recompute and ct_eq's full-length
 -- scan. Tests that reject timing does not depend on where the first
--- mismatch lies. Both samplers do identical work, differing only
--- in the flip index.
+-- mismatch lies.
+--
+-- The prologue draws one message and encrypts it per pair, so both
+-- classes decrypt the /same/ ciphertext under the same key and
+-- differ in nothing but which tag byte is corrupted. Drawing
+-- independently per class would leave the flip index confounded
+-- with message-to-message variation.
 posAeadDecryptReject
   :: (Int, Int)
   -> IO (C.Hypothesis
@@ -108,24 +126,31 @@ posAeadDecryptReject
            , BS.ByteString, BS.ByteString ))
 posAeadDecryptReject (i0, i1) = do
   g <- C.mkRng fixedSeed
-  let mk pos = do
-        !key   <- random32 g
-        !nonce <- random12 g
-        !aad   <- random32 g
-        !pt    <- C.randomBytes g 256
+  let draw = do
+        !key <- random32 g
+        (!nonce, !aad, !pt) <- publicCtx g
         case AEAD.encrypt aad key nonce pt of
           Left _ -> error "censor-aead: encrypt failed during sample setup"
           Right (cip, mac) -> do
             !c <- evaluate cip
-            !m <- evaluate (flipByte pos mac)
+            !m <- evaluate mac
             pure (key, nonce, aad, c, m)
+  -- seeded with a real draw so the ref is total; 'prepare'
+  -- overwrites it before the first pair is ever measured.
+  ref <- newIORef =<< draw
+  let mk pos = do
+        (!key, !nonce, !aad, !cip, !mac) <- readIORef ref
+        !m <- evaluate (flipByte pos mac)
+        pure (key, nonce, aad, cip, m)
   pure C.Hypothesis
     { C.target  = \(!key, !nonce, !aad, !cip, !mac) -> do
         r <- evaluate (AEAD.decrypt aad key nonce (cip, mac))
         case r of
           Right !_ -> pure ()   -- unreachable: tag is corrupted
           Left _   -> pure ()
-    , C.prepare = pure ()
+    , C.prepare = do
+        !x <- draw
+        writeIORef ref x
     , C.sampleA = mk i0
     , C.sampleB = mk i1
     }

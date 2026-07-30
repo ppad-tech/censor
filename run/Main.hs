@@ -4,6 +4,7 @@
 --
 --   censor <libpath> --workspace BYTES [--target NAME]
 --     [--secret off:len]... [--public off:len]...
+--     [--context off:len]...
 --   censor <libpath> --manifest PATH
 --     [--meter wall|instructions|cycles|branches]
 --     [--alpha FLOAT] [--budget INT] [--warmup INT] [--batch INT]
@@ -26,16 +27,22 @@
 --   * --public off:len  ranges are overwritten in BOTH classes with
 --                       bytes from a shared fixed buffer drawn at
 --                       setup (common public context: message, IV,
---                       modulus, ...).
+--                       modulus, ...), pinned for the whole run.
+--   * --context off:len ranges are overwritten in BOTH classes with
+--                       bytes redrawn once per pair, so the pair
+--                       shares one *fresh* public input. Tests
+--                       secret dependence given identical public
+--                       input, without the nuisance variance an
+--                       independently random public input adds.
 --
 -- Bytes outside any pinned range are random per pair, per class.
 --
 -- --manifest runs a whole battery from a declarative file: one
 -- dlopen, one report carrying every case, its controls, the host
 -- environment, and the family-wise alpha. The per-case layout flags
--- (--workspace/--target/--secret/--public/--trace) are then rejected
--- rather than silently ignored; see Censor.Runner.Manifest for the
--- format.
+-- (--workspace/--target/--secret/--public/--context/--trace) are
+-- then rejected rather than silently ignored; see
+-- Censor.Runner.Manifest for the format.
 
 module Main where
 
@@ -69,6 +76,7 @@ data Args = Args
   , argWorkspace  :: !Int
   , argSecret     :: ![Range]
   , argPublic     :: ![Range]
+  , argContext    :: ![Range]
   , argMeter      :: !(Maybe String)
   , argAlpha      :: !(Maybe Double)
   , argBudget     :: !(Maybe Int)
@@ -88,6 +96,7 @@ data ArgAcc = ArgAcc
   , accWorkspace  :: !(Maybe Int)
   , accSecret     :: ![Range]
   , accPublic     :: ![Range]
+  , accContext    :: ![Range]
   , accMeter      :: !(Maybe String)
   , accAlpha      :: !(Maybe Double)
   , accBudget     :: !(Maybe Int)
@@ -102,8 +111,8 @@ data ArgAcc = ArgAcc
   }
 
 emptyAcc :: ArgAcc
-emptyAcc = ArgAcc Nothing Nothing Nothing [] [] Nothing Nothing Nothing
-  Nothing Nothing Nothing Nothing Nothing Nothing False Nothing
+emptyAcc = ArgAcc Nothing Nothing Nothing [] [] [] Nothing Nothing
+  Nothing Nothing Nothing Nothing Nothing Nothing Nothing False Nothing
 
 -- exit codes ------------------------------------------------------------------
 
@@ -117,6 +126,7 @@ usage :: String
 usage = unlines
   [ "usage: censor <libpath> --workspace BYTES [--target NAME]"
   , "              [--secret off:len]... [--public off:len]..."
+  , "              [--context off:len]..."
   , "              [--meter wall|instructions|cycles|branches]"
   , "              [--alpha FLOAT] [--budget INT] [--warmup INT]"
   , "              [--batch INT] [--seed HEX] [--order-seed HEX]"
@@ -129,7 +139,8 @@ usage = unlines
   , "single report; per-case layout flags are then rejected."
   , ""
   , "--secret pins class A only (fix vs. random axis)."
-  , "--public pins BOTH classes (shared public context)."
+  , "--public pins BOTH classes for the whole run."
+  , "--context refreshes BOTH classes together, once per pair."
   , ""
   , "--seed pins the input samplers; --order-seed pins the A/B"
   , "order bit (default: fresh OS entropy, reported on the run)."
@@ -167,6 +178,9 @@ go acc (x:xs)        = case x of
   "--public"     -> withVal x xs $ \v ys -> do
     r <- parseRange x v
     go acc { accPublic = r : accPublic acc } ys
+  "--context"    -> withVal x xs $ \v ys -> do
+    r <- parseRange x v
+    go acc { accContext = r : accContext acc } ys
   "--meter"      -> withVal x xs $ \v ys ->
     onceStr x (accMeter acc) $
       go acc { accMeter = Just v } ys
@@ -276,12 +290,14 @@ finish acc = do
       Nothing        -> die2 "censor: missing --workspace BYTES"
   mapM_ (checkRange ws "--secret") (accSecret acc)
   mapM_ (checkRange ws "--public") (accPublic acc)
+  mapM_ (checkRange ws "--context") (accContext acc)
   pure Args
     { argLib       = lib
     , argTarget    = maybe "censor_target" id (accTarget acc)
     , argWorkspace = ws
     , argSecret    = reverse (accSecret acc)
     , argPublic    = reverse (accPublic acc)
+    , argContext   = reverse (accContext acc)
     , argMeter     = accMeter acc
     , argAlpha     = accAlpha acc
     , argBudget    = accBudget acc
@@ -301,6 +317,7 @@ finish acc = do
       , ("--target",    isJust (accTarget acc))
       , ("--secret",    not (null (accSecret acc)))
       , ("--public",    not (null (accPublic acc)))
+      , ("--context",   not (null (accContext acc)))
       , ("--trace",     isJust (accTrace acc))
       ]
 
@@ -321,32 +338,42 @@ defaultSeed = 0xC0FFEE5EED0BEEF7
 
 -- setup: draw the fixed --secret and --public overlay buffers once
 -- from a seeded RNG; keep independent per-class RNGs for the random
--- fill of everything else. Returns an FFIHypothesis ready to hand to
--- 'withFFIHypothesis'.
+-- fill of everything else. Context ranges live in a third buffer
+-- that the prologue redraws once per pair, so both classes see the
+-- same fresh public bytes there. Returns an FFIHypothesis ready to
+-- hand to 'withFFIHypothesis'.
 buildHypothesis
   :: Int                 -- ^ workspace bytes
   -> [Range]             -- ^ secret ranges (class A only)
-  -> [Range]             -- ^ public ranges (both classes)
+  -> [Range]             -- ^ public ranges (both classes, pinned)
+  -> [Range]             -- ^ context ranges (both classes, per pair)
   -> Word64              -- ^ sampler seed
   -> (Ptr Word8 -> IO ())
   -> IO F.FFIHypothesis
-buildHypothesis ws secrets publics seed target = do
+buildHypothesis ws secrets publics contexts seed target = do
   fixSec <- mallocBytes ws
   fixPub <- mallocBytes ws
+  ctxBuf <- mallocBytes ws
   gFix <- C.mkRng seed
   F.fillRandom gFix fixSec ws
   F.fillRandom gFix fixPub ws
-  ga <- C.mkRng (seed `xor` 0x0A0A0A0A0A0A0A0A)
-  gb <- C.mkRng (seed `xor` 0x0B0B0B0B0B0B0B0B)
+  ga  <- C.mkRng (seed `xor` 0x0A0A0A0A0A0A0A0A)
+  gb  <- C.mkRng (seed `xor` 0x0B0B0B0B0B0B0B0B)
+  gCtx <- C.mkRng (seed `xor` 0x0C0C0C0C0C0C0C0C)
+  let refresh = mapM_ (\(Range o l) ->
+        F.fillRandom gCtx (ctxBuf `plusPtr` o) l) contexts
+  refresh
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = ws
-    , F.ffiPrepare = pure ()
+    , F.ffiPrepare = refresh
     , F.ffiSampleA = \p -> do
         F.fillRandom ga p ws
+        overlay p ctxBuf contexts
         overlay p fixPub publics
         overlay p fixSec secrets
     , F.ffiSampleB = \p -> do
         F.fillRandom gb p ws
+        overlay p ctxBuf contexts
         overlay p fixPub publics
     , F.ffiTarget = target
     }
@@ -396,7 +423,8 @@ runWith :: Args -> IO ()
 runWith args = DL.withLibrary (argLib args) $ \lib -> do
   target <- DL.resolveTarget lib (argTarget args)
   hyp    <- buildHypothesis (argWorkspace args) (argSecret args)
-              (argPublic args) (samplerSeed args) target
+              (argPublic args) (argContext args) (samplerSeed args)
+              target
   rnd    <- Rep.resolveFormat (argFormat args)
   rc     <- Rep.initReportCfg
   let cfg  = buildConfig args
@@ -436,7 +464,7 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
             , Rep.crTrace       = mfrs
             }
       emit cr
-      -- the trace artefact is the same censor/report-v2 object the
+      -- the trace artefact is the same censor/report-v3 object the
       -- json renderer emits, with the frame trajectory embedded.
       case argTrace args of
         Just tp -> writeFile tp (Rep.reportJSON hdr [cr])
@@ -496,18 +524,34 @@ data Cell = Cell
 
 expand :: Word64 -> M.ManifestCase -> [Cell]
 expand base mc
-  | n <= 1    = [Cell (M.mcName mc) mc base]
+  | n <= 1    = [Cell (M.mcName mc) mc s0]
   | otherwise =
-      [ Cell (M.mcName mc ++ " #" ++ show i) mc (replicaSeed base i)
+      [ Cell (M.mcName mc ++ " #" ++ show i) mc (replicaSeed s0 i)
       | i <- [1 .. n]
       ]
   where
-    n = M.mcReplicates mc
+    n  = M.mcReplicates mc
+    s0 = caseSeed base (M.mcName mc)
 
--- Decorrelate replicate seeds with the golden-ratio odd constant
+-- Mix the run-wide seed with the case name, so each case draws its
+-- own fixed secret. Sharing one seed across every case would start
+-- them all from identical bytes, which makes a battery far less
+-- independent than its case count suggests.
+caseSeed :: Word64 -> String -> Word64
+caseSeed base name = base `xor` fnv1a name
+
+fnv1a :: String -> Word64
+fnv1a = foldl' step 0xCBF29CE484222325
+  where
+    step !h ch = (h `xor` fromIntegral (fromEnum ch)) * 0x100000001B3
+
+-- Replicate #1 *is* the base cell: raising 'replicates' must extend
+-- a battery, never redefine the cell that was already in it.
+-- Later indices decorrelate with the golden-ratio odd constant
 -- rather than a small addend, so nearby indices do not produce
 -- nearby generator states.
 replicaSeed :: Word64 -> Int -> Word64
+replicaSeed base 1 = base
 replicaSeed base i = base `xor` (fromIntegral i * 0x9E3779B97F4A7C15)
 
 runManifest :: Args -> FilePath -> IO ()
@@ -521,7 +565,15 @@ runManifest args path = do
   let d     = M.mfDefaults mf
       seed  = pick (argSeed args) (M.dfSeed d) defaultSeed
       cells = concatMap (expand seed) (M.mfCases mf)
-      cfg   = manifestConfig args d
+      cfg0  = manifestConfig args d
+      -- 'family-alpha on' turns the reported union bound into an
+      -- actual correction: each of the M cells runs at alpha / M, so
+      -- "any cell rejects" is a test at alpha family-wise.
+      cfg   = case M.dfFamilyAlpha d of
+        Just True -> cfg0
+          { C.cfgAlpha = C.cfgAlpha cfg0
+              / fromIntegral (max 1 (length cells)) }
+        _ -> cfg0
       mname = case argMeter args of
         Just m  -> Just m
         Nothing -> M.dfMeter d
@@ -561,15 +613,19 @@ runCell args d meter cfg lib cell = do
   let mc = cellCase cell
   target <- DL.resolveTarget lib (M.mcTarget mc)
   let mk = buildHypothesis (M.mcWorkspace mc) (M.mcSecret mc)
-             (M.mcPublic mc) (cellSeed cell) target
-  hyp <- mk
-  (b, mnoise) <- F.withFFIHypothesis hyp $ \h ->
-    case caseBatch args d mc of
-      M.BatchFixed n -> pure (n, Nothing)
-      M.BatchAuto    -> do
+             (M.mcPublic mc) (M.mcContext mc) (cellSeed cell) target
+  -- calibration gets its own instance: it runs a prologue and a
+  -- class-A draw, and the run proper should start from the same
+  -- state whether or not a calibration happened.
+  (b, mnoise) <- case caseBatch args d mc of
+    M.BatchFixed n -> pure (n, Nothing)
+    M.BatchAuto    -> do
+      hCal <- mk
+      F.withFFIHypothesis hCal $ \h -> do
         cb <- C.calibrateBatchReport meter h
         pure (C.crBatch cb, C.crNoise cb)
   let cfg' = cfg { C.cfgBatch = b }
+  hyp <- mk
   result <- F.withFFIHypothesis hyp $ \h -> C.runCT meter cfg' h
   mat <- case (argAttribute args, result) of
     (True, C.Reject{}) -> do

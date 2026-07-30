@@ -474,7 +474,7 @@ runAll tex meter emit = do
 
 -- Record the three secp positive controls under the wall meter
 -- with per-pair trajectories, and write the resulting battery as a
--- single censor/report-v2 JSON object to PATH. Reuses the suite's
+-- single censor/report-v3 JSON object to PATH. Reuses the suite's
 -- exact hypotheses; rejections are auto-attributed, matching
 -- runTraceSuite's behaviour.
 --

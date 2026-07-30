@@ -15,7 +15,7 @@
 --   through a 'Renderer'. Three renderers are provided —
 --   'pretty' (the ppad terminal aesthetic: bold brand line, dim
 --   key column, middle-dot separators, ANSI-colored verdicts on a
---   TTY), 'json' (one @censor\/report-v2@ object per run,
+--   TTY), 'json' (one @censor\/report-v3@ object per run,
 --   deterministic key order, per-case trace arrays when present),
 --   and 'plain' (ASCII-only, grep-safe).
 -- * 'withReport' streams cases through the chosen renderer and
@@ -310,7 +310,7 @@ prettyHeaderBlock rc hdr =
   let entries = concat
         [ [("meter", meterLine hdr)]
         , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
-        , maybe [] (\w -> [("seed",   seedHex w)])   (rhSeed hdr)
+        , maybe [] (\w -> [("sampler seed", seedHex w)]) (rhSeed hdr)
         , maybe [] (envEntries " \183 ") (rhEnv hdr)
         , maybe [] (\n -> [("note",   n)])           (rhNote hdr)
         ]
@@ -402,8 +402,11 @@ prettyCase rc cr = do
                           ++ cDim rc (attributionText a)
     Nothing -> pure ()
 
--- the calibration detail line under a case row: resolved batch and,
--- when recorded, the meter's noise floor at that batch.
+-- the run-metadata line under a case row: resolved batch, the
+-- meter's noise floor at that batch when recorded, and the order
+-- seed the run resolved to. The seed is unconditional -- it is what
+-- replays the case, and a reader should not have to reach for the
+-- JSON to find it.
 calibText :: CaseReport -> Maybe String
 calibText cr = case segs of
   [] -> Nothing
@@ -414,6 +417,7 @@ calibText cr = case segs of
       , maybe [] (\n -> [ printf "noise med=%d iqr=%d"
                             (nsMedian n) (nsIqr n) ])
           (crNoise cr)
+      , ["orderSeed=" ++ seedHex (resSeed (crResult cr))]
       ]
 
 -- Indent under the evidence column: 4 (row indent) + 6 (verdict)
@@ -455,7 +459,7 @@ colorCount col rc n suf
 
 -- json renderer ------------------------------------------------------------
 
--- | Emit one @censor\/report-v2@ JSON object per battery,
+-- | Emit one @censor\/report-v3@ JSON object per battery,
 --   deterministic key order. Header and per-case callbacks are
 --   no-ops; the whole object materialises at close, exactly as
 --   'reportJSON' would render it.
@@ -470,21 +474,27 @@ jsonClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
 jsonClose _ hdr tl = putStrLn (reportJSON hdr (btCases tl))
 
 -- | Serialise a header + case list as the canonical
---   @censor\/report-v2@ JSON object. Deterministic key order; the
+--   @censor\/report-v3@ JSON object. Deterministic key order; the
 --   per-case block carries 'crBatch' and 'crTrace' as optional
 --   fields, present exactly when the runner recorded them.
+--
+--   The two seeds are named apart: @samplerSeed@ at the top level
+--   is the harness-wide seed behind the input samplers, and
+--   @orderSeed@ inside each case result is the resolved per-run
+--   A\/B order seed that replays that case.
 --
 --   The 'json' renderer and 'runTraceSuite' both call this so
 --   stdout output and the on-disk artefact are byte-identical.
 reportJSON :: ReportHeader -> [CaseReport] -> String
 reportJSON hdr cases = concat
-  [ "{\"schema\":\"censor/report-v2\""
+  [ "{\"schema\":\"censor/report-v3\""
   , ",\"tool\":",    jstr brand
   , ",\"version\":", jstr brandVersion
   , ",\"meter\":",   jstr (rhMeter hdr)
   , ",\"config\":",  configJSON hdr
-  , maybe "" (\e -> ",\"env\":"    ++ envJSON e)        (rhEnv hdr)
-  , maybe "" (\w -> ",\"seed\":"   ++ jstr (seedHex w)) (rhSeed hdr)
+  , maybe "" (\e -> ",\"env\":" ++ envJSON e) (rhEnv hdr)
+  , maybe "" (\w -> ",\"samplerSeed\":" ++ jstr (seedHex w))
+      (rhSeed hdr)
   , maybe "" (\t -> ",\"target\":" ++ jstr t)           (rhTarget hdr)
   , maybe "" (\n -> ",\"note\":"   ++ jstr n)           (rhNote hdr)
   , ",\"cases\":["
@@ -505,7 +515,11 @@ configJSON hdr =
         , ",\"budget\":", show (cfgBudget c)
         , ",\"warmup\":", show (cfgWarmup c)
         , batchField
-        , maybe "" (\w -> ",\"seed\":" ++ jstr (seedHex w)) (cfgSeed c)
+        -- the *requested* order seed; absent when the runner left
+        -- it to per-run OS entropy. Each case result carries the
+        -- value it actually resolved to.
+        , maybe "" (\w -> ",\"orderSeed\":" ++ jstr (seedHex w))
+            (cfgSeed c)
         , "}"
         ]
 
@@ -610,7 +624,7 @@ plainOpen _ hdr = do
   let entries = concat
         [ [("meter", plainMeterLine hdr)]
         , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
-        , maybe [] (\w -> [("seed",   seedHex w)])   (rhSeed hdr)
+        , maybe [] (\w -> [("sampler seed", seedHex w)]) (rhSeed hdr)
         , maybe [] (envEntries ", ") (rhEnv hdr)
         , maybe [] (\n -> [("note",   n)])           (rhNote hdr)
         ]
@@ -813,7 +827,7 @@ data TraceCase =
 
 -- | A trace-recording suite: iterate a list of hypotheses under a
 --   chosen meter, record each run's per-pair frame trajectory, and
---   write the whole battery as a single @censor\/report-v2@ JSON
+--   write the whole battery as a single @censor\/report-v3@ JSON
 --   artefact alongside the human-facing report.
 --
 --   The tool's @Main.hs@ builds one of these and calls
@@ -879,17 +893,22 @@ runTraceSuite ts = do
     ref <- newIORef ([] :: [CaseReport])
     _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
       forM_ (tsCases ts) $ \(TraceCase name policy mkH) -> do
-        h  <- mkH
         -- --batch overrides every case's policy; otherwise the
         -- case's own declared policy governs, and only
         -- RepeatableAuto runs a calibration probe.
+        --
+        -- The probe gets its own instance: it runs a prologue and a
+        -- class-A draw, and the main run should start from the same
+        -- state whether or not a calibration happened.
         (b, mnoise) <- case maybe policy FixedBatch (saBatch sa) of
           SingleShot     -> pure (1, Nothing)
           FixedBatch n   -> pure (n, Nothing)
           RepeatableAuto -> do
-            cb <- calibrateBatchReport meter h
+            hCal <- mkH
+            cb   <- calibrateBatchReport meter hCal
             pure (C.crBatch cb, C.crNoise cb)
         let c = (tsConfig ts) { cfgBatch = b }
+        h <- mkH
         t <- record name mname meter c h
         let r = traceResult t
         mat <- case r of

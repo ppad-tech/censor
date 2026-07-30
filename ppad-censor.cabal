@@ -216,7 +216,6 @@ executable censor-viz
     build-depends:
         base
       , ppad-censor
-      , ppad-eproc
       , ppad-fixed
       , ppad-secp256k1
 

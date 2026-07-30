@@ -222,7 +222,7 @@ target-prefix  censor_target_
 workspace      128
 
 case mul   secret=0:32
-case ecdh  secret=0:32 public=32:64
+case ecdh  secret=0:32 context=32:64
 case inv   secret=0:32 replicates=3
 ```
 
@@ -230,19 +230,35 @@ case inv   secret=0:32 replicates=3
 $ censor libfoo.dylib --manifest battery.manifest --attribute
 ```
 
-One dlopen, one `censor/report-v2` object containing every case,
+One dlopen, one `censor/report-v3` object containing every case,
 its controls, the host environment, and the family-wise alpha. The
 per-case layout flags (`--workspace`, `--target`, `--secret`,
-`--public`, `--trace`) are rejected in this mode rather than
-silently ignored; run-wide flags still override manifest
+`--public`, `--context`, `--trace`) are rejected in this mode rather
+than silently ignored; run-wide flags still override manifest
 directives. See `etc/example.manifest` for the annotated format.
+
+A case's ranges come in three kinds. `secret=off:len` is pinned in
+class A only — the fix-vs-random axis. `public=off:len` is pinned in
+both classes for the whole run. `context=off:len` is redrawn once
+per *pair* and written into both classes, which is the manifest's
+route to the paired public context described above. Everything
+outside a declared range is random per pair, per class.
 
 `replicates=N` runs a case against N independent fixed secrets, as
 N ordinary case rows. A dudect-style cell pins *one* fixed secret,
 so on its own it answers "does this secret time differently from
 random", not "does any secret"; replicating guards against an
 unlucky draw, and each replicate counts toward the family-wise
-alpha as it should.
+alpha as it should. Replicate #1 keeps the seed the unreplicated
+case had, so raising `replicates` extends a battery without
+redefining the cell already in it; each case also mixes its own
+name into the run-wide seed, so cases do not all begin from
+identical bytes.
+
+`family-alpha on` turns the reported union bound into an actual
+correction: each of the M expanded cells runs at `alpha / M`, so
+"any cell rejects" is a test at `alpha` family-wise. It is off by
+default, since it costs power in every cell.
 
 ### Reproducibility
 
@@ -254,10 +270,17 @@ scheduler quanta) is a fact rather than an assumption. A clock
 reading would not do: it is not independent entropy, and the
 nuisance process may itself be periodic in that very clock.
 
+That is the normal path rather than an unconditional one. If
+`/dev/urandom` cannot be read, the driver falls back to the
+monotonic clock — better than a constant, but it forfeits the
+independence argument above. Pin `cfgSeed` explicitly if you need
+to know which of the two you got.
+
 Whichever way it resolves, the seed actually used comes back as
-`resSeed` on the `Result` and is recorded in the JSON report. A
-fresh audit run is therefore statistically randomised *and* exactly
-replayable afterwards — feed `resSeed` back as `cfgSeed = Just s`.
+`resSeed` on the `Result`, appears under each case row in the human
+report, and is recorded as `orderSeed` in the JSON. A fresh audit
+run is therefore statistically randomised *and* exactly replayable
+afterwards — feed `resSeed` back as `cfgSeed = Just s`.
 
 Keep this seed distinct from whatever seeds your input samplers.
 The conditional null needs the order bit independent of the sampled
@@ -353,17 +376,18 @@ Haddocks (API documentation, etc.) are hosted at
 
 ## Performance
 
-The K=4 hedge runs four e-processes per pair plus the mixture
-composition, and the effect-size confidence sequence updates its
-live candidate grid every pair. The estimator dominates the driver
-cost early — O(live candidates) per pair, ~300 at the start — and
-amortizes down as evidence rejects candidates, so the per-pair
-driver cost falls from ~1 μs over short runs toward ~250 ns over
-long ones. For any target that itself takes a microsecond or
-longer per call the overhead is dominated by the target; for
-sub-microsecond targets, raise `cfgBatch` (which the wall-clock
-quantum demands anyway) — but only if repetition genuinely
-recomputes. See the batching contract below.
+The hedge runs `K = 4 + n` e-processes per pair — sign, three
+clipped magnitudes, and one CDF indicator per resolved cut point —
+plus the mixture composition, and the effect-size confidence
+sequence updates its live candidate grid every pair. The estimator
+dominates the driver cost early — O(live candidates) per pair, ~300
+at the start — and amortizes down as evidence rejects candidates,
+so the per-pair driver cost falls from ~1 μs over short runs toward
+~250 ns over long ones. For any target that itself takes a
+microsecond or longer per call the overhead is dominated by the
+target; for sub-microsecond targets, raise `cfgBatch` (which the
+wall-clock quantum demands anyway) — but only if repetition
+genuinely recomputes. See the batching contract below.
 
 ### The batching contract
 
@@ -458,17 +482,25 @@ their value is characterisation, not assertion.
 
 This is a pre-release calibration check, not a per-commit gate; a
 full run at the current battery size takes roughly an hour under
-the K=4 hedge. The default test suite carries a lightweight smoke
-tier that catches gross wiring regressions only.
+the hedge. The default test suite carries a lightweight tier that
+catches gross wiring regressions only.
 
 ### The null, and what it does and does not cover
 
 The null censor tests is **conditional exchangeability** of the
 measured pair `(ta, tb)`: given everything observed so far,
-swapping the two class labels leaves the joint law unchanged. This
-is exactly what the randomised per-pair A/B order delivers, and it
-is implied by — but strictly weaker than — the informal property
-"the two input classes induce the same timing distribution".
+swapping the two class labels leaves the joint law unchanged.
+
+This is *stronger* than the informal property "the two input
+classes induce the same timing distribution", not weaker.
+Exchangeability implies the two readings share a marginal law;
+equal marginals on their own say nothing about the joint, and so
+cannot deliver it. What does deliver it is the randomised per-pair
+A/B order — under the assumption that the within-pair nuisance
+dynamics (cache and predictor state, frequency drift) are
+themselves blind to the class labels. Randomisation makes
+*position* independent of class; it cannot undo a nuisance process
+that reacts to the class itself.
 
 Every component of the test bets on an **antisymmetric functional**
 of the pair, a statistic `g` with `g(ta, tb) = -g(tb, ta)`. Under

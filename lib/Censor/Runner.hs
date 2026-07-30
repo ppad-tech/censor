@@ -232,8 +232,13 @@ clipText r
 -- | Serialise a t'Result' as a stable JSON object. Includes verdict,
 --   pairs, mixture peak log e-value, anytime-valid p-value, effect
 --   interval, clip counts at each of the three magnitude bounds,
---   warmup bound, per-component peaks, and the 'diagnose'
---   advisories.
+--   warmup bound, the resolved order seed, the CDF channel as
+--   @[cut point, peak]@ pairs, per-component peaks, and the
+--   'diagnose' advisories.
+--
+--   The seed here is the /order/ seed ('resSeed'), the one that
+--   replays the A\/B order sequence. The sampler seed is a property
+--   of the harness, not of a run, and appears in the report header.
 --
 --   The object is a single line; pipe multiple runs into a
 --   line-oriented store and diff or filter with @jq@.
@@ -249,9 +254,10 @@ resultToJSON r = concat
   , ",\"clipped4\":",   show (resClipped4 r)
   , ",\"clipped16\":",  show (resClipped16 r)
   , printf ",\"bound\":%.6g" (resBound r)
-  , ",\"seed\":",       jstr ("0x" ++ showHex (resSeed r) "")
-  , ",\"cutPoints\":["
-  , intercalate "," (map (printf "%.6g") (resCutPoints r))
+  , ",\"orderSeed\":",  jstr ("0x" ++ showHex (resSeed r) "")
+  , ",\"cdf\":["
+  , intercalate ","
+      [ printf "[%.6g,%.6g]" q p | (q, p) <- resCdf r ]
   , "]"
   , ",\"peaks\":{"
   ,       printf "\"sign\":%.6g"    (resPeakSign r)

@@ -16,7 +16,7 @@
 -- together — which duplicates the tool version and config by hand
 -- in every script, and produces no single artefact carrying the
 -- whole battery. With one, a single invocation opens the library
--- once and emits one @censor\/report-v2@ object containing every
+-- once and emits one @censor\/report-v3@ object containing every
 -- case, its controls, the host environment, and the family-wise
 -- alpha.
 --
@@ -34,6 +34,7 @@
 -- >
 -- > case mul       secret=0:32
 -- > case sign      workspace=96 secret=0:32 public=32:32
+-- > case ecdh      secret=0:32 context=32:32
 -- > case inv       secret=0:32 replicates=3
 --
 -- A case's target symbol is @target-prefix@ ++ its name unless
@@ -88,6 +89,10 @@ data Defaults = Defaults
     --   resolved value is reported for replay.
   , dfPrefix    :: !(Maybe String)
   , dfWorkspace :: !(Maybe Int)
+  , dfFamilyAlpha :: !(Maybe Bool)
+    -- ^ when set, run every expanded cell at @alpha \/ M@ (M being
+    --   the number of cells) so the /battery/ tests at @alpha@
+    --   family-wise, rather than merely reporting the union bound.
   } deriving (Eq, Show)
 
 -- | All directives unset.
@@ -102,6 +107,7 @@ emptyDefaults = Defaults
   , dfOrderSeed = Nothing
   , dfPrefix    = Nothing
   , dfWorkspace = Nothing
+  , dfFamilyAlpha = Nothing
   }
 
 -- | One case: a display name, the symbol to resolve, the workspace
@@ -112,6 +118,17 @@ data ManifestCase = ManifestCase
   , mcWorkspace  :: !Int
   , mcSecret     :: ![Range]
   , mcPublic     :: ![Range]
+  , mcContext    :: ![Range]
+    -- ^ ranges redrawn once per /pair/ and written identically into
+    --   both classes: a shared fresh public context.
+    --
+    --   'mcPublic' pins its ranges for the whole cell, which tests
+    --   one public input; leaving them to the per-class random fill
+    --   gives each class a different one, injecting nuisance
+    --   variance into @d@ that has nothing to do with the secret.
+    --   A context range is the third option — fresh every pair, but
+    --   common to A and B — so the tested axis is secret dependence
+    --   /given identical public input/.
   , mcBatch      :: !(Maybe BatchSpec)
   , mcReplicates :: {-# UNPACK #-} !Int
     -- ^ how many independent fixed secrets to run this case
@@ -176,6 +193,8 @@ parseDirective n d k v = case k of
   "seed"          -> fmap (\x -> d { dfSeed      = Just x }) (hex n "seed" v)
   "order-seed"    -> fmap (\x -> d { dfOrderSeed = Just x })
                           (hex n "order-seed" v)
+  "family-alpha"  -> fmap (\x -> d { dfFamilyAlpha = Just x })
+                          (flag n "family-alpha" v)
   _ -> Left (at n ("unknown directive " ++ show k))
   where
     num nm = case reads v of
@@ -195,6 +214,11 @@ batch n v = case reads v of
   [(x, "")] | x >= 1 -> Right (BatchFixed x)
   _ -> Left (at n ("batch expects a positive integer or 'auto', got "
                    ++ show v))
+
+flag :: Int -> String -> String -> Either String Bool
+flag _ _ "on"  = Right True
+flag _ _ "off" = Right False
+flag n nm v = Left (at n (nm ++ " expects 'on' or 'off', got " ++ show v))
 
 hex :: Int -> String -> String -> Either String Word64
 hex n nm v =
@@ -217,12 +241,14 @@ parseCase n d toks = case toks of
           , mcWorkspace  = maybe 0 id (dfWorkspace d)
           , mcSecret     = []
           , mcPublic     = []
+          , mcContext    = []
           , mcBatch      = Nothing
           , mcReplicates = 1
           }
     c <- foldl (\acc kv -> acc >>= \x -> applyKV n x kv) (Right c0) kvs
-    validateCase n c { mcSecret = reverse (mcSecret c)
-                     , mcPublic = reverse (mcPublic c) }
+    validateCase n c { mcSecret  = reverse (mcSecret c)
+                     , mcPublic  = reverse (mcPublic c)
+                     , mcContext = reverse (mcContext c) }
 
 applyKV :: Int -> ManifestCase -> String -> Either String ManifestCase
 applyKV n c kv = case break (== '=') kv of
@@ -233,6 +259,8 @@ applyKV n c kv = case break (== '=') kv of
                          (range n "secret" v)
     "public"     -> fmap (\r -> c { mcPublic = r : mcPublic c })
                          (range n "public" v)
+    "context"    -> fmap (\r -> c { mcContext = r : mcContext c })
+                         (range n "context" v)
     "batch"      -> fmap (\b -> c { mcBatch = Just b }) (batch n v)
     "workspace"  -> case reads v of
       [(x, "")] | x > 0 -> Right c { mcWorkspace = x }
@@ -268,7 +296,17 @@ validateCase n c
         Left (at n ("case " ++ mcName c ++ " range " ++ show o ++ ":"
                     ++ show l ++ " overflows its workspace of "
                     ++ show (mcWorkspace c) ++ " bytes"))
-      [] -> Right c
+      [] -> case [ (x, y) | x <- mcContext c, y <- mcSecret c
+                          , overlaps x y ] of
+        -- the secret overlay lands after the context one, so class A
+        -- would keep its fixed secret there while class B kept the
+        -- context bytes: the range is no longer shared, and the
+        -- declaration cannot mean what it says.
+        ((Range o l, _) : _) ->
+          Left (at n ("case " ++ mcName c ++ " context " ++ show o
+                      ++ ":" ++ show l ++ " overlaps a secret range"))
+        [] -> Right c
   where
-    rs = mcSecret c ++ mcPublic c
+    rs = mcSecret c ++ mcPublic c ++ mcContext c
     overflows ws (Range o l) = o + l > ws
+    overlaps (Range o1 l1) (Range o2 l2) = o1 < o2 + l2 && o2 < o1 + l1

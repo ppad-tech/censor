@@ -17,10 +17,16 @@
 --
 -- The null is /conditional exchangeability/ of the measured pair
 -- @(ta, tb)@: given the past, swapping the two class labels leaves
--- the joint law unchanged. This is what the randomised per-pair
--- A\/B order actually delivers, and it is implied by (but weaker
--- than) the informal target property \"the two input classes induce
--- the same timing distribution\".
+-- the joint law unchanged. This is /stronger/ than the informal
+-- target property \"the two input classes induce the same timing
+-- distribution\": exchangeability implies the two readings share a
+-- marginal law, while equal marginals on their own constrain
+-- nothing about the joint. What supplies it is the randomised
+-- per-pair A\/B order — and that argument assumes the within-pair
+-- nuisance dynamics (cache and predictor state, frequency drift)
+-- are themselves blind to the class labels. Randomisation makes
+-- /position/ independent of class; it cannot undo a nuisance
+-- process that reacts to the class itself.
 --
 -- Every component of the test is an /antisymmetric functional/ of
 -- the pair — a statistic @g@ with @g(ta, tb) = -g(tb, ta)@ — and
@@ -63,6 +69,7 @@ module Censor (
 
     -- * Result
   , Result(..)
+  , resPeakCdf
 
     -- * Advisories
   , Advisory(..)
@@ -292,13 +299,19 @@ data Config = Config
   , cfgSeed   :: !(Maybe Word64)
                           -- ^ seed for the per-pair A\/B order bit.
                           --   'Nothing' (the default) draws a fresh
-                          --   seed from OS entropy
-                          --   (@\/dev\/urandom@) per run, so the
+                          --   seed per run from OS entropy
+                          --   (@\/dev\/urandom@), so the
                           --   conditional independence of the order
                           --   bit from any periodic ambient noise
                           --   (timer interrupts, scheduler quanta)
                           --   is a fact rather than an assumption.
-                          --   @Just s@ pins the seed instead.
+                          --   That is the normal path, not a
+                          --   guarantee: if @\/dev\/urandom@ cannot
+                          --   be read the driver falls back to the
+                          --   monotonic clock, which is better than
+                          --   a constant but forfeits the
+                          --   independence argument. @Just s@ pins
+                          --   the seed instead.
                           --
                           --   Whichever way it resolves, the seed
                           --   actually used is reported as
@@ -362,6 +375,11 @@ defaultConfig = Config
 --   every other channel). Each is a supremum over its own (possibly
 --   different) time, so the peaks are diagnostic only -- rejection
 --   latches on the mixture's supremum, never on per-component peaks.
+--
+--   'resPeakCdf' is a maximum over the CDF channel; 'resCdf' keeps
+--   the per-cut-point breakdown behind it, so a CDF-driven
+--   rejection names the threshold that found the difference rather
+--   than only its height.
 data Result
   = Reject
       { resPairs      :: {-# UNPACK #-} !Int
@@ -415,13 +433,15 @@ data Result
         -- ^ peak log e-value of the magnitude component at @4c@.
       , resPeakMagn16 :: {-# UNPACK #-} !Double
         -- ^ peak log e-value of the magnitude component at @16c@.
-      , resPeakCdf    :: {-# UNPACK #-} !Double
-        -- ^ largest peak log e-value across the CDF-indicator
-        --   components (@0@ when warmup resolved no cut points).
-      , resCutPoints  :: ![Double]
-        -- ^ the warmup-fixed cut points @q@ backing the
-        --   CDF-indicator components, ascending and deduplicated.
-        --   Empty when warmup readings were degenerate.
+      , resCdf        :: ![(Double, Double)]
+        -- ^ the CDF-indicator channel, one @(q, peak)@ entry per
+        --   warmup-fixed cut point: the cut point itself (ascending
+        --   and deduplicated) paired with that component's peak log
+        --   e-value. Empty when warmup readings were degenerate.
+        --
+        --   'resPeakCdf' is the maximum of the peaks; this is the
+        --   breakdown, so a CDF-driven rejection can name /which/
+        --   threshold separated the classes.
       , resSeed       :: {-# UNPACK #-} !Word64
         -- ^ the order-bit seed the run actually used, whether
         --   supplied via 'cfgSeed' or drawn from OS entropy.
@@ -441,11 +461,16 @@ data Result
       , resPeakMagn   :: {-# UNPACK #-} !Double
       , resPeakMagn4  :: {-# UNPACK #-} !Double
       , resPeakMagn16 :: {-# UNPACK #-} !Double
-      , resPeakCdf    :: {-# UNPACK #-} !Double
-      , resCutPoints  :: ![Double]
+      , resCdf        :: ![(Double, Double)]
       , resSeed       :: {-# UNPACK #-} !Word64
       }
   deriving Show
+
+-- | The largest peak log e-value across the CDF-indicator
+--   components — @0@ when warmup resolved no cut points. A maximum
+--   over 'resCdf', which keeps the per-cut-point detail.
+resPeakCdf :: Result -> Double
+resPeakCdf = foldr (\(_, p) acc -> max p acc) 0 . resCdf
 
 -- | An actionable observation about a t'Result', produced by
 --   'diagnose'. Each constructor identifies a specific pattern in
@@ -692,8 +717,7 @@ runCTWith meter cfg hyp observe = do
         (EPMagn.log_evalue_sup (hsMagn1 st))
         (EPMagn.log_evalue_sup (hsMagn2 st))
         (EPMagn.log_evalue_sup (hsMagn3 st))
-        (peakCdf (hsCdf st))
-        qs
+        (cdfPeaks qs (hsCdf st))
         root
       -- the effect interval is latched: once the evidence pins the
       -- mean below the grid's resolution the survivor set empties,
@@ -762,6 +786,14 @@ runCTAttributed meter cfg hyp = do
 --   > b <- calibrateBatch meter hyp
 --   > r <- runCT meter cfg { cfgBatch = b } hyp
 --
+--   The hypothesis's 'prepare' prologue runs first, exactly as it
+--   does before every measured pair, so a sampler that depends on
+--   it probes the same state the run will see. Calibration consumes
+--   one prologue and one class-A draw regardless of how many probes
+--   it runs; build a fresh hypothesis for the run itself if the
+--   sampler stream must start where it would have without a
+--   calibration pass.
+--
 --   Returns @1@ if the meter cannot resolve the target even at a
 --   large batch (the subsequent 'runCT' then throws
 --   'WarmupZeroDuration'). This is a heuristic — it reads the median
@@ -818,6 +850,7 @@ data Noise = Noise
 --   (particularly when the answer is @1@).
 calibrateBatchReport :: Meter -> Hypothesis a -> IO CalibReport
 calibrateBatchReport meter hyp = do
+  prepare hyp
   !x <- sampleA hyp
   let !act = target hyp x
       -- grow the batch until the reading itself reaches the target
@@ -1226,10 +1259,11 @@ cdfDiff !q !ta !tb = ind ta - ind tb
            | otherwise = 0
 {-# INLINE cdfDiff #-}
 
--- Largest peak log e-value across the CDF components; @0@ (the
--- calibrated floor) when there are none.
-peakCdf :: [EPMagn.State] -> Double
-peakCdf = foldr (\s acc -> max (EPMagn.log_evalue_sup s) acc) 0
+-- Pair each cut point with its component's peak log e-value. The
+-- state list is aligned with 'hcQs' by construction, so the zip is
+-- total on both.
+cdfPeaks :: [Double] -> [EPMagn.State] -> [(Double, Double)]
+cdfPeaks qs = zip qs . map EPMagn.log_evalue_sup
 
 clipD :: Double -> Double -> Double
 clipD !lim !x
