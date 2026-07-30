@@ -107,10 +107,10 @@ nested and the coverage guarantee is time-uniform. Coverage of the
 interval and type-I control of the verdict are separate marginal
 guarantees, each at `cfgAlpha`.
 
-### A/A diagnostic
+### A/A and B/B negative controls
 
 Before trusting a `Reject` on a new hypothesis, run the A/A
-diagnostic to rule out harness asymmetry:
+control to look for harness asymmetry:
 
 ```haskell
 result <- C.runAA meter C.defaultConfig hyp
@@ -130,29 +130,55 @@ asymmetry is fixed.
 `sampleB` vs `sampleB`, which exercises asymmetries specific to
 `sampleB` that `toAA` can't see (a heavier-allocation-path
 sampler, RTS state that only its fresh objects trigger). Running
-both diagnostics attributes any `Reject` to one of: (a) target
-leak, (b) `sampleA`-specific harness bug, (c) `sampleB`-specific
-harness bug, or (d) pervasive harness asymmetry across both.
+both controls sorts any `Reject` into: (a) neither control
+convicted, (b) a `sampleA`-specific harness bug, (c) a
+`sampleB`-specific harness bug, or (d) pervasive harness asymmetry
+across both.
 
-`attribute` packages the whole protocol — it runs both diagnostics
-and folds their verdicts into a four-way `Attribution`
-(`TargetLeak`, `SampleAAsymmetry`, `SampleBAsymmetry`, or
-`PervasiveAsymmetry`, with the rejecting diagnostic results
-attached as evidence):
+`attribute` packages the whole protocol — it runs both controls and
+returns an `Attribution` carrying the `ControlVerdict` alongside
+*both* control runs in full, so the evidence behind the verdict can
+be inspected rather than taken on trust:
 
 ```haskell
 att <- C.attribute meter C.defaultConfig hyp
+C.attVerdict att   -- ControlsPass | SampleAAsymmetry | ...
+C.attAA att        -- the complete A/A run
+C.attBB att        -- the complete B/B run
 ```
+
+**These are controls, not an attribution mechanism.** They can
+convict the harness; they cannot acquit it. A/A compares `sampleA`
+against itself and B/B compares `sampleB` against itself, so an
+asymmetry existing only *between* the two samplers is invisible to
+both. If `sampleA` returns a fully forced input while `sampleB`
+leaves a thunk that the target forces inside the timed region, the
+primary run rejects on that harness artefact and both controls
+pass. `ControlsPass` therefore reads as "no within-class control
+failure was found" — which is why it is not called `TargetLeak`.
+Establishing that a rejection really is the target's requires
+harness symmetry argued by construction, or an independent harness.
 
 ### Reproducibility
 
 `cfgSeed :: Maybe Word64` in `Config` controls the per-pair A/B
-order-bit PRNG. The default `Nothing` draws fresh entropy from the
-monotonic clock per run, so the conditional independence of the
-order bit from any periodic ambient noise (timer interrupts,
-scheduler quanta) is a fact rather than an assumption. Pin
-`cfgSeed = Just s` when you want reproducible runs — for a CI
-tripwire, a debugging session, or a validation baseline.
+order-bit PRNG. The default `Nothing` draws a fresh seed from OS
+entropy (`/dev/urandom`) per run, so the conditional independence
+of the order bit from any periodic ambient noise (timer interrupts,
+scheduler quanta) is a fact rather than an assumption. A clock
+reading would not do: it is not independent entropy, and the
+nuisance process may itself be periodic in that very clock.
+
+Whichever way it resolves, the seed actually used comes back as
+`resSeed` on the `Result` and is recorded in the JSON report. A
+fresh audit run is therefore statistically randomised *and* exactly
+replayable afterwards — feed `resSeed` back as `cfgSeed = Just s`.
+
+Keep this seed distinct from whatever seeds your input samplers.
+The conditional null needs the order bit independent of the sampled
+timing sequence; deriving both from one seed forfeits that. The
+`censor` CLI enforces the split: `--seed` pins the samplers,
+`--order-seed` pins the order bit.
 
 On Linux, `withCounter` swaps the wall-clock meter for a hardware
 performance counter, which is deterministic and immune to the
@@ -251,7 +277,32 @@ driver cost falls from ~1 μs over short runs toward ~250 ns over
 long ones. For any target that itself takes a microsecond or
 longer per call the overhead is dominated by the target; for
 sub-microsecond targets, raise `cfgBatch` (which the wall-clock
-quantum demands anyway).
+quantum demands anyway) — but only if repetition genuinely
+recomputes. See the batching contract below.
+
+### The batching contract
+
+`cfgBatch` repeats the *same* `target a` action on one pre-drawn
+sample. That only multiplies real work when each repetition
+genuinely recomputes: a foreign (FFI) call, or a target driving
+mutable state. For a pure Haskell target `\a -> evaluate (f a)`
+the `f a` thunk is shared across the batch and forced once, so the
+remaining repetitions are no-ops on an already-evaluated value and
+a per-batch reading divided by `cfgBatch` is *not* a per-call
+figure.
+
+This is a property of the target that cannot be inferred, so suites
+declare it per case as a `BatchPolicy`:
+
+  * `SingleShot` — force `batch = 1`. The correct policy for pure
+    Haskell targets. If such a target is sub-quantum under the
+    meter, widen the work rather than batching.
+  * `RepeatableAuto` — each repetition recomputes; calibrate the
+    batch with `calibrateBatchReport`. For FFI calls and targets
+    driving mutable state.
+  * `FixedBatch n` — pin it, for comparability across meters.
+
+`--batch N` on any suite overrides every case's policy.
 
 Current benchmark figures on an M4 Silicon MacBook Air (use
 `cabal bench` to reproduce):
@@ -325,17 +376,41 @@ full run at the current battery size takes roughly an hour under
 the K=4 hedge. The default test suite carries a lightweight smoke
 tier that catches gross wiring regressions only.
 
+### The null, and what it does and does not cover
+
+The null censor tests is **conditional exchangeability** of the
+measured pair `(ta, tb)`: given everything observed so far,
+swapping the two class labels leaves the joint law unchanged. This
+is exactly what the randomised per-pair A/B order delivers, and it
+is implied by — but strictly weaker than — the informal property
+"the two input classes induce the same timing distribution".
+
+Every component of the test bets on an **antisymmetric functional**
+of the pair, a statistic `g` with `g(ta, tb) = -g(tb, ta)`. Under
+exchangeability each such functional is conditionally symmetric
+about zero, hence has conditional mean zero, which is what makes it
+a valid input to a two-sided mean-zero e-process.
+
+The alternatives censor can detect are exactly those that move at
+least one functional in its family off zero. That family is finite
+and therefore **not a complete cover**: no fixed set of functionals
+detects every departure from exchangeability. A `Pass` means "none
+of these channels found evidence", never "this code is constant
+time".
+
 ### Hedged e-process composition
 
-The driver internally runs a four-way convex-hedge mixture of
-anytime-valid e-processes, all consuming the same per-pair
-difference `d = ta - tb`:
+The driver runs a convex-hedge mixture of anytime-valid e-processes
+over that family:
 
   * **Sign** — a two-sided Bernoulli test at `p_0 = 1/2` on
-    `sign d` (ties skipped). No bounds, no clipping. Detects any
-    distributional asymmetry, including equal-mean shape leaks and
-    heavy-tail bulk shifts where the mean signal is swamped by tail
-    variance.
+    `sign d`, where `d = ta - tb` (ties skipped). No bounds, no
+    clipping. Detects asymmetry of the difference itself
+    (`P(d > 0) /= 1/2`), including heavy-tail bulk shifts where the
+    mean signal is swamped by tail variance. Note that it does
+    *not* detect every distributional difference: if both classes
+    are symmetric about a common centre, `d` is symmetric and this
+    channel sees nothing however different the two shapes are.
   * **Magnitude at c, 4c, 16c** — three two-sided bounded-mean
     tests on `d` clipped to progressively wider intervals. The
     tight bound (`c`, from warmup `p99(|d|)`) gives the largest
@@ -343,18 +418,31 @@ difference `d = ta - tb`:
     shifts; the wider bounds preserve signal from rare-outlier
     leaks (e.g. a rarely-taken data-dependent branch) that the
     tight clip would truncate away.
+  * **CDF indicators** — one bounded-mean test on
+    `1[ta <= q] - 1[tb <= q]` per cut point `q`, with the cut
+    points fixed during warmup as order statistics of the *pooled*
+    readings (deciles and quartiles, deduplicated). Each has
+    conditional mean `F_A(q) - F_B(q)`, so together they see any
+    difference between the two classes' CDFs at those points. This
+    is the channel that catches **dispersion leaks** — a target
+    whose timing *variance* depends on the secret while its mean
+    does not — which leave `d` symmetric and are invisible to every
+    other component.
 
 The convex combination itself is delegated to
-`Numeric.Eproc.Mixture`: uniform weights over the four components,
-rejecting when the mixture e-value crosses `1/alpha` (the `+log 4`
-on the log scale over a single component is the price of hedging).
-Rejection latches on the supremum of the mixture's log e-value, not
-on the components' individual suprema. Each component's own peak
-log e-value is surfaced in the `Result` for diagnosis — a rejection
-driven by the sign component points at a shape or bulk-shift leak,
-one driven by the wide magnitude components at rare outliers — but
-the peaks are attained at possibly different times and never gate
-the verdict.
+`Numeric.Eproc.Mixture`: uniform weights over the `K = 4 + n`
+components (`n` resolved cut points), rejecting when the mixture
+e-value crosses `1/alpha`. The `+log K` on the log scale over a
+single component is the price of hedging — against
+`log(1/alpha) = 13.8` at the default alpha, the indicator channel
+costs well under a nat. Rejection latches on the supremum of the
+mixture's log e-value, not on the components' individual suprema.
+Each component's own peak log e-value is surfaced in the `Result`
+for diagnosis — a rejection driven by the sign component points at
+a shape leak, one driven by the wide magnitude components at rare
+outliers, one driven by the indicators at a dispersion or general
+CDF difference — but the peaks are attained at possibly different
+times and never gate the verdict.
 
 ### Baseline
 
