@@ -1,6 +1,6 @@
 # Changelog
 
-- 0.4.0 (unreleased)
+- 0.4.0 (2026-07-30)
   * The null is now stated, and tested, as conditional
     *exchangeability* of the measured pair `(ta, tb)` rather than
     symmetry of `d = ta - tb`. Exchangeability is what the
