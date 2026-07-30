@@ -42,6 +42,7 @@ import Control.Exception (try)
 import Control.Monad (forM)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.List (intercalate)
+import Numeric (showHex)
 import System.Exit (die)
 import System.IO (hFlush, stdout)
 import Text.Printf (printf)
@@ -153,11 +154,11 @@ runBattery meter cfg cs = forM cs $ \(Case name mkH) -> do
   pure (name, r, ma)
 
 attribLabel :: Attribution -> String
-attribLabel a = case a of
-  TargetLeak           -> "target leak"
-  SampleAAsymmetry{}   -> "sampleA asymmetry"
-  SampleBAsymmetry{}   -> "sampleB asymmetry"
-  PervasiveAsymmetry{} -> "harness asymmetry"
+attribLabel a = case attVerdict a of
+  ControlsPass         -> "controls pass"
+  SampleAAsymmetry     -> "sampleA asymmetry"
+  SampleBAsymmetry     -> "sampleB asymmetry"
+  PervasiveAsymmetry   -> "harness asymmetry"
 
 -- sweeps ----------------------------------------------------------------------
 
@@ -229,11 +230,16 @@ resultToJSON r = concat
       (fst (resEffect r)) (snd (resEffect r))
   , ",\"clipped\":",    show (resClipped r)
   , printf ",\"bound\":%.6g" (resBound r)
+  , ",\"seed\":",       jstr ("0x" ++ showHex (resSeed r) "")
+  , ",\"cutPoints\":["
+  , intercalate "," (map (printf "%.6g") (resCutPoints r))
+  , "]"
   , ",\"peaks\":{"
   ,       printf "\"sign\":%.6g"    (resPeakSign r)
   , printf ",\"magn\":%.6g"         (resPeakMagn r)
   , printf ",\"magn4\":%.6g"        (resPeakMagn4 r)
   , printf ",\"magn16\":%.6g"       (resPeakMagn16 r)
+  , printf ",\"cdf\":%.6g"          (resPeakCdf r)
   , "}"
   , ",\"advisories\":["
   , intercalate "," (map advisoryJSON (diagnose r))
@@ -256,6 +262,7 @@ shapeName s = case s of
   BulkShift   -> "bulk"
   ShapeLeak   -> "shape"
   RareOutlier -> "tail"
+  CdfShift    -> "cdf"
   MixedShape  -> "mixed"
 
 jstr :: String -> String

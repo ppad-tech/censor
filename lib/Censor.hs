@@ -15,20 +15,41 @@
 -- through an anytime-valid two-sample test, and either rejects (a
 -- leak is detected) or exhausts its budget.
 --
--- Internally the test is a four-way convex-hedge mixture of
--- e-processes — a sign test at @p_0 = 1\/2@ on @sign d@ plus three
--- bounded-mean tests on @d@ clipped to progressively wider intervals
--- (see 'runCT' for the shape). Each component's wealth process is a
--- nonnegative supermartingale under the null (a notional bankroll
--- that bets on the data and grows only when the null is wrong; see
--- "Numeric.Eproc.Bounded" for the mechanics). The convex
--- combination is delegated to "Numeric.Eproc.Mixture": the mixture
--- is itself an e-process, and the test is valid under optional
--- stopping — 'runCT' halts as soon as the mixture e-value crosses
--- @1 \/ alpha@, with type-I error controlled at @alpha@ regardless
--- of when sampling stops. Alongside the verdict, the driver
--- reports the mixture's anytime-valid p-value and per-component
--- peak evidence on the calibrated e-value scale.
+-- The null is /conditional exchangeability/ of the measured pair
+-- @(ta, tb)@: given the past, swapping the two class labels leaves
+-- the joint law unchanged. This is what the randomised per-pair
+-- A\/B order actually delivers, and it is implied by (but weaker
+-- than) the informal target property \"the two input classes induce
+-- the same timing distribution\".
+--
+-- Every component of the test is an /antisymmetric functional/ of
+-- the pair — a statistic @g@ with @g(ta, tb) = -g(tb, ta)@ — and
+-- each such functional has a conditionally symmetric distribution
+-- under the null, hence conditional mean zero. The test is a
+-- convex-hedge mixture of e-processes over a family of them: a
+-- sign test on @sign d@ where @d = ta - tb@, three bounded-mean
+-- tests on @d@ clipped to progressively wider intervals, and a set
+-- of CDF-indicator tests on @1[ta <= q] - 1[tb <= q]@ at
+-- warmup-fixed cut points @q@ (see 'runCT' for the shape). Each
+-- component's wealth process is a nonnegative supermartingale
+-- under the null (a notional bankroll that bets on the data and
+-- grows only when the null is wrong; see "Numeric.Eproc.Bounded"
+-- for the mechanics). The convex combination is delegated to
+-- "Numeric.Eproc.Mixture": the mixture is itself an e-process, and
+-- the test is valid under optional stopping — 'runCT' halts as
+-- soon as the mixture e-value crosses @1 \/ alpha@, with type-I
+-- error controlled at @alpha@ regardless of when sampling stops.
+-- Alongside the verdict, the driver reports the mixture's
+-- anytime-valid p-value and per-component peak evidence on the
+-- calibrated e-value scale.
+--
+-- The alternatives the test can see are exactly those that move at
+-- least one functional in the family off zero. That family is
+-- deliberately not exhaustive: no fixed finite set of functionals
+-- detects every departure from exchangeability. In particular a
+-- distributional difference confined to regions between the
+-- warmup-fixed cut points, and leaving @d@ symmetric, is invisible
+-- to this test — see 'runCT' for the standing caveat.
 
 module Censor (
     -- * Hypothesis
@@ -63,12 +84,13 @@ module Censor (
   , calibrateBatchReport
   , Noise(..)
 
-    -- * A\/A and B\/B diagnostics
+    -- * A\/A and B\/B negative controls
   , toAA
   , runAA
   , toBB
   , runBB
   , Attribution(..)
+  , ControlVerdict(..)
   , attribute
 
     -- * Measurement (re-exports)
@@ -85,12 +107,14 @@ module Censor (
   , randomBytes
   ) where
 
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, IOException, throwIO, try)
 import Control.Monad (unless)
 import qualified Data.Bits as B
+import qualified Data.ByteString as BS
 import Data.List (sort, sortBy)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
+import System.IO (IOMode(ReadMode), withBinaryFile)
 import qualified Numeric.Eproc.Bernoulli.TwoSided as EPSign
 import qualified Numeric.Eproc.Bounded as EPMagn
 import qualified Numeric.Eproc.ConfSeq as EPCS
@@ -106,16 +130,23 @@ import Censor.Rng (Rng, mkRng, nextWord, randomBytes, splitMix)
 --   * @sampleA@, @sampleB@: independent samplers for two input
 --     classes (typically a \"fixed\" class and a \"random\" class).
 --
---   The null asserts that the paired difference @d = ta - tb@ is
---   conditionally symmetric about zero — a strictly stronger
---   statement than conditional mean zero, and the one that the
---   randomised A\/B order actually delivers. The driver tests it
---   via a four-way convex-hedge mixture of anytime-valid
---   e-processes (a sign test at @p_0 = 1\/2@ plus three
---   bounded-mean tests on @d@ clipped to @c@, @4c@, and @16c@),
---   so the alternative class detected is the union: first-moment
---   shifts, equal-mean shape or tail leaks, and rare-outlier leaks
---   all move at least one component off the null.
+--   The null asserts that the measured pair @(ta, tb)@ is
+--   conditionally exchangeable — swapping the class labels leaves
+--   the conditional joint law unchanged. This is what the
+--   randomised A\/B order delivers, and it is what the driver
+--   tests, via a convex-hedge mixture of anytime-valid e-processes
+--   over a family of antisymmetric functionals of the pair (a sign
+--   test on @sign d@, bounded-mean tests on @d = ta - tb@ clipped
+--   to @c@, @4c@, and @16c@, and CDF-indicator tests at
+--   warmup-fixed cut points).
+--
+--   The detected alternative class is the union over that family:
+--   first-moment shifts, sign-asymmetric shape leaks, rare-outlier
+--   leaks, and dispersion or general CDF differences all move at
+--   least one component off the null. It is a union, not a
+--   complete cover — a departure orthogonal to every functional in
+--   the family passes. Read a 'Pass' as \"none of these channels
+--   found evidence\", not as proof of constant time.
 data Hypothesis a = Hypothesis
   { target  :: !(a -> IO ())
   , sampleA :: !(IO a)
@@ -195,19 +226,30 @@ data Config = Config
                           --   @cfgWarmup <= 100@ picks the max).
   , cfgSeed   :: !(Maybe Word64)
                           -- ^ seed for the per-pair A\/B order bit.
-                          --   'Nothing' (the default) draws fresh
-                          --   entropy per run, so the conditional
-                          --   independence of the order bit from
-                          --   any periodic ambient noise (timer
-                          --   interrupts, scheduler quanta) is a
-                          --   fact rather than an assumption.
-                          --   @Just s@ pins the seed for
-                          --   reproducibility.
+                          --   'Nothing' (the default) draws a fresh
+                          --   seed from OS entropy
+                          --   (@\/dev\/urandom@) per run, so the
+                          --   conditional independence of the order
+                          --   bit from any periodic ambient noise
+                          --   (timer interrupts, scheduler quanta)
+                          --   is a fact rather than an assumption.
+                          --   @Just s@ pins the seed instead.
+                          --
+                          --   Whichever way it resolves, the seed
+                          --   actually used is reported as
+                          --   'resSeed', so a randomised run can be
+                          --   replayed exactly by feeding that value
+                          --   back as @Just@. Keep this seed
+                          --   distinct from any seed driving the
+                          --   input samplers: the order bit must be
+                          --   independent of the sampled timing
+                          --   sequence for the conditional null to
+                          --   hold.
   } deriving Show
 
 -- | Defaults: @alpha = 1e-6@, budget @100000@ pairs, batch 1 (no
 --   inner repetition), warmup 200 pairs, order-bit seed drawn from
---   entropy per run.
+--   OS entropy per run.
 defaultConfig :: Config
 defaultConfig = Config
   { cfgAlpha  = 1.0e-6
@@ -237,12 +279,15 @@ defaultConfig = Config
 --   @lambda_max@ is proportionally smaller).
 --
 --   The per-component peaks identify which evidence channel drove a
---   rejection: 'resPeakSign' growing points at a distributional
---   asymmetry (bulk shift or shape leak), 'resPeakMagn' at a small
---   consistent shift, 'resPeakMagn16' at rare large outliers. Each
---   is a supremum over its own (possibly different) time, so the
---   peaks are diagnostic only -- rejection latches on the mixture's
---   supremum, never on per-component peaks.
+--   rejection: 'resPeakSign' growing points at an asymmetry of @d@
+--   itself (@P(d > 0) \/= 1\/2@), 'resPeakMagn' at a small
+--   consistent shift, 'resPeakMagn16' at rare large outliers, and
+--   'resPeakCdf' at a difference between the two classes' CDFs at
+--   one of the warmup-fixed cut points (dispersion or general shape,
+--   including leaks that leave @d@ symmetric and so are invisible to
+--   every other channel). Each is a supremum over its own (possibly
+--   different) time, so the peaks are diagnostic only -- rejection
+--   latches on the mixture's supremum, never on per-component peaks.
 data Result
   = Reject
       { resPairs      :: {-# UNPACK #-} !Int
@@ -284,6 +329,18 @@ data Result
         -- ^ peak log e-value of the magnitude component at @4c@.
       , resPeakMagn16 :: {-# UNPACK #-} !Double
         -- ^ peak log e-value of the magnitude component at @16c@.
+      , resPeakCdf    :: {-# UNPACK #-} !Double
+        -- ^ largest peak log e-value across the CDF-indicator
+        --   components (@0@ when warmup resolved no cut points).
+      , resCutPoints  :: ![Double]
+        -- ^ the warmup-fixed cut points @q@ backing the
+        --   CDF-indicator components, ascending and deduplicated.
+        --   Empty when warmup readings were degenerate.
+      , resSeed       :: {-# UNPACK #-} !Word64
+        -- ^ the order-bit seed the run actually used, whether
+        --   supplied via 'cfgSeed' or drawn from OS entropy.
+        --   Feeding it back as @'cfgSeed' = 'Just' s@ replays the
+        --   same A\/B order sequence.
       }
   | Pass
       { resPairs      :: {-# UNPACK #-} !Int
@@ -296,6 +353,9 @@ data Result
       , resPeakMagn   :: {-# UNPACK #-} !Double
       , resPeakMagn4  :: {-# UNPACK #-} !Double
       , resPeakMagn16 :: {-# UNPACK #-} !Double
+      , resPeakCdf    :: {-# UNPACK #-} !Double
+      , resCutPoints  :: ![Double]
+      , resSeed       :: {-# UNPACK #-} !Word64
       }
   deriving Show
 
@@ -329,11 +389,16 @@ data LeakShape
     -- ^ 'resPeakMagn' (tight magnitude) dominates: a small consistent
     --   mean shift in @d@.
   | ShapeLeak
-    -- ^ 'resPeakSign' dominates: an equal-mean distributional
-    --   asymmetry (@P(d > 0) \/= 1\/2@).
+    -- ^ 'resPeakSign' dominates: an equal-mean asymmetry of the
+    --   difference itself (@P(d > 0) \/= 1\/2@).
   | RareOutlier
     -- ^ 'resPeakMagn4' or 'resPeakMagn16' dominates: rare-tail
     --   outliers (e.g. a rarely-taken data-dependent branch).
+  | CdfShift
+    -- ^ 'resPeakCdf' dominates: the two classes' CDFs differ at a
+    --   warmup-fixed cut point. Typical of a dispersion (variance)
+    --   leak, which leaves @d@ symmetric and so registers on no
+    --   other channel.
   | MixedShape
     -- ^ No single component peak dominates by @>= 1.5x@; the leak
     --   registers on several channels comparably.
@@ -365,10 +430,11 @@ diagnose r =
         Pass{}   -> []
   in  clipA ++ powerA ++ drvA
 
--- | Identify which component of the K=4 hedge has the largest peak
---   log e-value in a t'Result', binning the two wider magnitude
---   components together as 'RareOutlier'. Returns 'MixedShape' when
---   no single peak exceeds the next-largest by a factor of @1.5@.
+-- | Identify which channel of the hedge has the largest peak log
+--   e-value in a t'Result', binning the two wider magnitude
+--   components together as 'RareOutlier' and the CDF-indicator
+--   components together as 'CdfShift'. Returns 'MixedShape' when no
+--   single peak exceeds the next-largest by a factor of @1.5@.
 --
 --   Only meaningful on a 'Reject' — on a 'Pass' every peak sits near
 --   the calibrated floor of @0@ and the returned shape is not
@@ -378,10 +444,12 @@ leakShape r =
   let !sig  = resPeakSign r
       !mag  = resPeakMagn r
       !tl   = max (resPeakMagn4 r) (resPeakMagn16 r)
+      !cdf  = resPeakCdf r
       ranked = sortBy (\a b -> compare (fst b) (fst a))
                  [ (sig, ShapeLeak)
                  , (mag, BulkShift)
                  , (tl,  RareOutlier)
+                 , (cdf, CdfShift)
                  ]
   in  case ranked of
         (p1, s1) : (p2, _) : _
@@ -448,15 +516,20 @@ data Frame = Frame
 --
 --   Phases:
 --
---   1. /Warmup/ — take @cfgWarmup@ paired measurements to estimate
---      an upper bound @c@ on the magnitude of the per-pair difference
---      @|d| = |ta - tb|@. The subsequent e-process bets on @d@
---      clipped to @[-c, c]@.
+--   1. /Warmup/ — take @cfgWarmup@ paired measurements and fix two
+--      calibrations from them: an upper bound @c@ on the magnitude
+--      of the per-pair difference @|d| = |ta - tb|@, and the cut
+--      points @q@ for the CDF-indicator components (order
+--      statistics of the /pooled/ per-class readings, so a cut
+--      point carries no class information). Both are frozen before
+--      the main phase begins.
 --   2. /Main/ — for each pair, choose A-first or B-first uniformly
---      at random, sample and measure both classes, compute
---      @d = ta - tb@, clip to @[-c, c]@, and stream to the e-process
---      test. Halt as soon as the wealth process crosses threshold,
---      or when the budget is exhausted.
+--      at random, sample and measure both classes, then stream
+--      every hedge component's functional of @(ta, tb)@ into its
+--      e-process: @sign d@, @d@ clipped to @[-c, c]@, @[-4c, 4c]@,
+--      @[-16c, 16c]@, and @1[ta <= q] - 1[tb <= q]@ at each cut
+--      point. Halt as soon as the mixture crosses threshold, or
+--      when the budget is exhausted.
 --
 --   The main phase also feeds @d@ clipped to the widest hedge
 --   interval @[-16c, 16c]@ into an anytime-valid confidence
@@ -464,22 +537,31 @@ data Frame = Frame
 --   'resEffect': the effect size of a detected leak, in meter
 --   units. Warmup pairs are excluded (they fix the bounds).
 --
---   Because the order bit is randomised per pair, @d@ is
---   conditionally symmetric about zero under H_0 (not just conditional
---   mean zero); symmetric clipping is odd and preserves the null.
---   Betting on @d@ directly — rather than on the raw per-class
---   readings — lets @lambda_max@ scale with the noise magnitude
---   @p99(|d|)@ rather than with the target's baseline runtime
---   @p99(t)@, which for narrow-noise heavy-baseline targets can be
---   orders of magnitude better for power at the same alpha.
+--   Because the order bit is randomised per pair, @(ta, tb)@ is
+--   conditionally exchangeable under H_0, so every antisymmetric
+--   functional of it is conditionally symmetric about zero — not
+--   merely conditional mean zero. Symmetric clipping is odd and so
+--   preserves that symmetry. Betting on @d@ directly — rather than
+--   on the raw per-class readings — lets @lambda_max@ scale with
+--   the noise magnitude @p99(|d|)@ rather than with the target's
+--   baseline runtime @p99(t)@, which for narrow-noise
+--   heavy-baseline targets can be orders of magnitude better for
+--   power at the same alpha.
+--
+--   /Standing caveat./ The functional family is finite, so the test
+--   is not an omnibus test of distributional equality. A departure
+--   that leaves @d@ symmetric /and/ leaves @F_A - F_B@ zero at
+--   every cut point passes. Widening 'cfgWarmup' sharpens the cut
+--   points but does not close the gap in principle. Read a 'Pass'
+--   as the absence of evidence on these channels.
 runCTWith
   :: Meter -> Config -> Hypothesis a -> (Frame -> IO ()) -> IO Result
 runCTWith meter cfg hyp observe = do
   validateConfig cfg
-  (!wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
-  (!c, !meterResolves) <- warmup meter cfg hyp wSeed
+  (!root, !wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
+  (!c, !qs, !meterResolves) <- warmup meter cfg hyp wSeed
   unless meterResolves $ throwIO WarmupZeroDuration
-  !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c of
+  !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c qs of
     Left  e -> throwIO (InvalidEprocConfig e)
     Right x -> pure x
   !cscfg <- case EPCS.config (negate (hcC3 hcfg)) (hcC3 hcfg)
@@ -496,6 +578,9 @@ runCTWith meter cfg hyp observe = do
         (EPMagn.log_evalue_sup (hsMagn1 st))
         (EPMagn.log_evalue_sup (hsMagn2 st))
         (EPMagn.log_evalue_sup (hsMagn3 st))
+        (peakCdf (hsCdf st))
+        qs
+        root
       -- the effect interval is latched: once the evidence pins the
       -- mean below the grid's resolution the survivor set empties,
       -- and the last resolvable interval (nested within all earlier
@@ -507,9 +592,11 @@ runCTWith meter cfg hyp observe = do
         | otherwise = do
             let (!rng', !flipOrder) = nextOrderBit rng
             (!ta, !tb) <- runPair meter cfg hyp flipOrder
-            let !d       = fromIntegral ta - fromIntegral tb :: Double
+            let !xa      = fromIntegral ta :: Double
+                !xb      = fromIntegral tb :: Double
+                !d       = xa - xb
                 !clipped = abs d > c
-                !st'     = updateHedge hcfg st d
+                !st'     = updateHedge hcfg st d xa xb
                 !cs'     = EPCS.update cscfg cs (clipD (hcC3 hcfg) d)
                 !iv'     = case EPCS.interval cscfg cs' of
                              Just x  -> x
@@ -534,12 +621,12 @@ runCTWith meter cfg hyp observe = do
 runCT :: Meter -> Config -> Hypothesis a -> IO Result
 runCT meter cfg hyp = runCTWith meter cfg hyp (\_ -> pure ())
 
--- | Run a constant-time test and, if it rejects, attribute the
---   rejection with the A\/A and B\/B diagnostics ('attribute'). A
---   'Pass' returns 'Nothing' (no attribution needed); a 'Reject'
---   returns @'Just' att@ distinguishing a target leak from a harness
---   asymmetry. The diagnostics re-run the test twice, so this costs
---   up to three runs on a rejection.
+-- | Run a constant-time test and, if it rejects, qualify the
+--   rejection with the A\/A and B\/B negative controls
+--   ('attribute'). A 'Pass' returns 'Nothing' (no controls needed);
+--   a 'Reject' returns @'Just' att@ reporting whether either
+--   control convicted the harness. The controls re-run the test
+--   twice, so this costs up to three runs on a rejection.
 runCTAttributed
   :: Meter -> Config -> Hypothesis a -> IO (Result, Maybe Attribution)
 runCTAttributed meter cfg hyp = do
@@ -749,40 +836,67 @@ toBB h = h { sampleA = sampleB h }
 runBB :: Meter -> Config -> Hypothesis a -> IO Result
 runBB meter cfg hyp = runCT meter cfg (toBB hyp)
 
--- | Attribution of a 'Reject' verdict, as determined by the A\/A
---   and B\/B diagnostics. Rejecting diagnostics carry their
---   'Result's as evidence.
-data Attribution
-  = TargetLeak
-    -- ^ both diagnostics passed: the harness is symmetric, and a
-    --   'Reject' from 'runCT' is attributable to the target.
-  | SampleAAsymmetry !Result
-    -- ^ the A\/A diagnostic rejected: 'sampleA' itself induces a
-    --   timing asymmetry, and the real-hypothesis verdict is not
+-- | The outcome of the A\/A and B\/B /negative controls/.
+--
+--   These are controls, not an attribution mechanism: they can
+--   convict the harness, but they cannot acquit it. A\/A compares
+--   'sampleA' against itself and B\/B compares 'sampleB' against
+--   itself, so an asymmetry that exists only /between/ the two
+--   samplers is invisible to both. If, say, 'sampleA' returns a
+--   fully forced input while 'sampleB' leaves a thunk that the
+--   target forces inside the timed region, the primary run rejects
+--   on that harness artefact while both controls pass.
+data ControlVerdict
+  = ControlsPass
+    -- ^ Neither control rejected. No within-class harness asymmetry
+    --   was found — which is weaker than \"the harness is
+    --   symmetric\", and weaker still than \"the target leaks\".
+    --   A 'Reject' from 'runCT' alongside this verdict is
+    --   /consistent with/ a target leak; establishing that it /is/
+    --   one needs harness symmetry argued by construction, or an
+    --   independent harness.
+  | SampleAAsymmetry
+    -- ^ The A\/A control rejected: 'sampleA' itself induces a
+    --   timing asymmetry, and the primary verdict is not
     --   informative until it is fixed.
-  | SampleBAsymmetry !Result
-    -- ^ the B\/B diagnostic rejected: as above, for 'sampleB'.
-  | PervasiveAsymmetry !Result !Result
-    -- ^ both diagnostics rejected (A\/A and B\/B results
-    --   respectively): the harness asymmetry is not specific to
-    --   either sampler.
-  deriving Show
+  | SampleBAsymmetry
+    -- ^ The B\/B control rejected: as above, for 'sampleB'.
+  | PervasiveAsymmetry
+    -- ^ Both controls rejected: the harness asymmetry is not
+    --   specific to either sampler.
+  deriving (Eq, Show)
 
--- | Attribute a 'Reject' verdict by running the A\/A and B\/B
---   diagnostics and combining their outcomes. Only meaningful after
---   'runCT' has rejected the hypothesis: on a symmetric harness both
---   diagnostics pass whether or not the target leaks, so a
---   'TargetLeak' attribution confirms an existing rejection rather
+-- | The full result of running the negative controls: the verdict
+--   plus both control runs in their entirety, so a caller can
+--   serialise or inspect the evidence rather than trusting a label.
+data Attribution = Attribution
+  { attVerdict :: !ControlVerdict
+    -- ^ the combined outcome.
+  , attAA      :: !Result
+    -- ^ the complete A\/A control run.
+  , attBB      :: !Result
+    -- ^ the complete B\/B control run.
+  } deriving Show
+
+-- | Run the A\/A and B\/B negative controls and combine their
+--   outcomes. Only meaningful after 'runCT' has rejected: on a
+--   symmetric harness both controls pass whether or not the target
+--   leaks, so 'ControlsPass' qualifies an existing rejection rather
 --   than detecting anything by itself.
 attribute :: Meter -> Config -> Hypothesis a -> IO Attribution
 attribute meter cfg hyp = do
   raa <- runAA meter cfg hyp
   rbb <- runBB meter cfg hyp
-  pure $! case (raa, rbb) of
-    (Pass{},     Pass{})     -> TargetLeak
-    (a@Reject{}, Pass{})     -> SampleAAsymmetry a
-    (Pass{},     b@Reject{}) -> SampleBAsymmetry b
-    (a@Reject{}, b@Reject{}) -> PervasiveAsymmetry a b
+  let !v = case (raa, rbb) of
+        (Pass{},   Pass{})   -> ControlsPass
+        (Reject{}, Pass{})   -> SampleAAsymmetry
+        (Pass{},   Reject{}) -> SampleBAsymmetry
+        (Reject{}, Reject{}) -> PervasiveAsymmetry
+  pure $! Attribution
+    { attVerdict = v
+    , attAA      = raa
+    , attBB      = rbb
+    }
 
 -- internal
 
@@ -816,18 +930,23 @@ runPair meter cfg hyp flipOrder
       pure (x, y)
 {-# INLINE runPair #-}
 
--- The K=4 hedge composition ------------------------------------------------
+-- The hedge composition ----------------------------------------------------
 
--- Four e-processes running on the same per-pair @d@, combined via
--- "Numeric.Eproc.Mixture" (a uniform convex hedge):
+-- A family of e-processes, each betting on a different
+-- antisymmetric functional of the measured pair @(ta, tb)@,
+-- combined via "Numeric.Eproc.Mixture" (a uniform convex hedge).
+-- Antisymmetry (@g(ta, tb) = -g(tb, ta)@) is what makes each
+-- component's input conditionally symmetric about zero under
+-- exchangeability, hence a valid null for a two-sided mean-zero
+-- test:
 --
 --   * /sign/: a two-sided Bernoulli test at @p_0 = 1\/2@ on
---     @sign d@ (ties skipped, valid because non-tie steps are
---     conditionally fair under symmetric @d@). No bounds, no
---     warmup calibration; unbeatable against equal-mean shape
---     leaks and heavy-tail scenarios where a small bulk shift
---     moves @P(d > 0)@ off @1\/2@ but variance from the tail
---     swamps the magnitude signal.
+--     @sign d@, @d = ta - tb@ (ties skipped, valid because non-tie
+--     steps are conditionally fair under symmetric @d@). No bounds,
+--     no warmup calibration; unbeatable against shape leaks that
+--     move @P(d > 0)@ off @1\/2@ and heavy-tail scenarios where a
+--     small bulk shift is swamped by tail variance in the
+--     magnitude channel.
 --
 --   * /magn(c), magn(4c), magn(16c)/: three two-sided bounded-mean
 --     tests on @d@ clipped to progressively wider intervals. The
@@ -837,6 +956,15 @@ runPair meter cfg hyp flipOrder
 --     rare-outlier leaks (a rarely-taken data-dependent branch
 --     showing up as occasional slow paths).
 --
+--   * /cdf(q)/: one two-sided bounded-mean test on
+--     @1[ta <= q] - 1[tb <= q]@ per warmup-fixed cut point @q@.
+--     Each has conditional mean @F_A(q) - F_B(q)@, so together they
+--     see any difference between the two classes' CDFs at the cut
+--     points — including dispersion leaks, which leave @d@
+--     symmetric and are therefore invisible to every other
+--     component. The summand lies in @{-1, 0, 1}@ by construction,
+--     so the bound needs no calibration.
+--
 -- The driver steps each component itself (they are heterogeneous)
 -- and feeds the vector of their calibrated log e-values to
 -- 'EPMix.update' once per pair, upholding the mixture's lockstep
@@ -845,12 +973,17 @@ runPair meter cfg hyp flipOrder
 -- mixture owns the rejection latch (the supremum of the /mixture's/
 -- log e-value, never per-component suprema, which peak at different
 -- times) and the threshold @log(K \/ alpha)@ on the component sum.
+-- @K@ is @4 + n@ for @n@ resolved cut points, so the hedging price
+-- is @log K@ nats — against @log(1 \/ alpha) = 13.8@ at the default
+-- alpha, adding the CDF channel costs well under a nat.
 
 data HedgeCfg = HedgeCfg
   { hcSign  :: !EPSign.Config
   , hcMagn1 :: !EPMagn.Config
   , hcMagn2 :: !EPMagn.Config
   , hcMagn3 :: !EPMagn.Config
+  , hcCdf   :: !EPMagn.Config          -- shared by every cut point
+  , hcQs    :: ![Double]               -- the cut points themselves
   , hcMix   :: !EPMix.Config
   , hcC1    :: {-# UNPACK #-} !Double  -- tight clip level (base c)
   , hcC2    :: {-# UNPACK #-} !Double  -- 4c
@@ -862,23 +995,28 @@ data HedgeState = HedgeState
   , hsMagn1 :: !EPMagn.State
   , hsMagn2 :: !EPMagn.State
   , hsMagn3 :: !EPMagn.State
+  , hsCdf   :: ![EPMagn.State]         -- aligned with 'hcQs'
   , hsMix   :: !EPMix.State
   }
 
-mkHedgeCfg :: Double -> Double -> Either ConfigError HedgeCfg
-mkHedgeCfg !alpha !c = do
+mkHedgeCfg
+  :: Double -> Double -> [Double] -> Either ConfigError HedgeCfg
+mkHedgeCfg !alpha !c qs = do
   let !c2 = 4  * c
       !c3 = 16 * c
   !sc <- EPSign.config 0.5 alpha Newton
   !m1 <- EPMagn.config 0 (negate c)  c  alpha Newton
   !m2 <- EPMagn.config 0 (negate c2) c2 alpha Newton
   !m3 <- EPMagn.config 0 (negate c3) c3 alpha Newton
-  !mx <- EPMix.config 4 alpha
+  !cd <- EPMagn.config 0 (negate 1)  1  alpha Newton
+  !mx <- EPMix.config (4 + length qs) alpha
   pure HedgeCfg
     { hcSign  = sc
     , hcMagn1 = m1
     , hcMagn2 = m2
     , hcMagn3 = m3
+    , hcCdf   = cd
+    , hcQs    = qs
     , hcMix   = mx
     , hcC1    = c
     , hcC2    = c2
@@ -891,30 +1029,63 @@ initialHedge HedgeCfg{..} = HedgeState
   , hsMagn1 = EPMagn.initial hcMagn1
   , hsMagn2 = EPMagn.initial hcMagn2
   , hsMagn3 = EPMagn.initial hcMagn3
+  , hsCdf   = map (const (EPMagn.initial hcCdf)) hcQs
   , hsMix   = EPMix.initial hcMix
   }
 
-updateHedge :: HedgeCfg -> HedgeState -> Double -> HedgeState
-updateHedge HedgeCfg{..} HedgeState{..} !d =
+updateHedge
+  :: HedgeCfg -> HedgeState -> Double -> Double -> Double -> HedgeState
+updateHedge HedgeCfg{..} HedgeState{..} !d !ta !tb =
   let !s'  = if d == 0
              then hsSign
              else EPSign.update hcSign hsSign (d > 0)
       !m1' = EPMagn.update hcMagn1 hsMagn1 (clipD hcC1 d)
       !m2' = EPMagn.update hcMagn2 hsMagn2 (clipD hcC2 d)
       !m3' = EPMagn.update hcMagn3 hsMagn3 (clipD hcC3 d)
+      !cd' = stepCdf hcCdf hcQs hsCdf ta tb
       !x'  = EPMix.update hcMix hsMix
-               [ EPSign.log_evalue s'
-               , EPMagn.log_evalue m1'
-               , EPMagn.log_evalue m2'
-               , EPMagn.log_evalue m3'
-               ]
+               ( EPSign.log_evalue s'
+               : EPMagn.log_evalue m1'
+               : EPMagn.log_evalue m2'
+               : EPMagn.log_evalue m3'
+               : map EPMagn.log_evalue cd'
+               )
   in  HedgeState
         { hsSign  = s'
         , hsMagn1 = m1'
         , hsMagn2 = m2'
         , hsMagn3 = m3'
+        , hsCdf   = cd'
         , hsMix   = x'
         }
+
+-- Step every CDF-indicator component. Spine- and element-strict so
+-- the per-pair states don't accumulate thunks across the budget.
+stepCdf
+  :: EPMagn.Config -> [Double] -> [EPMagn.State] -> Double -> Double
+  -> [EPMagn.State]
+stepCdf !cfg = go
+  where
+    go (q : qs) (s : ss) !ta !tb =
+      let !s'  = EPMagn.update cfg s (cdfDiff q ta tb)
+          !ss' = go qs ss ta tb
+      in  s' : ss'
+    go _ _ _ _ = []
+
+-- The antisymmetric indicator functional at cut point @q@:
+-- @1[ta <= q] - 1[tb <= q]@, valued in @{-1, 0, 1}@, with
+-- conditional mean @F_A(q) - F_B(q)@.
+cdfDiff :: Double -> Double -> Double -> Double
+cdfDiff !q !ta !tb = ind ta - ind tb
+  where
+    ind !t | t <= q    = 1
+           | otherwise = 0
+{-# INLINE cdfDiff #-}
+
+-- Largest peak log e-value across the CDF components; @0@ (the
+-- calibrated floor) when there are none.
+peakCdf :: [EPMagn.State] -> Double
+peakCdf = foldr (\s acc -> max (EPMagn.log_evalue_sup s) acc) 0
 
 clipD :: Double -> Double -> Double
 clipD !lim !x
@@ -945,18 +1116,43 @@ nextOrderBit !s =
   in  (s', B.testBit w 0)
 {-# INLINE nextOrderBit #-}
 
--- Resolve the (warmup, main) seed pair. From a user-supplied
--- constant we splitmix once to derive each slot; from entropy
--- (Nothing) we take the current monotonic time and splitmix twice
--- to decorrelate low-order bits from wall clock resolution.
-resolveSeeds :: Maybe Word64 -> IO (Word64, Word64)
+-- Resolve the (root, warmup, main) seed triple. The root is the
+-- user-supplied constant, or a fresh draw from OS entropy; we
+-- splitmix off it to derive the warmup and main-phase slots. The
+-- root is returned so the driver can report it as 'resSeed' and a
+-- randomised run stays exactly replayable.
+--
+-- OS entropy rather than the monotonic clock: a clock reading is
+-- not independent entropy, and the conditional-null argument needs
+-- the order bit independent of the nuisance process — which may
+-- itself be periodic in that very clock. 'getMonotonicTimeNSec' is
+-- kept only as a fallback for hosts without a readable
+-- /dev/urandom, where it is better than a constant.
+resolveSeeds :: Maybe Word64 -> IO (Word64, Word64, Word64)
 resolveSeeds mseed = do
   !base <- case mseed of
     Just s  -> pure s
-    Nothing -> getMonotonicTimeNSec
+    Nothing -> do
+      mw <- osEntropy
+      case mw of
+        Just w  -> pure w
+        Nothing -> getMonotonicTimeNSec
   let (!s1, !w1) = splitMix base
       (_ , !w2) = splitMix s1
-  pure (w1, w2)
+  pure (base, w1, w2)
+
+-- Eight bytes from /dev/urandom, big-endian. 'Nothing' on any IO
+-- failure (absent device, sandbox, exhausted descriptors).
+osEntropy :: IO (Maybe Word64)
+osEntropy = fmap toWord (try (withBinaryFile urandom ReadMode grab))
+  where
+    urandom = "/dev/urandom"
+    grab h  = BS.hGet h 8
+    toWord (Left e)   = const Nothing (e :: IOException)
+    toWord (Right bs)
+      | BS.length bs == 8 = Just $! BS.foldl' step 0 bs
+      | otherwise         = Nothing
+    step !acc !w = acc * 256 + fromIntegral w
 
 -- Warmup collects per-pair @|d|@ (for the bound estimate) and the
 -- flat list of per-class readings (for the meter-resolution
@@ -964,18 +1160,28 @@ resolveSeeds mseed = do
 -- loop so the p99 estimate doesn't inherit a parity-locked nuisance
 -- bias.
 --
--- Returns @(c, meterResolves)@ where @c = max 1 (2 * p99(|d|))@ is
--- the clipping bound and @meterResolves@ is True iff
--- @p99(readings) > 0@ (i.e., the meter is producing nonzero readings
--- often enough that at least the upper tail is resolved). If
--- @meterResolves@ is False the meter's quantum is swallowing at
--- least 99% of per-target timings and the caller throws
--- 'WarmupZeroDuration' with the "raise cfgBatch" hint. All-zero
--- /differences/ with well-resolved readings are the PMU-on-truly-CT
--- happy path — we fall back to @c = 1@ and let the main loop
--- proceed; under continued zero differences the wealth process
--- stays flat and the run passes at budget.
-warmup :: Meter -> Config -> Hypothesis a -> Word64 -> IO (Double, Bool)
+-- Returns @(c, qs, meterResolves)@ where @c = max 1 (2 * p99(|d|))@
+-- is the clipping bound, @qs@ are the CDF-indicator cut points, and
+-- @meterResolves@ is True iff @p99(readings) > 0@ (i.e., the meter
+-- is producing nonzero readings often enough that at least the
+-- upper tail is resolved). If @meterResolves@ is False the meter's
+-- quantum is swallowing at least 99% of per-target timings and the
+-- caller throws 'WarmupZeroDuration' with the "raise cfgBatch"
+-- hint. All-zero /differences/ with well-resolved readings are the
+-- PMU-on-truly-CT happy path — we fall back to @c = 1@ and let the
+-- main loop proceed; under continued zero differences the wealth
+-- process stays flat and the run passes at budget.
+--
+-- The cut points are order statistics of the /pooled/ readings, so
+-- they are fixed before the main phase and identical for both
+-- classes — which is what keeps the indicator functional
+-- antisymmetric, and hence the null intact. Pooling also means a
+-- cut point carries no class information. Duplicates are dropped:
+-- on a discrete meter several levels can land on the same reading,
+-- and a repeated cut point would only inflate @K@.
+warmup
+  :: Meter -> Config -> Hypothesis a -> Word64
+  -> IO (Double, [Double], Bool)
 warmup meter cfg hyp seed = do
   let go !i !rng !accD !accR
         | i >= cfgWarmup cfg = pure (accD, accR)
@@ -987,8 +1193,10 @@ warmup meter cfg hyp seed = do
                 !da = abs (dx - dy)
             go (i + 1) rng' (da : accD) (x : y : accR)
   (diffs, readings) <- go 0 seed [] []
-  let !p99d = orderStat99 diffs
-      !p99r = orderStat99 readings
+  let !sortedR = sort readings
+      !p99d    = orderStat99 diffs
+      !p99r    = orderStat99 readings
+      !qs      = cutPoints sortedR
   -- "p99" is fuzzy: at default cfgWarmup = 200 (m = 200 diffs, m'
   -- = 400 readings) idx lands at ~99.5% empirical rank. At small
   -- warmup sizes (cfgWarmup <= 100 for diffs) idx = m - 1, so p99
@@ -1000,7 +1208,7 @@ warmup meter cfg hyp seed = do
   -- The @max 1@ floor keeps @c > 0@ so the e-process configs accept
   -- it even when warmup differences are identically zero (PMU on
   -- truly CT code).
-  pure (max 1 (2 * p99d), p99r > 0)
+  pure (max 1 (2 * p99d), qs, p99r > 0)
 
 -- Empirical @~p99@ order statistic. Sorts and picks index
 -- @(m * 99) \/ 100@; degenerates to the sample max at small @m@
@@ -1014,3 +1222,35 @@ orderStat99 xs =
         (x : _) -> x
         []      -> 0
 {-# INLINE orderStat99 #-}
+
+-- The levels at which the CDF-indicator components cut the pooled
+-- warmup readings. Spread across the bulk rather than the tails:
+-- a cut point out at the extremes leaves both indicators equal on
+-- nearly every pair, contributing no evidence while still costing
+-- its share of @log K@. The topmost level is deliberately below
+-- the p99 that sets the clip bound, so the two calibrations do not
+-- collapse onto the same statistic.
+cdfLevels :: [Double]
+cdfLevels = [0.10, 0.25, 0.50, 0.75, 0.90]
+
+-- Nearest-rank order statistics of a sorted reading list at
+-- 'cdfLevels', ascending and deduplicated. Empty when warmup
+-- collected nothing.
+cutPoints :: [Word64] -> [Double]
+cutPoints sorted
+  | m == 0    = []
+  | otherwise = dedupAsc (map pick cdfLevels)
+  where
+    !m = length sorted
+    pick !p =
+      let !idx = max 0 (min (m - 1) (floor (p * fromIntegral m)))
+      in  case drop idx sorted of
+            (x : _) -> fromIntegral x
+            []      -> 0
+
+-- Drop repeats from an ascending list.
+dedupAsc :: [Double] -> [Double]
+dedupAsc (x : y : rest)
+  | x == y    = dedupAsc (y : rest)
+  | otherwise = x : dedupAsc (y : rest)
+dedupAsc xs = xs

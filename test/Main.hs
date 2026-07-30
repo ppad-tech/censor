@@ -249,13 +249,14 @@ attributedTests = testGroup "runCTAttributed" [
         (C.Pass{}, Nothing) -> pure ()
         _                   -> assertFailure "expected (Pass, Nothing)"
 
-  , testCase "reject attributes a target leak" $ do
+  , testCase "reject runs controls, and they pass" $ do
       (hyp, meter) <- leakHyp
       (r, ma) <- C.runCTAttributed meter leakCfg hyp
       case (r, ma) of
-        (C.Reject{}, Just C.TargetLeak) -> pure ()
-        (C.Reject{}, Just other)        -> assertFailure $
-          "expected TargetLeak, got " ++ show other
+        (C.Reject{}, Just att)
+          | C.attVerdict att == C.ControlsPass -> pure ()
+        (C.Reject{}, Just other)               -> assertFailure $
+          "expected ControlsPass, got " ++ show (C.attVerdict other)
         _ -> assertFailure "leak fixture did not reject"
   ]
 
@@ -476,14 +477,25 @@ aaDiagnosticTests = testGroup "A/A and B/B diagnostics" [
 -- rejection attributes to the target.
 attributeTests :: TestTree
 attributeTests = testGroup "attribute" [
-    testCase "symmetric-harness leak attributes to the target" $ do
+    testCase "symmetric harness: neither control convicts" $ do
       (hyp, meter) <- leakHyp
       let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
       att <- C.attribute meter c hyp
-      case att of
-        C.TargetLeak -> pure ()
+      case C.attVerdict att of
+        C.ControlsPass -> pure ()
         other -> assertFailure $
-          "expected TargetLeak, got " ++ show other
+          "expected ControlsPass, got " ++ show other
+
+  , testCase "controls carry both full runs, not just a label" $ do
+      (hyp, meter) <- leakHyp
+      let c = leakCfg { C.cfgSeed = Just 0xABAD1DEA }
+      att <- C.attribute meter c hyp
+      -- both control runs must be present and non-degenerate, so a
+      -- reader can weigh how much evidence backs ControlsPass.
+      assertBool "A/A control consumed no pairs"
+        (C.resPairs (C.attAA att) > 0)
+      assertBool "B/B control consumed no pairs"
+        (C.resPairs (C.attBB att) > 0)
   ]
 
 -- fixVsRandom pins the first secret draw as class A's input and
@@ -654,15 +666,18 @@ countRejects = go 0
 
 smokeCalibrationTests :: TestTree
 smokeCalibrationTests = testGroup "smoke calibration" [
-    -- two H_0 fixtures, alpha = 0.1, N = 200, loose bound: a true
+    -- an H_0 fixture, alpha = 0.1, N = 200, loose bound: a true
     -- 0.1-FPR test would produce ~20 +/- ~10 rejections; a broken
     -- driver flips this to 100+ rejections. The 0.30 bound is a
     -- regression tripwire, not a real calibration check.
     testCase "sym-uniform H_0 stays under 30%" $
       assertCalibrated symUniformTrial
 
-  , testCase "asym-uniform-equal-mean H_0 stays under 30%" $
-      assertCalibrated asymUniformTrial
+    -- the mirror-image tripwire: a variance-only alternative must
+    -- be detected, not tolerated. This is the channel that a null
+    -- of "d is symmetric" cannot see and exchangeability can.
+  , testCase "asym-uniform-equal-mean H_1 detected above 90%" $
+      assertDetected asymUniformTrial
   ]
   where
     cfg = C.defaultConfig
@@ -677,6 +692,10 @@ smokeCalibrationTests = testGroup "smoke calibration" [
       (m, h) <- mkSynthMeter (uniformInRange ra 0 200)
                              (uniformInRange rb 0 200)
       C.runCT m cfg h
+    -- equal means, different variances. Under exchangeability this
+    -- is a genuine alternative: d stays symmetric (so sign and
+    -- magnitude see nothing), but the class CDFs differ, which the
+    -- indicator components detect.
     asymUniformTrial = do
       ra <- C.mkRng 0x5EED03
       rb <- C.mkRng 0x5EED04
@@ -691,6 +710,14 @@ smokeCalibrationTests = testGroup "smoke calibration" [
                   ++ "/" ++ show n ++ " rejections (rate "
                   ++ show rate ++ ")")
                  (rate <= 0.30)
+    assertDetected trial = do
+      let n = 200
+      rejects <- countRejects n trial
+      let rate = fromIntegral rejects / (fromIntegral n :: Double)
+      assertBool ("variance-only detection regressed: " ++ show rejects
+                  ++ "/" ++ show n ++ " rejections (rate "
+                  ++ show rate ++ ")")
+                 (rate >= 0.90)
 
 -- clip count rises when |ta - tb| exceeds the warmup-derived bound.
 -- fixture: target writes its input to an IORef, meter reads it;
@@ -757,7 +784,7 @@ isHighClipRate _                  = False
 
 diagnoseTests :: TestTree
 diagnoseTests = testGroup "diagnose" [
-    testCase "sign-only leak -> RejectionDriver ShapeLeak" $ do
+    testCase "equal-mean shape leak -> a shape driver, not bulk" $ do
       ref <- newIORef (0 :: Word64)
       ctr <- newIORef (0 :: Int)
       let leakMeter = C.Meter $ \k act ->
@@ -780,11 +807,20 @@ diagnoseTests = testGroup "diagnose" [
             }
       r <- C.runCT leakMeter c hyp
       case r of
-        C.Reject{} ->
+        C.Reject{} -> do
           let advs = C.diagnose r
-          in  assertBool
-                ("expected RejectionDriver ShapeLeak in " ++ show advs)
-                (C.RejectionDriver C.ShapeLeak `elem` advs)
+              -- class A averages 100, as class B always does, so no
+              -- mean shift exists for the magnitude channel to find.
+              -- The leak lives in the shape, which both the sign and
+              -- the CDF-indicator channels can see; which of the two
+              -- dominates depends on where the pooled cut points
+              -- land, so accept either.
+              shapeDriven = C.RejectionDriver C.ShapeLeak `elem` advs
+                         || C.RejectionDriver C.CdfShift  `elem` advs
+          assertBool ("expected a shape driver in " ++ show advs)
+            shapeDriven
+          assertBool "sign component saw no evidence at all"
+            (C.resPeakSign r > 0)
         C.Pass{} -> assertFailure "shape leak fixture did not reject"
 
   , testCase "bulk leak -> some RejectionDriver" $ do
@@ -939,7 +975,7 @@ reportJSONTests = testGroup "reportJSON" [
             , Rep.rhTarget    = Just "test"
             , Rep.rhNote      = Nothing
             , Rep.rhEnv       = Just env
-            , Rep.rhAutoBatch = False
+            , Rep.rhPerCaseBatch = False
             }
           cr = Rep.CaseReport
             { Rep.crName        = "case"
@@ -966,7 +1002,7 @@ reportJSONTests = testGroup "reportJSON" [
             , Rep.rhTarget    = Nothing
             , Rep.rhNote      = Nothing
             , Rep.rhEnv       = Nothing
-            , Rep.rhAutoBatch = False
+            , Rep.rhPerCaseBatch = False
             }
           cr = Rep.CaseReport "case" r Nothing Nothing Nothing Nothing
           j  = Rep.reportJSON hdr [cr]

@@ -149,8 +149,13 @@ scSymUniform !seed = Scenario "sym-uniform-iid" $ \_ -> do
 
 -- A uniform over a wide range, B uniform over a narrow centred
 -- range. Both have mean 100; the only asymmetry is the variance.
--- Tests that pure shape differences don't drive false rejections
--- under our mean-equality null.
+--
+-- This is an H_1 scenario, not H_0. Both marginals are symmetric
+-- about 100, so d = ta - tb is symmetric about zero and the sign
+-- and magnitude channels see nothing. The class CDFs differ
+-- everywhere but the centre, though, so the indicator components
+-- detect it. It is the cell that distinguishes a null of
+-- "d is symmetric" from a null of "the pair is exchangeable".
 scAsymUniform :: Word64 -> Scenario
 scAsymUniform !seed = Scenario "asym-uniform-equal-mean" $ \_ -> do
   ra <- C.mkRng seed
@@ -289,7 +294,6 @@ h0Scenarios :: [Scenario]
 h0Scenarios =
   [ scConstant
   , scSymUniform        0x5EED01
-  , scAsymUniform       0x5EED02
   , scHeavyTail         0x5EED03
   , scDriftingBaseline  0x5EED04
   , scNearBound         0x5EED05
@@ -386,7 +390,7 @@ edgeCaseCells =
     sc = scSymUniform 0xED6E01
 
 powerCells :: [Cell]
-powerCells = shiftedCells ++ asymCells
+powerCells = shiftedCells ++ asymCells ++ varianceCells
   where
     shiftedCells =
       [ Cell (addShift base shift) (baseCfg budget 1 1e-3) Nothing
@@ -399,6 +403,14 @@ powerCells = shiftedCells ++ asymCells
     -- 'addShift'. Just two budget cells.
     asymCells =
       [ Cell (scRareOutlierAsym 0xB055ED04) (baseCfg budget 1 1e-3)
+             Nothing
+      | budget <- powerBudgets
+      ]
+    -- Likewise the variance-only H_1: its leak is a dispersion
+    -- difference at equal means, reachable only through the
+    -- CDF-indicator channel.
+    varianceCells =
+      [ Cell (scAsymUniform 0xB055ED05) (baseCfg budget 1 1e-3)
              Nothing
       | budget <- powerBudgets
       ]
