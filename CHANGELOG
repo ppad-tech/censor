@@ -1,6 +1,6 @@
 # Changelog
 
-- 0.5.0 (unreleased)
+- 0.4.1 (unreleased)
   * **`prepare` now runs during batch calibration.** `runPair` has
     always run the prologue before either sampler, but
     `calibrateBatchReport` drew its probe sample without one, so a
