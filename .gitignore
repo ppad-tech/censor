@@ -11,3 +11,7 @@ rs-demo/target
 # shared libraries built by the shim smoke script
 etc/censor-run-test/shim.dylib
 etc/censor-run-test/shim.so
+
+# report artefacts written by the demo suites, whose default output
+# name is <progName>-<meter>.json
+censor-*.json
