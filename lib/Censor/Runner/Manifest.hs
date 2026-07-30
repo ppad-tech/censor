@@ -158,16 +158,11 @@ parseManifest src = do
 at :: Int -> String -> String
 at n msg = "manifest line " ++ show n ++ ": " ++ msg
 
--- drop a trailing comment and surrounding whitespace. '#' only
--- starts a comment at the beginning of a token, so a value may
--- contain one.
+-- Drop a comment and leading whitespace. '#' starts a comment
+-- anywhere on the line: no field here (symbol, range, number) has
+-- any use for one, so there is nothing to escape.
 strip :: String -> String
-strip = dropWhile isSpace . go
-  where
-    go ('#' : _)              = []
-    go (c : '#' : _) | isSpace c = []
-    go (c : cs)               = c : go cs
-    go []                     = []
+strip = dropWhile isSpace . takeWhile (/= '#')
 
 parseDirective :: Int -> Defaults -> String -> String -> Either String Defaults
 parseDirective n d k v = case k of
@@ -216,15 +211,15 @@ parseCase
 parseCase n d toks = case toks of
   [] -> Left (at n "case needs a name")
   (name : kvs) -> do
-    c0 <- Right ManifestCase
-      { mcName       = name
-      , mcTarget     = maybe "" id (dfPrefix d) ++ name
-      , mcWorkspace  = maybe 0 id (dfWorkspace d)
-      , mcSecret     = []
-      , mcPublic     = []
-      , mcBatch      = Nothing
-      , mcReplicates = 1
-      }
+    let c0 = ManifestCase
+          { mcName       = name
+          , mcTarget     = maybe "" id (dfPrefix d) ++ name
+          , mcWorkspace  = maybe 0 id (dfWorkspace d)
+          , mcSecret     = []
+          , mcPublic     = []
+          , mcBatch      = Nothing
+          , mcReplicates = 1
+          }
     c <- foldl (\acc kv -> acc >>= \x -> applyKV n x kv) (Right c0) kvs
     validateCase n c { mcSecret = reverse (mcSecret c)
                      , mcPublic = reverse (mcPublic c) }
