@@ -52,7 +52,8 @@ import Data.Bits (xor)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.Maybe (isJust)
 import Data.Word (Word8, Word64)
-import Foreign.Marshal.Alloc (mallocBytes)
+import Foreign.ForeignPtr
+  (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, plusPtr)
 import Numeric (readHex)
@@ -288,9 +289,12 @@ finish acc = do
       Just n | n > 0 -> pure n
       Just _         -> die2 "censor: --workspace must be positive"
       Nothing        -> die2 "censor: missing --workspace BYTES"
-  mapM_ (checkRange ws "--secret") (accSecret acc)
-  mapM_ (checkRange ws "--public") (accPublic acc)
-  mapM_ (checkRange ws "--context") (accContext acc)
+  -- the same validator a manifest case goes through, so the two
+  -- entry points cannot accept different layouts.
+  case M.checkLayout ws (accSecret acc) (accPublic acc)
+         (accContext acc) of
+    Just msg -> die2 ("censor: " ++ msg)
+    Nothing  -> pure ()
   pure Args
     { argLib       = lib
     , argTarget    = maybe "censor_target" id (accTarget acc)
@@ -321,13 +325,6 @@ finish acc = do
       , ("--trace",     isJust (accTrace acc))
       ]
 
-checkRange :: Int -> String -> Range -> IO ()
-checkRange ws name (Range o l)
-  | o + l > ws =
-      die2 ("censor: " ++ name ++ " " ++ show o ++ ":" ++ show l
-            ++ " overflows workspace of " ++ show ws ++ " bytes")
-  | otherwise = pure ()
-
 -- hypothesis construction -----------------------------------------------------
 
 -- fallback seed when the user does not pass --seed. Not
@@ -342,6 +339,12 @@ defaultSeed = 0xC0FFEE5EED0BEEF7
 -- that the prologue redraws once per pair, so both classes see the
 -- same fresh public bytes there. Returns an FFIHypothesis ready to
 -- hand to 'withFFIHypothesis'.
+--
+-- The three buffers are ForeignPtrs held by the sampler closures,
+-- so they live exactly as long as the hypothesis does and are
+-- reclaimed with it. Phase isolation builds up to three hypotheses
+-- per cell (calibration, run, controls); raw mallocs would strand
+-- three workspaces apiece for the length of a battery.
 buildHypothesis
   :: Int                 -- ^ workspace bytes
   -> [Range]             -- ^ secret ranges (class A only)
@@ -351,21 +354,27 @@ buildHypothesis
   -> (Ptr Word8 -> IO ())
   -> IO F.FFIHypothesis
 buildHypothesis ws secrets publics contexts seed target = do
-  fixSec <- mallocBytes ws
-  fixPub <- mallocBytes ws
-  ctxBuf <- mallocBytes ws
+  fixSec <- mallocForeignPtrBytes ws
+  fixPub <- mallocForeignPtrBytes ws
+  ctxBuf <- mallocForeignPtrBytes ws
   gFix <- C.mkRng seed
-  F.fillRandom gFix fixSec ws
-  F.fillRandom gFix fixPub ws
+  withForeignPtr fixSec $ \p -> F.fillRandom gFix p ws
+  withForeignPtr fixPub $ \p -> F.fillRandom gFix p ws
   ga  <- C.mkRng (seed `xor` 0x0A0A0A0A0A0A0A0A)
   gb  <- C.mkRng (seed `xor` 0x0B0B0B0B0B0B0B0B)
   gCtx <- C.mkRng (seed `xor` 0x0C0C0C0C0C0C0C0C)
-  let refresh = mapM_ (\(Range o l) ->
-        F.fillRandom gCtx (ctxBuf `plusPtr` o) l) contexts
+  let refresh
+        | null contexts = pure ()
+        | otherwise = withForeignPtr ctxBuf $ \p ->
+            mapM_ (\(Range o l) ->
+              F.fillRandom gCtx (p `plusPtr` o) l) contexts
   refresh
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = ws
     , F.ffiPrepare = refresh
+      -- role ranges are validated pairwise disjoint, so the overlay
+      -- order below is immaterial: no two of them write the same
+      -- byte.
     , F.ffiSampleA = \p -> do
         F.fillRandom ga p ws
         overlay p ctxBuf contexts
@@ -378,9 +387,14 @@ buildHypothesis ws secrets publics contexts seed target = do
     , F.ffiTarget = target
     }
 
-overlay :: Ptr Word8 -> Ptr Word8 -> [Range] -> IO ()
-overlay dst src = mapM_ $ \(Range o l) ->
-  copyBytes (dst `plusPtr` o) (src `plusPtr` o) l
+-- Copy the declared ranges out of a backing buffer into the
+-- workspace. Short-circuits on an empty range list, so a role a
+-- hypothesis does not use costs nothing per sample.
+overlay :: Ptr Word8 -> ForeignPtr Word8 -> [Range] -> IO ()
+overlay _   _   [] = pure ()
+overlay dst src rs = withForeignPtr src $ \p ->
+  mapM_ (\(Range o l) ->
+    copyBytes (dst `plusPtr` o) (p `plusPtr` o) l) rs
 
 -- driver ----------------------------------------------------------------------
 
@@ -531,12 +545,16 @@ expand base mc
       ]
   where
     n  = M.mcReplicates mc
-    s0 = caseSeed base (M.mcName mc)
+    s0 = caseSeed base (M.mcId mc)
 
--- Mix the run-wide seed with the case name, so each case draws its
--- own fixed secret. Sharing one seed across every case would start
--- them all from identical bytes, which makes a battery far less
--- independent than its case count suggests.
+-- Mix the run-wide seed with the case identity, so each case draws
+-- its own fixed secret. Sharing one seed across every case would
+-- start them all from identical bytes, which makes a battery far
+-- less independent than its case count suggests.
+--
+-- Deliberately 'mcId', not 'mcName': a label= override is a
+-- presentation change, and must not silently re-roll the secret the
+-- case tests against.
 caseSeed :: Word64 -> String -> Word64
 caseSeed base name = base `xor` fnv1a name
 

@@ -1260,11 +1260,42 @@ manifestTests = testGroup "manifest" [
             M.mcPublic  c @?= [M.Range 96 16]
           cs -> assertFailure ("expected 1 case, got " ++ show (length cs))
 
-    -- the secret overlay lands after the context one, so an overlap
-    -- means the range is not actually shared across the pair.
+    -- A byte belongs to exactly one role. Whichever overlay landed
+    -- last would silently win, so an overlap is always a mistake.
   , testCase "a context range overlapping a secret is rejected" $
       assertLeft "context cannot overlap a secret range"
         (M.parseManifest "workspace 64\ncase k secret=0:32 context=16:8\n")
+
+  , testCase "a context range overlapping a public is rejected" $
+      assertLeft "context cannot overlap a public range"
+        (M.parseManifest
+          "workspace 64\ncase k secret=0:16 public=16:16 context=16:16\n")
+
+  , testCase "a public range overlapping a secret is rejected" $
+      assertLeft "public cannot overlap a secret range"
+        (M.parseManifest "workspace 64\ncase k secret=0:32 public=24:8\n")
+
+    -- label is presentation only; the runner seeds each case from
+    -- mcId, so relabelling must not change the experiment.
+  , testCase "label sets the display name but not the identity" $
+      case M.parseManifest
+             "workspace 32\ncase inv secret=0:8 label=fe_inv\n" of
+        Left err -> assertFailure ("unexpected parse error: " ++ err)
+        Right mf -> case M.mfCases mf of
+          [c] -> do
+            M.mcId   c @?= "inv"
+            M.mcName c @?= "fe_inv"
+          cs -> assertFailure ("expected 1 case, got " ++ show (length cs))
+
+  , testCase "checkLayout accepts adjacent, non-overlapping roles" $
+      M.checkLayout 64 [M.Range 0 16] [M.Range 16 16] [M.Range 32 16]
+        @?= Nothing
+
+  , testCase "checkLayout names the role that overflows" $
+      case M.checkLayout 16 [] [] [M.Range 8 16] of
+        Nothing  -> assertFailure "expected an overflow rejection"
+        Just msg -> assertBool ("role not named in " ++ show msg)
+          ("context" `isInfixOf` msg)
 
   , testCase "family-alpha parses on and off" $ do
       let parse v = fmap (M.dfFamilyAlpha . M.mfDefaults)
