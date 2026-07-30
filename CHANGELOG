@@ -1,6 +1,40 @@
 # Changelog
 
 - 0.4.0 (unreleased)
+  * The null is now stated, and tested, as conditional
+    *exchangeability* of the measured pair `(ta, tb)` rather than
+    symmetry of `d = ta - tb`. Exchangeability is what the
+    randomised A/B order actually delivers; every hedge component
+    is an antisymmetric functional of the pair, and each such
+    functional is conditionally symmetric about zero under the
+    null.
+
+  * New **CDF-indicator channel**: one bounded-mean e-process on
+    `1[ta <= q] - 1[tb <= q]` per warmup-fixed cut point `q` (the
+    deciles and quartiles of the pooled warmup readings,
+    deduplicated). This detects dispersion leaks — a target whose
+    timing variance depends on the secret while its mean does not —
+    which leave `d` symmetric and were invisible to every previous
+    component. `K` grows from 4 to `4 + n`; `Result` gains
+    `resPeakCdf` and `resCutPoints`, and `LeakShape` gains
+    `CdfShift`.
+
+    Previously such a target passed unconditionally. The
+    variance-only cell in the validation suite moves from H_0 to
+    the power table accordingly.
+
+    The functional family is finite, so this is still not an
+    omnibus test of distributional equality. That limit is now
+    documented rather than left implicit.
+
+  * `Attribution` is no longer a four-way label. It is a record
+    carrying the `ControlVerdict` plus *both* control runs in full,
+    and `TargetLeak` is renamed `ControlsPass`. The A/A and B/B
+    runs are negative controls: they can convict the harness but
+    cannot acquit it, so the old name overstated what they
+    establish. The JSON `attribution` string field becomes a
+    `controls` object with `verdict`, `aa`, and `bb`.
+
   * Clipping is counted at each of the hedge's three magnitude
     bounds, not only the tight one. `Result` gains `resClipped4`
     (`|d| > 4c`) and `resClipped16` (`|d| > 16c`) alongside
@@ -22,56 +56,41 @@
     profile for the one-line and terminal reports and stays as
     terse as it was when nothing clipped past `c`.
 
-  * The null is now stated, and tested, as conditional
-    *exchangeability* of the measured pair `(ta, tb)` rather than
-    symmetry of `d = ta - tb`. Every hedge component is an
-    antisymmetric functional of the pair.
-
-  * New **CDF-indicator channel**: one bounded-mean e-process on
-    `1[ta <= q] - 1[tb <= q]` per warmup-fixed cut point `q` (the
-    deciles and quartiles of the pooled warmup readings,
-    deduplicated). This detects dispersion leaks — a target whose
-    timing variance depends on the secret while its mean does not —
-    which leave `d` symmetric and were invisible to every previous
-    component. `K` grows from 4 to `4 + n`; `Result` gains
-    `resPeakCdf` and `resCutPoints`, and `LeakShape` gains
-    `CdfShift`.
-
-    Previously such a target passed. The variance-only cell in the
-    validation suite moves from H_0 to the power table accordingly.
-
-  * `Attribution` is no longer a four-way label. It is a record
-    carrying the `ControlVerdict` plus *both* control runs in full,
-    and `TargetLeak` is renamed `ControlsPass`. The A/A and B/B
-    runs are negative controls: they can convict the harness but
-    cannot acquit it, so the old name overstated what they
-    establish. The JSON `attribution` string field becomes a
-    `controls` object with `verdict`, `aa`, and `bb`.
-
-  * The default order-bit seed is drawn from OS entropy
-    (`/dev/urandom`) rather than `getMonotonicTimeNSec`; a clock
-    reading is not independent entropy, and the nuisance process
-    may be periodic in that same clock. The resolved seed is
-    reported as `resSeed`, so a randomised run stays exactly
-    replayable.
-
-  * The `censor` CLI splits `--seed` (input samplers) from
-    `--order-seed` (the A/B order bit). They previously shared one
-    value, weakening the independence the conditional null needs.
-
-  * `TraceCase` carries an explicit `BatchPolicy` — `SingleShot`,
-    `RepeatableAuto`, or `FixedBatch n`. `runTraceSuite` no longer
-    auto-calibrates every case: repeating a pure Haskell target
-    forces one thunk and then measures no-ops, so the calibrated
-    batch counted no-ops as work. All bundled demo targets are
-    pure and now declare `SingleShot`. `rhAutoBatch` becomes
-    `rhPerCaseBatch`.
-
   * Reports carry suite-wide alpha accounting: `totals` gains
     `alpha` and `familyAlpha` (the union bound `M * alpha` over `M`
     cells), and multi-case footers render it. Censor's guarantee is
     per run; a battery that fails when any cell rejects has the
     family bound, not alpha.
+
+  * The default order-bit seed is drawn from OS entropy
+    (`/dev/urandom`) rather than `getMonotonicTimeNSec`; a clock
+    reading is not independent entropy, and the nuisance process
+    the order bit must be independent of may itself be periodic in
+    that same clock. The resolved seed is reported as `resSeed`, so
+    a randomised run stays exactly replayable.
+
+  * The `censor` CLI splits `--seed` (input samplers) from
+    `--order-seed` (the A/B order bit). They previously shared one
+    value, weakening the independence the conditional null needs.
+
+  * `Censor.Runner.Env` records the conditions a run executed
+    under: a best-effort host snapshot (OS, arch, kernel release,
+    CPU model, core count, Linux cpufreq/SMT/perf_event knobs, load
+    average, UTC timestamp) taken once at run start, backed by a
+    small C shim. Rides on the report header and into the JSON.
+    Alongside it, `calibrateBatchReport` records the meter's noise
+    floor (`Noise`: median and IQR of repeated readings) at the
+    selected batch, so a `Pass` obtained where dispersion rivals
+    the effect sizes of interest can be recognised as such.
+
+  * `TraceCase` carries an explicit `BatchPolicy` — `SingleShot`,
+    `RepeatableAuto`, or `FixedBatch n`. `runTraceSuite` no longer
+    auto-calibrates every case: repeating a pure Haskell target
+    forces one thunk and then measures no-ops, so a calibrated
+    batch counted no-ops as work. All bundled demo targets are
+    pure and now declare `SingleShot`. `--batch N` overrides every
+    case's policy; plain suites reject the flag. `rhAutoBatch`
+    becomes `rhPerCaseBatch`, rendering `batch=per-case`.
 
   * `Hypothesis` gains a `prepare` field: a per-pair prologue run
     before either sampler and outside the timed region. New
@@ -84,17 +103,45 @@
     the whole run (testing one public input). `FFIHypothesis`
     gains the matching `ffiPrepare`.
 
-  * New `Censor.Runner.Manifest` and a `--manifest PATH` mode on the
-    `censor` CLI: a declarative battery of cases, driven by one
+  * New `Censor.Runner.Manifest` and a `--manifest PATH` mode on
+    the `censor` CLI: a declarative battery of cases, driven by one
     dlopen and emitted as a single report carrying every case, its
     controls, the host environment, and the family-wise alpha.
     Replaces the per-symbol process loop with hand-stitched output,
     which duplicated the tool version and config in every script.
     Cases support `replicates=N` to run several independent fixed
     secrets, since a single pinned secret answers only whether
-    *that* secret times differently from random.
+    *that* secret times differently from random. See
+    `etc/example.manifest`.
 
-  * Report schema bumped to `censor/report-v2`.
+  * `TraceSuite` takes a heterogeneous case list (an existential
+    `TraceCase`), so cases with different hypothesis payload types
+    share one list, and auto-attributes on `Reject`. A run collapses
+    to a single canonical JSON object — the same one the `json`
+    renderer emits to stdout, with optional per-case batch, noise,
+    and trace fields. `renderTrace` is gone.
+
+  * The `censor` executable catches up with that surface: `--trace`
+    writes the same report object the `json` renderer emits, with
+    the frame trajectory embedded, rather than a separate format.
+
+  * `Censor.Runner` exports `shapeName`; `Censor.Runner.Report` now
+    imports it rather than keeping a second copy that could (and
+    did) fall out of step with `LeakShape`.
+
+  * `censor-secp` presents an 8-case surface: both constant-time
+    multipliers (`mul`, `mul_wnaf`), the ladder-based `sign_ecdsa`
+    / `sign_schnorr`, their precomputed-context wNAF variants, and
+    `ecdh` / `derive_pub`. The four signing cases hold the message
+    (and Schnorr aux) fixed and public across both classes, so the
+    derived RFC6979 / BIP340 nonce is deterministic in the fixed
+    class and fix-vs-random controls key + nonce rather than the
+    key alone.
+
+  * Report schema bumped to `censor/report-v2`, reflecting the
+    `controls` object, the new `Result` fields (`seed`,
+    `cutPoints`, `peaks.cdf`, `clipped4`, `clipped16`), the
+    `totals` alpha fields, and `"batch":"per-case"`.
 
 - 0.3.1 (2026-07-09)
   * The `censor` executable renders through `Censor.Runner.Report`
