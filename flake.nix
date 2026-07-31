@@ -220,6 +220,11 @@
 
           packages.haddock = hpkgs.${lib}.doc;
 
+          # 'nix flake check' realises the full package (demo,
+          # demo-ffi, poly flags on), catching breaks that a plain
+          # 'cabal build' skips because those flags default to off.
+          checks.default = hpkgs.${lib};
+
           devShells.default = hpkgs.shellFor {
             packages = p: [
               p.${lib}

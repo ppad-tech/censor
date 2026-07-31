@@ -247,7 +247,7 @@ runCase emit meter c name fh = do
   mat <- case r of
     C.Reject{} -> Just <$> F.withFFIHypothesis fh (C.attribute meter c)
     C.Pass{}   -> pure Nothing
-  emit (R.CaseReport name r mat)
+  emit (R.CaseReport name r mat Nothing Nothing Nothing)
 
 runAll :: C.Meter -> (R.CaseReport -> IO ()) -> IO ()
 runAll meter emit = do
