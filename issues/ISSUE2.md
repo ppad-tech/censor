@@ -195,9 +195,17 @@ flip-conditional reading deltas at the
 analysis noise floor. The synthetic-meter null
 battery stays 0/70, and the test suite passes.
 
-The x86_64-linux lanes carry the same
-signature (cycle-resolved readings put high
-density at the cut points instead of
-quantisation atoms) but have not been re-run;
-ATTACK165's wall and cycles cells remain
-uninformative until revalidated there.
+The x86_64-linux lanes are confirmed fixed by
+the `runPair` change alone (their readings
+were never quantisation-limited; the amplifier
+there is high reading density at the low cut
+points). Interleaved A/A runs on the ATTACK165
+linux host: v0.4.2 rejects 6/6 -- cycles
+within 363-720 pairs, wall within 101-1924,
+with indicator asymmetries of 0.10-0.32 at the
+hot cut point -- while the fixed driver passes
+6/6 at a 1e5 budget (`peakLogW <= 1.99`), its
+residual flip-conditional statistics at the
+analysis noise floor. ATTACK165's wall and
+cycles cells can be re-captured against the
+fixed driver.
