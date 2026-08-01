@@ -1,6 +1,9 @@
 # Changelog
 
-- 0.4.1 (unreleased)
+- 0.4.2 (2026-08-01)
+  * Makes minor adjustments to the flake setup and some demo binaries.
+
+- 0.4.1 (2026-07-30)
   * **`prepare` now runs during batch calibration.** `runPair` has
     always run the prologue before either sampler, but
     `calibrateBatchReport` drew its probe sample without one, so a
