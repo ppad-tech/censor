@@ -122,6 +122,8 @@ import qualified Data.Bits as B
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (sort, sortBy)
+import Data.Primitive.SmallArray
+  (SmallArray, indexSmallArray, smallArrayFromListN)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import System.IO (IOMode(ReadMode), withBinaryFile)
@@ -698,7 +700,8 @@ runCTWith
 runCTWith meter cfg hyp observe = do
   validateConfig cfg
   (!root, !wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
-  (!c, !qs, !meterResolves) <- warmup meter cfg hyp wSeed
+  let !samplers = orderedSamplers hyp
+  (!c, !qs, !meterResolves) <- warmup meter cfg hyp samplers wSeed
   unless meterResolves $ throwIO WarmupZeroDuration
   !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c qs of
     Left  e -> throwIO (InvalidEprocConfig e)
@@ -728,8 +731,8 @@ runCTWith meter cfg hyp observe = do
         | n >= cfgBudget cfg =
             pure $! finish Pass n st iv cl
         | otherwise = do
-            let (!rng', !flipOrder) = nextOrderBit rng
-            (!ta, !tb) <- runPair meter cfg hyp flipOrder
+            let (!rng', !bit) = nextOrderBit rng
+            (!ta, !tb) <- runPair meter cfg hyp samplers bit
             let !xa      = fromIntegral ta :: Double
                 !xb      = fromIntegral tb :: Double
                 !d       = xa - xb
@@ -1057,8 +1060,21 @@ validateConfig Config{..}
       "cfgBudget must be nonnegative"
   | otherwise      = pure ()
 
--- | Run one (sampleA, measure, sampleB, measure) pair, in the chosen
---   order, and return (measurement-of-A, measurement-of-B). The
+-- | The two samplers, indexed by the per-pair order word: slot 0
+--   holds 'sampleA', slot 1 'sampleB'. Built once per run so the
+--   driver's pair loop selects a sampler by indexing — a
+--   data-dependent load — rather than by branching on the order
+--   bit. Both elements live in one cache line, so the selection's
+--   microarchitectural footprint is as small as it can be made.
+orderedSamplers :: Hypothesis a -> SmallArray (IO a)
+orderedSamplers hyp =
+  let !sa = sampleA hyp
+      !sb = sampleB hyp
+  in  smallArrayFromListN 2 [sa, sb]
+
+-- | Run one (sample, measure, sample, measure) pair, in the order
+--   chosen by the order word (@0@ = class A first, @1@ = class B
+--   first), and return (measurement-of-A, measurement-of-B). The
 --   returned pair is independent of execution order.
 --
 --   The hypothesis's 'prepare' prologue runs first, before either
@@ -1066,23 +1082,38 @@ validateConfig Config{..}
 --   establishes (a shared public context) is common to both classes
 --   and its cost is not charged to whichever class happens to run
 --   first.
+--
+--   The implementation is deliberately /flip-oblivious/: one code
+--   path with a single call site per sampler and measurement, the
+--   sampler order selected by array indexing, and the class
+--   labeling recovered by mask arithmetic after both measurements.
+--   The order bit participates only as data — no conditional
+--   control flow depends on it between the draw and the completed
+--   pair. A branch on the bit would give the two orders distinct
+--   code paths, coupling the bit into the measured readings through
+--   microarchitectural state and breaking the conditional
+--   exchangeability the test's null rests on; this is not
+--   hypothetical (see @issues/ISSUE2.md@: A\/A controls rejected
+--   through exactly that channel on timing meters).
 runPair
-  :: Meter -> Config -> Hypothesis a -> Bool -> IO (Word64, Word64)
-runPair meter cfg hyp flipOrder = do
+  :: Meter -> Config -> Hypothesis a -> SmallArray (IO a) -> Word64
+  -> IO (Word64, Word64)
+runPair meter cfg hyp samplers !bit = do
   prepare hyp
-  if flipOrder
-    then do
-      !b <- sampleB hyp
-      !y <- measure meter (cfgBatch cfg) (target hyp b)
-      !a <- sampleA hyp
-      !x <- measure meter (cfgBatch cfg) (target hyp a)
-      pure (x, y)
-    else do
-      !a <- sampleA hyp
-      !x <- measure meter (cfgBatch cfg) (target hyp a)
-      !b <- sampleB hyp
-      !y <- measure meter (cfgBatch cfg) (target hyp b)
-      pure (x, y)
+  let !iFst = fromIntegral bit :: Int
+      !iSnd = 1 - iFst
+  !u  <- indexSmallArray samplers iFst
+  !t1 <- measure meter (cfgBatch cfg) (target hyp u)
+  !v  <- indexSmallArray samplers iSnd
+  !t2 <- measure meter (cfgBatch cfg) (target hyp v)
+  -- branchless unscramble: swap iff bit = 1, via an all-ones mask.
+  -- x is class A's reading (slot 1 when the bit is 0, slot 2 when
+  -- it is 1), y class B's.
+  let !m = negate bit
+      !s = (t1 `B.xor` t2) B..&. m
+      !x = t1 `B.xor` s
+      !y = t2 `B.xor` s
+  pure (x, y)
 {-# INLINE runPair #-}
 
 -- The hedge composition ----------------------------------------------------
@@ -1287,11 +1318,16 @@ effectGrid = 300
 -- timing distribution; the seed itself only needs to be independent
 -- of that distribution too, which fresh entropy (default) or a
 -- user-supplied constant both satisfy.
+--
+-- The bit is carried as a @Word64@ in @{0, 1}@, never as a 'Bool':
+-- the driver loop consumes it arithmetically (index, mask) and no
+-- case is ever taken on it, keeping the measurement path free of
+-- order-conditional control flow (see 'runPair').
 
-nextOrderBit :: Word64 -> (Word64, Bool)
+nextOrderBit :: Word64 -> (Word64, Word64)
 nextOrderBit !s =
   let (!s', !w) = splitMix s
-  in  (s', B.testBit w 0)
+  in  (s', w B..&. 1)
 {-# INLINE nextOrderBit #-}
 
 -- Resolve the (root, warmup, main) seed triple. The root is the
@@ -1358,14 +1394,14 @@ osEntropy = fmap toWord (try (withBinaryFile urandom ReadMode grab))
 -- on a discrete meter several levels can land on the same reading,
 -- and a repeated cut point would only inflate @K@.
 warmup
-  :: Meter -> Config -> Hypothesis a -> Word64
+  :: Meter -> Config -> Hypothesis a -> SmallArray (IO a) -> Word64
   -> IO (Double, [Double], Bool)
-warmup meter cfg hyp seed = do
+warmup meter cfg hyp samplers seed = do
   let go !i !rng !accD !accR
         | i >= cfgWarmup cfg = pure (accD, accR)
         | otherwise = do
-            let (!rng', !flipOrder) = nextOrderBit rng
-            (!x, !y) <- runPair meter cfg hyp flipOrder
+            let (!rng', !bit) = nextOrderBit rng
+            (!x, !y) <- runPair meter cfg hyp samplers bit
             let !dx = fromIntegral x :: Double
                 !dy = fromIntegral y :: Double
                 !da = abs (dx - dy)

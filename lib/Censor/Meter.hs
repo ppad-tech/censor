@@ -11,7 +11,9 @@
 -- Measurement abstraction.
 --
 -- A t'Meter' wraps an @IO@ action and returns a 'Word64' reading.
--- 'wallClock' is available everywhere, backed by
+-- 'wallClock' is available everywhere: on Darwin it is backed by
+-- @clock_gettime_nsec_np(CLOCK_UPTIME_RAW)@ (the
+-- @mach_absolute_time@ counter), elsewhere by
 -- @GHC.Clock.getMonotonicTimeNSec@. On Linux, 'withCounter' provides
 -- hardware performance-counter meters (retired instructions, retired
 -- branches, or CPU cycles) via @perf_event_open@. The instruction and
@@ -22,8 +24,8 @@
 -- instruction streams (e.g. variable-time divider units, cache
 -- misses), at the cost of run-to-run microarchitectural noise.
 --
--- Resolution caveat ('wallClock'): on Apple Silicon, the user-mode
--- monotonic counter ticks at roughly 24 MHz (~42 ns per tick). Targets
+-- Resolution caveat ('wallClock'): on Apple Silicon, the hardware
+-- counter ticks at roughly 24 MHz (~42 ns per tick). Targets
 -- faster than a microsecond should be measured under batching (see
 -- 'Censor.cfgBatch'). On Linux x86, the underlying counter is
 -- typically cycle-resolved.
@@ -43,7 +45,9 @@ module Censor.Meter (
 
 import Control.Exception (Exception, throwIO)
 import Data.Word (Word64)
+#if !defined(darwin_HOST_OS)
 import GHC.Clock (getMonotonicTimeNSec)
+#endif
 #if defined(linux_HOST_OS)
 import Control.Concurrent (runInBoundThread, rtsSupportsBoundThreads)
 import Control.Exception (finally)
@@ -70,22 +74,39 @@ newtype Meter = Meter
 -- | Wall-clock meter. Reads the monotonic clock before and after the
 --   @k@-fold batch and returns the elapsed nanoseconds.
 --
---   Backed by @GHC.Clock.getMonotonicTimeNSec@, which dispatches to
---   @mach_absolute_time@ on Darwin and @clock_gettime(CLOCK_MONOTONIC)@
---   on Linux.
+--   On Darwin, backed by
+--   @clock_gettime_nsec_np(CLOCK_UPTIME_RAW)@ — the
+--   @mach_absolute_time@ counter, resolved at its hardware tick
+--   rate. Not @GHC.Clock.getMonotonicTimeNSec@, whose
+--   @CLOCK_MONOTONIC@ macOS quantises to /microseconds/: a
+--   microsecond-atomised reading distribution puts warmup-fixed
+--   CDF cut points exactly on quantisation boundaries, where the
+--   indicator channel is maximally sensitive to nanosecond-scale
+--   harness perturbations (see @issues\/ISSUE2.md@). On other
+--   platforms, backed by @GHC.Clock.getMonotonicTimeNSec@
+--   (@clock_gettime(CLOCK_MONOTONIC)@ on Linux).
 --
---   Resolution caveat: on Apple Silicon the user-mode monotonic
---   counter ticks at roughly 24 MHz (~42 ns per tick), so
---   sub-microsecond targets need batching (see 'Censor.cfgBatch').
---   On Linux x86 the underlying counter is typically cycle-resolved.
+--   Resolution caveat: on Apple Silicon the hardware counter ticks
+--   at roughly 24 MHz (~42 ns per tick), so sub-microsecond targets
+--   need batching (see 'Censor.cfgBatch'). On Linux x86 the
+--   underlying counter is typically cycle-resolved.
 wallClock :: Meter
 wallClock = Meter measureWall
 
+#if defined(darwin_HOST_OS)
+foreign import ccall unsafe "censor_monotonic_ns"
+  monotonicNS :: IO Word64
+#else
+monotonicNS :: IO Word64
+monotonicNS = getMonotonicTimeNSec
+{-# INLINE monotonicNS #-}
+#endif
+
 measureWall :: Int -> IO () -> IO Word64
 measureWall !k !act = do
-  !t0 <- getMonotonicTimeNSec
+  !t0 <- monotonicNS
   rep k act
-  !t1 <- getMonotonicTimeNSec
+  !t1 <- monotonicNS
   pure $! t1 - t0
 {-# INLINE measureWall #-}
 
