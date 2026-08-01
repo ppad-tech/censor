@@ -1,5 +1,36 @@
 # Changelog
 
+- 0.4.3 (2026-08-01)
+  * **The driver's pair loop is now flip-oblivious.** `runPair`'s
+    order branch compiled the two A/B orders to two distinct code
+    paths, so the per-pair order bit selected which physical code
+    executed the pair -- coupling the bit into the measured
+    readings through microarchitectural state and breaking the
+    conditional exchangeability the null rests on. The A/A
+    negative controls surfaced this as pervasive timing-meter
+    rejections on long-duration pure targets, with the
+    instruction lane clean (issues/ISSUE2.md). The pair now runs
+    one code path with a single call site per sampler and
+    measurement: sampler order is selected by indexing a
+    two-element array with the order word, class labels are
+    recovered by mask arithmetic after both measurements, and the
+    order bit is never scrutinised as a `Bool` inside the loop.
+    Verified branchless by disassembly, in both the main and
+    warmup loops.
+
+  * **The darwin wall meter is tick-resolved.** `wallClock` now
+    reads `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` (~42 ns
+    ticks on Apple Silicon) rather than GHC's
+    `getMonotonicTimeNSec`, whose `CLOCK_MONOTONIC` macOS
+    quantises to microseconds. Microsecond atoms concentrated
+    wall readings so that warmup placed CDF cut points exactly on
+    quantisation boundaries, where the indicator channel
+    amplifies nanosecond-scale harness perturbations into
+    percent-scale class asymmetries.
+
+  * Adds a `primitive` dependency (`SmallArray`, backing the
+    branchless sampler selection).
+
 - 0.4.2 (2026-08-01)
   * Makes minor adjustments to the flake setup and some demo binaries.
 
