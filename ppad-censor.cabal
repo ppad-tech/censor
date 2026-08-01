@@ -113,6 +113,8 @@ library
   if os(linux)
     c-sources: cbits/censor_perf.c
     extra-libraries: dl
+  if os(osx)
+    c-sources: cbits/censor_clock.c
   exposed-modules:
       Censor
       Censor.FFI
