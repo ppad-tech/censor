@@ -131,6 +131,7 @@ library
       base >= 4.9 && < 5
     , bytestring >= 0.9 && < 0.13
     , ppad-eproc >= 0.4 && < 0.5
+    , primitive >= 0.8 && < 0.10
 
 test-suite censor-tests
   type:                exitcode-stdio-1.0
