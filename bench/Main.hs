@@ -32,6 +32,7 @@ constMeter = Meter $ \k act -> do
 noopHyp :: C.Hypothesis ()
 noopHyp = C.Hypothesis
   { C.target  = \_ -> pure ()
+  , C.prepare = pure ()
   , C.sampleA = pure ()
   , C.sampleB = pure ()
   }
