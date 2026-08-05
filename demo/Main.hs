@@ -447,7 +447,7 @@ runCase emit meter c name mkH = do
       hD <- mkH
       Just <$> C.attribute meter c hD
     C.Pass{}   -> pure Nothing
-  emit (R.CaseReport name r mat Nothing Nothing Nothing)
+  emit (R.CaseReport name r mat Nothing Nothing Nothing Nothing)
 
 -- run every case under the given meter.
 runAll
@@ -485,9 +485,11 @@ runAll tex meter emit = do
 backfillSecpTraces :: Secp.Context -> FilePath -> IO ()
 backfillSecpTraces tex path = do
   let mkCR name mkH = do
-        h <- mkH
         let b = 1
             c = cfgHeavy { C.cfgBatch = b }
+        hBase <- mkH
+        base  <- C.baselineReading C.wallClock c hBase
+        h <- mkH
         t <- CR.record name "wall" C.wallClock c h
         let r = CR.traceResult t
         mat <- case r of
@@ -501,6 +503,7 @@ backfillSecpTraces tex path = do
           , R.crAttribution = mat
           , R.crBatch       = Just b
           , R.crNoise       = Nothing
+          , R.crBaseline    = Just base
           , R.crTrace       = Just (CR.traceFrames t)
           }
   cr1 <- mkCR "positive: Secp.mul_wnaf (wNAF point multiplication)"

@@ -174,6 +174,11 @@ data CaseReport = CaseReport
     -- ^ the meter's noise floor at the calibrated batch, from the
     --   case's t'CalibReport'. 'Nothing' when the case was not
     --   calibrated per-case.
+  , crBaseline    :: !(Maybe Noise)
+    -- ^ baseline cost of the target on fresh class-A draws at the
+    --   case's batch, from 'baselineReading': median and IQR in
+    --   per-batch meter units, the scale of 'resEffect'. 'Nothing'
+    --   when the tool did not probe one.
   , crTrace       :: !(Maybe [Frame])
     -- ^ per-pair 'Frame' trajectory, when the runner recorded one
     --   (via 'record'). Surfaces in the JSON artefact as a thinned
@@ -403,10 +408,10 @@ prettyCase rc cr = do
     Nothing -> pure ()
 
 -- the run-metadata line under a case row: resolved batch, the
--- meter's noise floor at that batch when recorded, and the order
--- seed the run resolved to. The seed is unconditional -- it is what
--- replays the case, and a reader should not have to reach for the
--- JSON to find it.
+-- meter's noise floor at that batch when recorded, the target's
+-- baseline cost when probed, and the order seed the run resolved
+-- to. The seed is unconditional -- it is what replays the case,
+-- and a reader should not have to reach for the JSON to find it.
 calibText :: CaseReport -> Maybe String
 calibText cr = case segs of
   [] -> Nothing
@@ -417,6 +422,9 @@ calibText cr = case segs of
       , maybe [] (\n -> [ printf "noise med=%d iqr=%d"
                             (nsMedian n) (nsIqr n) ])
           (crNoise cr)
+      , maybe [] (\n -> [ printf "baseline med=%d iqr=%d"
+                            (nsMedian n) (nsIqr n) ])
+          (crBaseline cr)
       , ["orderSeed=" ++ seedHex (resSeed (crResult cr))]
       ]
 
@@ -549,6 +557,8 @@ caseJSON cr = concat
   , maybe "" (\b -> ",\"batch\":" ++ show b) (crBatch cr)
   , maybe "" (\n -> ",\"noise\":{\"med\":" ++ show (nsMedian n)
       ++ ",\"iqr\":" ++ show (nsIqr n) ++ "}") (crNoise cr)
+  , maybe "" (\n -> ",\"baseline\":{\"med\":" ++ show (nsMedian n)
+      ++ ",\"iqr\":" ++ show (nsIqr n) ++ "}") (crBaseline cr)
   , ",\"result\":", resultToJSON (crResult cr)
   , maybe "" (\a -> ",\"controls\":" ++ controlsJSON a)
       (crAttribution cr)
@@ -861,9 +871,12 @@ data TraceSuite = TraceSuite
 --   the batch and records the meter's noise floor at it (both
 --   surface on the case row and in the JSON) unless @--batch N@
 --   pins the batch (no probe, no noise floor — the honest setting
---   for pure Haskell targets is @--batch 1@), 'record' streams the
---   run and keeps its frames, and on 'Reject' 'attribute' runs the
---   A\/A + B\/B diagnostics automatically (two extra runs).
+--   for pure Haskell targets is @--batch 1@), 'baselineReading'
+--   records the target's baseline cost on fresh class-A draws at
+--   the resolved batch (every policy — fresh draws are genuine work
+--   even for pure targets), 'record' streams the run and keeps its
+--   frames, and on 'Reject' 'attribute' runs the A\/A + B\/B
+--   diagnostics automatically (two extra runs).
 runTraceSuite :: TraceSuite -> IO ()
 runTraceSuite ts = do
   hSetBuffering stdout LineBuffering
@@ -897,9 +910,9 @@ runTraceSuite ts = do
         -- case's own declared policy governs, and only
         -- RepeatableAuto runs a calibration probe.
         --
-        -- The probe gets its own instance: it runs a prologue and a
-        -- class-A draw, and the main run should start from the same
-        -- state whether or not a calibration happened.
+        -- Each probe gets its own instance: it runs a prologue and
+        -- class-A draws, and the main run should start from the
+        -- same state whether or not any probe happened.
         (b, mnoise) <- case maybe policy FixedBatch (saBatch sa) of
           SingleShot     -> pure (1, Nothing)
           FixedBatch n   -> pure (n, Nothing)
@@ -908,6 +921,8 @@ runTraceSuite ts = do
             cb   <- calibrateBatchReport meter hCal
             pure (C.crBatch cb, C.crNoise cb)
         let c = (tsConfig ts) { cfgBatch = b }
+        hBase <- mkH
+        base  <- baselineReading meter c hBase
         h <- mkH
         t <- record name mname meter c h
         let r = traceResult t
@@ -922,6 +937,7 @@ runTraceSuite ts = do
               , crAttribution = mat
               , crBatch       = Just b
               , crNoise       = mnoise
+              , crBaseline    = Just base
               , crTrace       = Just (traceFrames t)
               }
         modifyIORef' ref (cr :)
