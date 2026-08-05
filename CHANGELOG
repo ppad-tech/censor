@@ -1,6 +1,6 @@
 # Changelog
 
-- UNRELEASED
+- 0.4.4 (2026-08-05)
   * **Per-case baseline cost.** `baselineReading` measures the
     target on fresh class-A draws at the case's batch and reports
     the median and IQR in per-batch meter units -- the scale of
@@ -13,6 +13,9 @@
     optional per-case `baseline` key in the `censor/report-v3`
     object and a `baseline med=N iqr=N` segment on the case detail
     line.
+
+  * Fixes the benchmark suites, which had failed to compile since
+    `prepare` was added to `Hypothesis` in 0.4.1.
 
 - 0.4.3 (2026-08-01)
   * **The driver's pair loop is now flip-oblivious.** `runPair`'s
