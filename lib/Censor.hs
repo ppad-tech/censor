@@ -93,6 +93,9 @@ module Censor (
   , calibrateBatchReport
   , Noise(..)
 
+    -- * Baseline probe
+  , baselineReading
+
     -- * A\/A and B\/B negative controls
   , toAA
   , runAA
@@ -911,19 +914,52 @@ median xs = case drop (length xs `div` 2) (sort xs) of
 -- units. This is the meter's noise floor at the scale the driver
 -- will observe, recorded as a snapshot of measurement conditions.
 noiseReading :: Meter -> IO () -> Int -> IO Noise
-noiseReading meter act b = do
-  rs <- collect noiseSamples
-  let !srt = sort rs
-      !n   = length srt
-      !med = nth (n `div` 2) srt
-      !q1  = nth (n `div` 4) srt
-      !q3  = nth (3 * n `div` 4) srt
-  pure Noise { nsMedian = med, nsIqr = q3 - q1 }
+noiseReading meter act b = fmap dispersion (collect noiseSamples)
   where
     collect 0 = pure []
     collect i = do
       !r <- measure meter b act
       fmap (r :) (collect (i - 1 :: Int))
+
+-- median and nearest-rank interquartile range of a reading list.
+dispersion :: [Word64] -> Noise
+dispersion rs =
+  let !srt = sort rs
+      !n   = length srt
+      !med = nth (n `div` 2) srt
+      !q1  = nth (n `div` 4) srt
+      !q3  = nth (3 * n `div` 4) srt
+  in  Noise { nsMedian = med, nsIqr = q3 - q1 }
+
+-- | Baseline cost of the target on class-A inputs: the median and
+--   IQR of single measurements, each on a /fresh/ class-A draw, at
+--   batch 'cfgBatch' — so in per-batch meter units, the scale of
+--   'resEffect' and 'resBound'. Reported so an effect interval can
+--   be read as a relative bound against the cost of a call.
+--
+--   Distinct from the calibration noise floor ('crNoise'), which
+--   remeasures /one/ applied action: for a pure Haskell target the
+--   applied thunk is shared, so repetitions after the first force
+--   an already-evaluated value and the repeated-measurement median
+--   collapses toward the measurement overhead. Fresh draws make
+--   every measurement genuine work under any batch policy.
+--
+--   Each measurement runs the 'prepare' prologue and one 'sampleA'
+--   draw, mirroring what the driver does per pair. Build the probe
+--   its own hypothesis instance when the run's sampler stream must
+--   start undisturbed.
+baselineReading :: Meter -> Config -> Hypothesis a -> IO Noise
+baselineReading meter cfg hyp = fmap dispersion (collect baselineSamples)
+  where
+    collect 0 = pure []
+    collect i = do
+      prepare hyp
+      !x <- sampleA hyp
+      !r <- measure meter (cfgBatch cfg) (target hyp x)
+      fmap (r :) (collect (i - 1 :: Int))
+
+baselineSamples :: Int
+baselineSamples = 15
 
 nth :: Int -> [Word64] -> Word64
 nth k xs = case drop k xs of

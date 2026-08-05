@@ -45,6 +45,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , diagnoseTests
   , renderingTests
   , calibReportTests
+  , baselineTests
   , envTests
   , reportJSONTests
   , manifestTests
@@ -1109,6 +1110,34 @@ calibReportTests = testGroup "calibrateBatchReport" [
       readIORef draws >>= (@?= 1)
   ]
 
+baselineTests :: TestTree
+baselineTests = testGroup "baselineReading" [
+    testCase "reads the target cost at the configured batch" $ do
+      -- linMeter is deterministic (reading = batch * 64), so at
+      -- batch 3 every measurement reads 192 and the IQR is zero.
+      let c = testConfig { C.cfgBatch = 3 }
+      n <- C.baselineReading (linMeter 64) c noopHyp
+      n @?= C.Noise 192 0
+
+    -- unlike the calibration probe, which draws one class-A sample
+    -- and remeasures it, the baseline probe must draw fresh -- a
+    -- shared pure-target thunk would make later measurements no-ops.
+  , testCase "runs the prologue and draws fresh per measurement" $ do
+      preps <- newIORef (0 :: Int)
+      draws <- newIORef (0 :: Int)
+      let hyp = C.Hypothesis
+            { C.target  = \_ -> pure ()
+            , C.prepare = modifyIORef' preps (+ 1)
+            , C.sampleA = modifyIORef' draws (+ 1)
+            , C.sampleB = pure ()
+            }
+      _ <- C.baselineReading (linMeter 64) testConfig hyp
+      np <- readIORef preps
+      nd <- readIORef draws
+      nd @?= np
+      assertBool "expected more than one draw" (nd > 1)
+  ]
+
 envTests :: TestTree
 envTests = testGroup "captureEnv" [
     testCase "captures platform identity" $ do
@@ -1147,6 +1176,7 @@ reportJSONTests = testGroup "reportJSON" [
             , Rep.crAttribution = Nothing
             , Rep.crBatch       = Just 3
             , Rep.crNoise       = Just (C.Noise 100 5)
+            , Rep.crBaseline    = Just (C.Noise 41000 12)
             , Rep.crTrace       = Nothing
             }
           j = Rep.reportJSON hdr [cr]
@@ -1156,6 +1186,8 @@ reportJSONTests = testGroup "reportJSON" [
         ("\"cores\":" `isInfixOf` j)
       assertBool ("expected noise in " ++ j)
         ("\"noise\":{\"med\":100,\"iqr\":5}" `isInfixOf` j)
+      assertBool ("expected baseline in " ++ j)
+        ("\"baseline\":{\"med\":41000,\"iqr\":12}" `isInfixOf` j)
 
   , testCase "omits env and noise when absent" $ do
       r <- C.runCT (constMeter 100) testConfig noopHyp
@@ -1169,11 +1201,14 @@ reportJSONTests = testGroup "reportJSON" [
             , Rep.rhPerCaseBatch = False
             }
           cr = Rep.CaseReport "case" r Nothing Nothing Nothing Nothing
+                 Nothing
           j  = Rep.reportJSON hdr [cr]
       assertBool ("unexpected env block in " ++ j)
         (not ("\"env\":" `isInfixOf` j))
       assertBool ("unexpected noise in " ++ j)
         (not ("\"noise\":" `isInfixOf` j))
+      assertBool ("unexpected baseline in " ++ j)
+        (not ("\"baseline\":" `isInfixOf` j))
   ]
 
 -- manifest parsing -----------------------------------------------------------

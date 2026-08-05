@@ -455,6 +455,14 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
           , Rep.rhPerCaseBatch = False
           }
     cases <- Rep.withReport rc rnd hdr $ \emit -> do
+      -- the baseline probe gets its own hypothesis instance (its
+      -- own rng from the same seed), so the run's sampler stream
+      -- starts exactly where it would have without the probe.
+      hypB <- buildHypothesis (argWorkspace args) (argSecret args)
+                (argPublic args) (argContext args) (samplerSeed args)
+                target
+      base <- F.withFFIHypothesis hypB $ \h ->
+        C.baselineReading meter cfg h
       (result, mfrs) <- F.withFFIHypothesis hyp $ \h ->
         case argTrace args of
           Nothing -> do
@@ -475,6 +483,7 @@ runWith args = DL.withLibrary (argLib args) $ \lib -> do
             , Rep.crAttribution = mat
             , Rep.crBatch       = Nothing
             , Rep.crNoise       = Nothing
+            , Rep.crBaseline    = Just base
             , Rep.crTrace       = mfrs
             }
       emit cr
@@ -632,9 +641,9 @@ runCell args d meter cfg lib cell = do
   target <- DL.resolveTarget lib (M.mcTarget mc)
   let mk = buildHypothesis (M.mcWorkspace mc) (M.mcSecret mc)
              (M.mcPublic mc) (M.mcContext mc) (cellSeed cell) target
-  -- calibration gets its own instance: it runs a prologue and a
-  -- class-A draw, and the run proper should start from the same
-  -- state whether or not a calibration happened.
+  -- each probe gets its own instance: it runs a prologue and
+  -- class-A draws, and the run proper should start from the same
+  -- state whether or not any probe happened.
   (b, mnoise) <- case caseBatch args d mc of
     M.BatchFixed n -> pure (n, Nothing)
     M.BatchAuto    -> do
@@ -643,6 +652,9 @@ runCell args d meter cfg lib cell = do
         cb <- C.calibrateBatchReport meter h
         pure (C.crBatch cb, C.crNoise cb)
   let cfg' = cfg { C.cfgBatch = b }
+  hBase <- mk
+  base  <- F.withFFIHypothesis hBase $ \h ->
+    C.baselineReading meter cfg' h
   hyp <- mk
   result <- F.withFFIHypothesis hyp $ \h -> C.runCT meter cfg' h
   mat <- case (argAttribute args, result) of
@@ -656,5 +668,6 @@ runCell args d meter cfg lib cell = do
     , Rep.crAttribution = mat
     , Rep.crBatch       = Just b
     , Rep.crNoise       = mnoise
+    , Rep.crBaseline    = Just base
     , Rep.crTrace       = Nothing
     }

@@ -1,5 +1,19 @@
 # Changelog
 
+- UNRELEASED
+  * **Per-case baseline cost.** `baselineReading` measures the
+    target on fresh class-A draws at the case's batch and reports
+    the median and IQR in per-batch meter units -- the scale of
+    `resEffect` -- so an effect interval can be read as a relative
+    bound against the cost of a call. Fresh draws make every
+    measurement genuine work under any batch policy, unlike the
+    calibration noise probe, whose shared applied thunk makes it
+    meaningless for pure Haskell targets. `runTraceSuite` and both
+    dlopen CLI modes probe it per case; it surfaces as a new
+    optional per-case `baseline` key in the `censor/report-v3`
+    object and a `baseline med=N iqr=N` segment on the case detail
+    line.
+
 - 0.4.3 (2026-08-01)
   * **The driver's pair loop is now flip-oblivious.** `runPair`'s
     order branch compiled the two A/B orders to two distinct code
