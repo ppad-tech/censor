@@ -47,7 +47,9 @@
           "nixpkgs"
         ],
         "ppad-base16": "ppad-base16",
-        "ppad-chacha": "ppad-chacha",
+        "ppad-chacha": [
+          "ppad-chacha"
+        ],
         "ppad-nixpkgs": [
           "ppad-nixpkgs"
         ],
@@ -141,6 +143,40 @@
     "ppad-base16_3": {
       "inputs": {
         "flake-utils": [
+          "ppad-chacha",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-chacha",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-chacha",
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1766934151,
+        "narHash": "sha256-BUFpuLfrGXE2xi3Wa9TYCEhhRhFp175Ghxnr0JRbG2I=",
+        "ref": "master",
+        "rev": "58dfb7922401a60d5de76825fcd5f6ecbcd7afe0",
+        "revCount": 26,
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      }
+    },
+    "ppad-base16_4": {
+      "inputs": {
+        "flake-utils": [
           "ppad-poly1305",
           "ppad-base16",
           "ppad-nixpkgs",
@@ -172,56 +208,22 @@
         "url": "git://git.ppad.tech/base16.git"
       }
     },
-    "ppad-base16_4": {
-      "inputs": {
-        "flake-utils": [
-          "ppad-secp256k1",
-          "ppad-base16",
-          "ppad-nixpkgs",
-          "flake-utils"
-        ],
-        "nixpkgs": [
-          "ppad-secp256k1",
-          "ppad-base16",
-          "ppad-nixpkgs",
-          "nixpkgs"
-        ],
-        "ppad-nixpkgs": [
-          "ppad-secp256k1",
-          "ppad-nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1778943993,
-        "narHash": "sha256-8eZyChH7WDgMTj804Ht4VFvS+WER9pPtlwYZgWlO60Q=",
-        "ref": "master",
-        "rev": "480f24d852e100bb87cd69f2eda531bdb1306495",
-        "revCount": 37,
-        "type": "git",
-        "url": "git://git.ppad.tech/base16.git"
-      },
-      "original": {
-        "ref": "master",
-        "type": "git",
-        "url": "git://git.ppad.tech/base16.git"
-      }
-    },
     "ppad-base16_5": {
       "inputs": {
         "flake-utils": [
-          "ppad-sha256",
+          "ppad-secp256k1",
           "ppad-base16",
           "ppad-nixpkgs",
           "flake-utils"
         ],
         "nixpkgs": [
-          "ppad-sha256",
+          "ppad-secp256k1",
           "ppad-base16",
           "ppad-nixpkgs",
           "nixpkgs"
         ],
         "ppad-nixpkgs": [
-          "ppad-sha256",
+          "ppad-secp256k1",
           "ppad-nixpkgs"
         ]
       },
@@ -241,6 +243,40 @@
       }
     },
     "ppad-base16_6": {
+      "inputs": {
+        "flake-utils": [
+          "ppad-sha256",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-sha256",
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-sha256",
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1778943993,
+        "narHash": "sha256-8eZyChH7WDgMTj804Ht4VFvS+WER9pPtlwYZgWlO60Q=",
+        "ref": "master",
+        "rev": "480f24d852e100bb87cd69f2eda531bdb1306495",
+        "revCount": 37,
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      }
+    },
+    "ppad-base16_7": {
       "inputs": {
         "flake-utils": [
           "ppad-sha512",
@@ -366,37 +402,31 @@
     "ppad-chacha": {
       "inputs": {
         "flake-utils": [
-          "ppad-aead",
           "ppad-chacha",
           "ppad-nixpkgs",
           "flake-utils"
         ],
         "nixpkgs": [
-          "ppad-aead",
           "ppad-chacha",
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": [
-          "ppad-aead",
-          "ppad-base16"
-        ],
+        "ppad-base16": "ppad-base16_3",
         "ppad-nixpkgs": [
-          "ppad-aead",
           "ppad-nixpkgs"
         ]
       },
       "locked": {
-        "lastModified": 1783709359,
-        "narHash": "sha256-Xl31mWwQfJcfztw5v1NeaUlYn2vAaSVcambpCeemT7I=",
-        "ref": "master",
-        "rev": "2beeb81459bc33ad074321e9ced4ba3880edf747",
-        "revCount": 36,
+        "lastModified": 1778947722,
+        "narHash": "sha256-J03a6PMK3uYHuskkvUTW4vMItDHvdpNS8mRpRy0rNp4=",
+        "ref": "refs/tags/v0.2.2",
+        "rev": "fb376437e2e42f1a58d7252caefa308a52b37b95",
+        "revCount": 33,
         "type": "git",
         "url": "git://git.ppad.tech/chacha.git"
       },
       "original": {
-        "ref": "master",
+        "ref": "refs/tags/v0.2.2",
         "type": "git",
         "url": "git://git.ppad.tech/chacha.git"
       }
@@ -620,7 +650,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16_3",
+        "ppad-base16": "ppad-base16_4",
         "ppad-fixed": [
           "ppad-fixed"
         ],
@@ -693,7 +723,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16_4",
+        "ppad-base16": "ppad-base16_5",
         "ppad-fixed": "ppad-fixed_2",
         "ppad-hmac-drbg": "ppad-hmac-drbg_2",
         "ppad-nixpkgs": [
@@ -733,7 +763,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16_5",
+        "ppad-base16": "ppad-base16_6",
         "ppad-nixpkgs": [
           "ppad-nixpkgs"
         ]
@@ -765,7 +795,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16_6",
+        "ppad-base16": "ppad-base16_7",
         "ppad-nixpkgs": [
           "ppad-nixpkgs"
         ]
@@ -797,6 +827,7 @@
         ],
         "ppad-aead": "ppad-aead",
         "ppad-bip32": "ppad-bip32",
+        "ppad-chacha": "ppad-chacha",
         "ppad-eproc": "ppad-eproc",
         "ppad-fixed": "ppad-fixed",
         "ppad-nixpkgs": "ppad-nixpkgs",

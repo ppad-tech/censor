@@ -51,6 +51,13 @@ flag poly
   default:     False
   manual:      True
 
+flag chacha
+  description: Build the censor-chacha executable, which records
+               ppad-chacha ChaCha20 cipher and block traces under
+               a selectable meter (depends on ppad-chacha).
+  default:     False
+  manual:      True
+
 flag sha
   description: Build the censor-sha executable, which records
                ppad-sha256 constant-time MAC comparison traces
@@ -238,6 +245,23 @@ executable censor-poly
       , ppad-censor
       , ppad-eproc
       , ppad-poly1305
+
+executable censor-chacha
+  default-language: Haskell2010
+  hs-source-dirs:   demo
+  main-is:          ChaCha.hs
+  ghc-options:
+    -O2 -rtsopts -Wall
+
+  if !flag(chacha)
+    buildable: False
+  else
+    build-depends:
+        base
+      , bytestring
+      , ppad-censor
+      , ppad-chacha
+      , ppad-eproc
 
 executable censor-sha
   default-language: Haskell2010

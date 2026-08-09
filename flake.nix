@@ -61,11 +61,21 @@
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
       inputs.ppad-fixed.follows = "ppad-fixed";
     };
+    # Hoisted for the same reason as ppad-poly1305: without it,
+    # aead brings its own ppad-chacha and the build trips on
+    # multiple versions. Pinned at the v0.2.2 tag.
+    ppad-chacha = {
+      type = "git";
+      url  = "git://git.ppad.tech/chacha.git";
+      ref  = "refs/tags/v0.2.2";
+      inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
+    };
     ppad-aead = {
       type = "git";
       url  = "git://git.ppad.tech/aead.git";
       ref  = "master";
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
+      inputs.ppad-chacha.follows = "ppad-chacha";
       inputs.ppad-poly1305.follows = "ppad-poly1305";
     };
     flake-utils.follows = "ppad-nixpkgs/flake-utils";
@@ -76,7 +86,7 @@
             , ppad-eproc, ppad-fixed
             , ppad-sha256, ppad-sha512
             , ppad-secp256k1, ppad-bip32
-            , ppad-poly1305, ppad-aead }:
+            , ppad-poly1305, ppad-chacha, ppad-aead }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         lib = "ppad-censor";
@@ -130,6 +140,12 @@
             (hlib.enableCabalFlag poly1305 "llvm")
             [ llvm clang ];
 
+        chacha = ppad-chacha.packages.${system}.default;
+        chacha-llvm =
+          hlib.addBuildTools
+            (hlib.enableCabalFlag chacha "llvm")
+            [ llvm clang ];
+
         # rust staticlib exercised by censor-demo-ffi. bundles all
         # FFI targets (the 32-byte inequality witnesses and the
         # fastcrypto::secp256r1 sign bridge) in one crate so the
@@ -181,11 +197,13 @@
           ppad-bip32 = bip32-llvm;
           ppad-aead = aead-llvm;
           ppad-poly1305 = poly1305-llvm;
+          ppad-chacha = chacha-llvm;
           ${lib} = hlib.overrideCabal (hlib.enableCabalFlag
             (hlib.enableCabalFlag
               (hlib.enableCabalFlag
-                (new.callCabal2nixWithOptions lib ./.
-                   "--flag=demo --flag=demo-ffi --flag=poly" {
+                (hlib.enableCabalFlag
+                  (new.callCabal2nixWithOptions lib ./.
+                   "--flag=demo --flag=demo-ffi --flag=poly --flag=chacha" {
                    ppad-eproc = new.ppad-eproc;
                    ppad-fixed = new.ppad-fixed;
                    ppad-sha256 = new.ppad-sha256;
@@ -199,9 +217,10 @@
                    # extra-libraries entry as a missing nix arg.
                    censor_rs_demo = null;
                  })
-                "demo")
-              "demo-ffi")
-            "poly")
+                  "demo")
+                "demo-ffi")
+              "poly")
+            "chacha")
             (drv: {
               configureFlags = (drv.configureFlags or []) ++ [
                 "--extra-lib-dirs=${rs-demo}/lib"
@@ -221,8 +240,9 @@
           packages.haddock = hpkgs.${lib}.doc;
 
           # 'nix flake check' realises the full package (demo,
-          # demo-ffi, poly flags on), catching breaks that a plain
-          # 'cabal build' skips because those flags default to off.
+          # demo-ffi, poly, chacha flags on), catching breaks that a
+          # plain 'cabal build' skips because those flags default to
+          # off.
           checks.default = hpkgs.${lib};
 
           devShells.default = hpkgs.shellFor {
