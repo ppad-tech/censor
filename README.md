@@ -369,6 +369,65 @@ A few rules keep the comparison honest:
     class B keeps in place of the fixed input, so nursery occupancy
     and GC scheduling do not drift between classes.
 
+### Wall-clock rejections on noisy hosts
+
+Even a hypothesis that obeys every rule above can reject under the
+wall meter, far in excess of `alpha`, on a busy or frequency-scaled
+host — while the hardware counters consistently pass the same
+target. This is not a failure of the anytime guarantee, and "host
+noise" in the innocent sense cannot explain it: class-independent
+noise, however heavy-tailed, drifting, or autocorrelated, cannot
+inflate the false-alarm rate, because the guarantee is
+distribution-free given within-pair exchangeability, which the
+randomised order supplies whatever the noise's marginal law.
+Symmetric noise costs power, never validity. A wall rejection that
+*reproduces* is therefore a systematic: the exchangeability null
+really is false for the wall readings, and the question is which
+channel falsified it.
+
+The meter signature localises the channel. Wall time is on-thread
+user cycles divided by frequency, plus interrupt and kernel time,
+plus descheduled time. The perf meters count on-thread, user-only
+events: clean instructions rules out any class difference in the
+executed stream, and clean cycles additionally rules out
+data-dependent latency and microarchitectural state inside the
+timed region. What remains is exactly the wall-exclusive residue —
+frequency variation, interrupt service, scheduling gaps — all of
+it host-mediated.
+
+Class reaches those channels through *interference*, the one thing
+order randomisation cannot remove (the nuisance-process caveat
+under "The null, and what it does and does not cover", made
+concrete). The coin makes position independent of class; it does
+nothing about one arm's class modulating host state that the other
+arm's reading then absorbs. Concretely: constant time is not
+constant power. Writing and processing random bytes has higher
+switching activity than re-writing a fixed value, and DVFS
+hardware converts power to frequency on sub-millisecond
+timescales — so the second arm of a pair is slowed by an amount
+that depends on the *first* arm's class, an asymmetry that
+survives randomisation and leaves cycle counts invariant by
+construction. Interrupt phase behaves the same way:
+content-dependent wobble in the untimed sampler code shifts where
+the periodic tick lands relative to the timed window, and wall
+absorbs interrupt time that an `exclude_kernel` counter does not
+count.
+
+The sequential layer then does what it is built to do: the test is
+consistent, so any stable systematic — sub-nanosecond is enough
+for the sign and indicator components over enough pairs — becomes
+near-certain eventual rejection. A reproducible wall-only `Reject`
+with clean counters therefore reads as "the class difference lives
+in host-mediated time, not in the executed instruction stream" —
+the expected signature of a power or phase coupling, though a
+genuine power side channel in the target produces the same
+signature and the meters alone cannot tell the two apart. Pinning
+the frequency (performance governor, turbo off) removes the
+dominant channel; the A/A control above separates residual order
+coupling from class-side coupling, since it shares the harness
+shape but not the content asymmetry. Prefer the counters where
+they are available.
+
 ## Documentation
 
 Haddocks (API documentation, etc.) are hosted at
