@@ -1,5 +1,23 @@
 # Changelog
 
+- 0.5.0 (2026-08-21)
+  * **Channel-attribution counters.** Four new `Counter` meters
+    complete the wall-decomposition ladder: `RefCycles`
+    (constant-rate reference cycles -- a class difference here with
+    clean `Cycles` is a frequency/DVFS effect by construction),
+    `TaskClock` (on-CPU nanoseconds including kernel time on the
+    task's behalf; a software counter, so it needs no PMU access
+    and works in VMs), `BranchMisses` (secret-dependent branch
+    direction under balanced retired counts), and `CacheMisses`
+    (memory access patterns). With the existing meters, each
+    adjacent rung of instructions -> cycles -> ref-cycles ->
+    task-clock -> wall isolates exactly one cause of a class
+    difference: code path, microarchitectural latency, frequency,
+    kernel/interrupt time, scheduling. The dlopen CLI and suites
+    accept them as `ref-cycles`, `task-clock`, `branch-misses`,
+    and `cache-misses`. Adding constructors to `Counter` is a
+    breaking change for exhaustive matches on that type.
+
 - 0.4.4 (2026-08-05)
   * **Per-case baseline cost.** `baselineReading` measures the
     target on fresh class-A draws at the case's batch and reports

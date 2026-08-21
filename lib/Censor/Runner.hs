@@ -59,15 +59,20 @@ data MeterChoice
   = MeterWall
   | MeterPMU !Counter !String
 
--- | Parse a meter name: @wall@, @instructions@, @cycles@, or
---   @branches@.
+-- | Parse a meter name: @wall@, @instructions@, @cycles@,
+--   @branches@, @ref-cycles@, @task-clock@, @branch-misses@, or
+--   @cache-misses@.
 parseMeter :: String -> Maybe MeterChoice
 parseMeter s = case s of
-  "wall"         -> Just MeterWall
-  "instructions" -> Just (MeterPMU InstructionsRetired "instructions")
-  "cycles"       -> Just (MeterPMU Cycles "cycles")
-  "branches"     -> Just (MeterPMU BranchesRetired "branches")
-  _              -> Nothing
+  "wall"          -> Just MeterWall
+  "instructions"  -> Just (MeterPMU InstructionsRetired "instructions")
+  "cycles"        -> Just (MeterPMU Cycles "cycles")
+  "branches"      -> Just (MeterPMU BranchesRetired "branches")
+  "ref-cycles"    -> Just (MeterPMU RefCycles "ref-cycles")
+  "task-clock"    -> Just (MeterPMU TaskClock "task-clock")
+  "branch-misses" -> Just (MeterPMU BranchMisses "branch-misses")
+  "cache-misses"  -> Just (MeterPMU CacheMisses "cache-misses")
+  _               -> Nothing
 
 -- | The display name of a chosen meter.
 meterName :: MeterChoice -> String
@@ -87,7 +92,8 @@ withMeterArg marg k = do
     Just s  -> case parseMeter s of
       Just c  -> pure c
       Nothing -> die $ "unknown meter " ++ show s
-        ++ " (expected wall|instructions|cycles|branches)"
+        ++ " (expected wall|instructions|cycles|branches|ref-cycles"
+        ++ "|task-clock|branch-misses|cache-misses)"
   case choice of
     MeterWall         -> k "wall" wallClock
     MeterPMU cnt name -> do

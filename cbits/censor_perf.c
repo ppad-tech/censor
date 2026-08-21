@@ -24,21 +24,34 @@ static long censor_perf_event_open(struct perf_event_attr *attr, pid_t pid,
 }
 
 /* counter: 0 = instructions retired, 1 = branch instructions retired,
- * 2 = CPU cycles. Returns a file descriptor (>= 0) on success, or
- * -errno on failure. */
+ * 2 = CPU cycles, 3 = reference cycles (constant-rate; availability
+ * is microarchitecture-dependent), 4 = task clock (software event,
+ * nanoseconds on-CPU; deliberately counts kernel time on the task's
+ * behalf, so task-clock minus user ref-cycle time isolates it),
+ * 5 = branch misses, 6 = cache misses. Returns a file descriptor
+ * (>= 0) on success, or -errno on failure. */
 int censor_perf_open(int counter) {
   struct perf_event_attr attr;
   memset(&attr, 0, sizeof(attr));
   attr.type           = PERF_TYPE_HARDWARE;
   attr.size           = sizeof(attr);
+  attr.exclude_kernel = 1;
+  attr.exclude_hv     = 1;
   switch (counter) {
     case 1:  attr.config = PERF_COUNT_HW_BRANCH_INSTRUCTIONS; break;
     case 2:  attr.config = PERF_COUNT_HW_CPU_CYCLES;          break;
+    case 3:  attr.config = PERF_COUNT_HW_REF_CPU_CYCLES;      break;
+    case 4:
+      attr.type           = PERF_TYPE_SOFTWARE;
+      attr.config         = PERF_COUNT_SW_TASK_CLOCK;
+      attr.exclude_kernel = 0;
+      attr.exclude_hv     = 0;
+      break;
+    case 5:  attr.config = PERF_COUNT_HW_BRANCH_MISSES;       break;
+    case 6:  attr.config = PERF_COUNT_HW_CACHE_MISSES;        break;
     default: attr.config = PERF_COUNT_HW_INSTRUCTIONS;        break;
   }
   attr.disabled       = 1;
-  attr.exclude_kernel = 1;
-  attr.exclude_hv     = 1;
 
   long fd = censor_perf_event_open(&attr, 0 /* this thread */,
                                    -1 /* any cpu */, -1, 0);
