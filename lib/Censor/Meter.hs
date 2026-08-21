@@ -15,14 +15,18 @@
 -- @clock_gettime_nsec_np(CLOCK_UPTIME_RAW)@ (the
 -- @mach_absolute_time@ counter), elsewhere by
 -- @GHC.Clock.getMonotonicTimeNSec@. On Linux, 'withCounter' provides
--- hardware performance-counter meters (retired instructions, retired
--- branches, or CPU cycles) via @perf_event_open@. The instruction and
--- branch counters are deterministic properties of the executed code,
--- immune to the frequency-scaling, cache, and scheduling noise that
--- limits 'wallClock' on sub-microsecond targets; the cycle counter is
--- additionally sensitive to data-dependent latency within identical
--- instruction streams (e.g. variable-time divider units, cache
--- misses), at the cost of run-to-run microarchitectural noise.
+-- performance-counter meters (retired instructions, retired
+-- branches, CPU cycles, constant-rate reference cycles, on-CPU task
+-- clock, branch misses, or cache misses) via @perf_event_open@. The
+-- instruction and branch counters are deterministic properties of
+-- the executed code, immune to the frequency-scaling, cache, and
+-- scheduling noise that limits 'wallClock' on sub-microsecond
+-- targets; the cycle counter is additionally sensitive to
+-- data-dependent latency within identical instruction streams (e.g.
+-- variable-time divider units, cache misses), at the cost of
+-- run-to-run microarchitectural noise. The remaining counters exist
+-- to /attribute/ a difference to a channel — see t'Counter' for the
+-- ladder they form with 'wallClock'.
 --
 -- Resolution caveat ('wallClock'): on Apple Silicon, the hardware
 -- counter ticks at roughly 24 MHz (~42 ns per tick). Targets
@@ -120,13 +124,49 @@ rep !k !act = go k
     go i = act >> go (i - 1)
 {-# INLINE rep #-}
 
--- | A hardware event to count.
+-- | A hardware (or, for 'TaskClock', kernel software) event to
+--   count.
+--
+--   Together with 'wallClock' the counters form a ladder in which
+--   each adjacent gap isolates one cause of a class difference:
+--   instructions (code path) -> cycles (microarchitectural
+--   latency) -> ref-cycles (frequency) -> task-clock (kernel \/
+--   interrupt time) -> wall (scheduling gaps). A rejection that
+--   first appears at a given rung localises the difference to that
+--   rung's channel.
 data Counter =
     InstructionsRetired  -- ^ @PERF_COUNT_HW_INSTRUCTIONS@; deterministic.
   | BranchesRetired      -- ^ @PERF_COUNT_HW_BRANCH_INSTRUCTIONS@; deterministic.
   | Cycles               -- ^ @PERF_COUNT_HW_CPU_CYCLES@; sensitive to
                          --   data-dependent latency and microarch state,
                          --   not deterministic.
+  | RefCycles            -- ^ @PERF_COUNT_HW_REF_CPU_CYCLES@: cycles at
+                         --   the /constant/ reference rate, over the
+                         --   same scheduled user-mode interval as
+                         --   'Cycles'. A class difference here with
+                         --   clean 'Cycles' is a frequency (DVFS \/
+                         --   power) effect by construction.
+                         --   Availability is microarchitecture-
+                         --   dependent; 'withCounter' throws
+                         --   'OpenFailed' where unsupported.
+  | TaskClock            -- ^ @PERF_COUNT_SW_TASK_CLOCK@: nanoseconds
+                         --   the task spent on-CPU, /including/
+                         --   kernel time on its behalf (the
+                         --   exclusion bits are deliberately not
+                         --   set). Wall minus task-clock isolates
+                         --   descheduled time. A software counter:
+                         --   needs no PMU access, so it works in
+                         --   VMs and containers where the hardware
+                         --   counters cannot be opened.
+  | BranchMisses         -- ^ @PERF_COUNT_HW_BRANCH_MISSES@: catches a
+                         --   secret-dependent branch /direction/
+                         --   even when retired branch counts
+                         --   balance (one branch, two directions,
+                         --   same total). Not deterministic.
+  | CacheMisses          -- ^ @PERF_COUNT_HW_CACHE_MISSES@: attributes
+                         --   a cycles-level difference to memory
+                         --   access patterns (the table-lookup
+                         --   signature). Not deterministic.
   deriving (Eq, Show)
 
 -- | Why a 'withCounter' meter could not be opened.
@@ -154,26 +194,34 @@ counterCode :: Counter -> CInt
 counterCode InstructionsRetired = 0
 counterCode BranchesRetired     = 1
 counterCode Cycles              = 2
+counterCode RefCycles           = 3
+counterCode TaskClock           = 4
+counterCode BranchMisses        = 5
+counterCode CacheMisses         = 6
 
 -- | Acquire a hardware performance-counter t'Meter' for the duration of
 --   the callback, then release it.
 --
 --   The counter is opened in user-space-only mode
 --   (@exclude_kernel@), which unprivileged processes may do when
---   @kernel.perf_event_paranoid@ is at most @2@. Because a
---   @perf_event@ counter is bound to the thread that opened it, the
---   callback runs on a single OS thread -- under the threaded runtime
---   via 'runInBoundThread', otherwise inline on the sole OS thread --
+--   @kernel.perf_event_paranoid@ is at most @2@ — except
+--   'TaskClock', which deliberately counts kernel time on the
+--   task's behalf (see t'Counter'). Because a @perf_event@ counter
+--   is bound to the thread that opened it, the callback runs on a
+--   single OS thread -- under the threaded runtime via
+--   'runInBoundThread', otherwise inline on the sole OS thread --
 --   so that the open and every 'measure' share one thread.
 --
 --   Throws 'MeterError' if the counter cannot be opened. For
 --   'InstructionsRetired' and 'BranchesRetired' the reading is a
 --   deterministic property of the executed code, so a constant-time
 --   target yields identical readings across input classes regardless
---   of operand values, cache state, or CPU frequency. For 'Cycles' the
---   reading additionally reflects data-dependent latency and
---   microarchitectural state, so equality across classes is not
---   guaranteed even for CT code.
+--   of operand values, cache state, or CPU frequency. For the other
+--   counters the reading additionally reflects data-dependent
+--   latency, microarchitectural state, frequency ('RefCycles'), or
+--   kernel-time attribution ('TaskClock'), so equality across
+--   classes is not guaranteed even for CT code — class-conditional
+--   /differences/ are the signal.
 withCounter :: Counter -> (Meter -> IO a) -> IO a
 withCounter counter k = onOneThread $ do
   fd <- c_perf_open (counterCode counter)

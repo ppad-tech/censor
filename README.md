@@ -299,10 +299,31 @@ result <- C.withCounter C.InstructionsRetired $ \meter ->
   C.runCT meter C.defaultConfig hyp
 ```
 
-Available counters are `InstructionsRetired`, `BranchesRetired`, and
-`Cycles`. The first two are deterministic properties of the executed
-code; the third is additionally sensitive to data-dependent latency
-and microarchitectural state.
+Available counters are `InstructionsRetired`, `BranchesRetired`,
+`Cycles`, `RefCycles`, `TaskClock`, `BranchMisses`, and
+`CacheMisses`. The first two are deterministic properties of the
+executed code; `Cycles` is additionally sensitive to data-dependent
+latency and microarchitectural state. The rest exist to *attribute*
+a difference to a channel. With the wall clock they form a ladder in
+which each adjacent gap isolates one cause:
+
+  * instructions differ — code-path leak;
+  * cycles differ, instructions clean — microarchitectural latency;
+  * ref-cycles differ, cycles clean — frequency (`RefCycles` counts
+    constant-rate cycles over the same scheduled user-mode interval
+    as `Cycles`, so this gap is a DVFS/power effect by
+    construction);
+  * task-clock differs, ref-cycles clean — kernel/interrupt time
+    (`TaskClock` deliberately counts kernel time on the task's
+    behalf; as a software counter it also works in VMs and
+    containers where PMU access is denied);
+  * wall differs, task-clock clean — scheduling gaps.
+
+`BranchMisses` catches a secret-dependent branch *direction* when
+retired counts balance; `CacheMisses` attributes a cycles-level
+difference to memory access patterns. `RefCycles` availability is
+microarchitecture-dependent — `withCounter` throws where the event
+is unsupported.
 
 ### Foreign targets
 
@@ -425,8 +446,11 @@ signature and the meters alone cannot tell the two apart. Pinning
 the frequency (performance governor, turbo off) removes the
 dominant channel; the A/A control above separates residual order
 coupling from class-side coupling, since it shares the harness
-shape but not the content asymmetry. Prefer the counters where
-they are available.
+shape but not the content asymmetry; and the `RefCycles` and
+`TaskClock` rungs of the counter ladder (see the counter list
+above) measure the frequency and kernel-time channels directly, so
+a wall-only rejection can be pinned to a named channel rather than
+argued about. Prefer the counters where they are available.
 
 ## Documentation
 
