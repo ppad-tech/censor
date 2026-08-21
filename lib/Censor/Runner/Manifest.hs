@@ -84,6 +84,8 @@ data Defaults = Defaults
   , dfBudget    :: !(Maybe Int)
   , dfWarmup    :: !(Maybe Int)
   , dfBatch     :: !(Maybe BatchSpec)
+  , dfMargin    :: !(Maybe Double)
+    -- ^ relative interval-null margin (see 'Censor.cfgMargin').
   , dfSeed      :: !(Maybe Word64)
     -- ^ seeds the input samplers.
   , dfOrderSeed :: !(Maybe Word64)
@@ -106,6 +108,7 @@ emptyDefaults = Defaults
   , dfBudget    = Nothing
   , dfWarmup    = Nothing
   , dfBatch     = Nothing
+  , dfMargin    = Nothing
   , dfSeed      = Nothing
   , dfOrderSeed = Nothing
   , dfPrefix    = Nothing
@@ -203,6 +206,7 @@ parseDirective n d k v = case k of
   "warmup"        -> fmap (\x -> d { dfWarmup    = Just x }) (nat "warmup")
   "workspace"     -> fmap (\x -> d { dfWorkspace = Just x }) (pos "workspace")
   "batch"         -> fmap (\x -> d { dfBatch     = Just x }) (batch n v)
+  "margin"        -> fmap (\x -> d { dfMargin    = Just x }) posnum
   "seed"          -> fmap (\x -> d { dfSeed      = Just x }) (hex n "seed" v)
   "order-seed"    -> fmap (\x -> d { dfOrderSeed = Just x })
                           (hex n "order-seed" v)
@@ -213,6 +217,10 @@ parseDirective n d k v = case k of
     num nm = case reads v of
       [(x, "")] -> Right (x :: Double)
       _ -> Left (at n (nm ++ " expects a number, got " ++ show v))
+    posnum = case reads v of
+      [(x, "")] | x > 0 -> Right (x :: Double)
+      _ -> Left (at n ("margin expects a positive number, got "
+                       ++ show v))
     nat nm = case reads v of
       [(x, "")] | x >= 0 -> Right (x :: Int)
       _ -> Left (at n (nm ++ " expects a non-negative integer, got "

@@ -83,6 +83,7 @@ data Args = Args
   , argBudget     :: !(Maybe Int)
   , argWarmup     :: !(Maybe Int)
   , argBatch      :: !(Maybe Int)
+  , argMargin     :: !(Maybe Double)
   , argSeed       :: !(Maybe Word64)
   , argOrderSeed  :: !(Maybe Word64)
   , argFormat     :: !(Maybe String)
@@ -103,6 +104,7 @@ data ArgAcc = ArgAcc
   , accBudget     :: !(Maybe Int)
   , accWarmup     :: !(Maybe Int)
   , accBatch      :: !(Maybe Int)
+  , accMargin     :: !(Maybe Double)
   , accSeed       :: !(Maybe Word64)
   , accOrderSeed  :: !(Maybe Word64)
   , accFormat     :: !(Maybe String)
@@ -113,7 +115,8 @@ data ArgAcc = ArgAcc
 
 emptyAcc :: ArgAcc
 emptyAcc = ArgAcc Nothing Nothing Nothing [] [] [] Nothing Nothing
-  Nothing Nothing Nothing Nothing Nothing Nothing Nothing False Nothing
+  Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
+  False Nothing
 
 -- exit codes ------------------------------------------------------------------
 
@@ -130,7 +133,8 @@ usage = unlines
   , "              [--context off:len]..."
   , "              [--meter wall|instructions|cycles|branches]"
   , "              [--alpha FLOAT] [--budget INT] [--warmup INT]"
-  , "              [--batch INT] [--seed HEX] [--order-seed HEX]"
+  , "              [--batch INT] [--margin FLOAT]"
+  , "              [--seed HEX] [--order-seed HEX]"
   , "              [--format pretty|json|plain]"
   , "              [--trace PATH] [--attribute]"
   , "   or: censor <libpath> --manifest PATH [--format FMT]"
@@ -142,6 +146,9 @@ usage = unlines
   , "--secret pins class A only (fix vs. random axis)."
   , "--public pins BOTH classes for the whole run."
   , "--context refreshes BOTH classes together, once per pair."
+  , ""
+  , "--margin M tests the interval null |mean effect| <= delta,"
+  , "with delta = M x the warmup median reading (see cfgMargin)."
   , ""
   , "--seed pins the input samplers; --order-seed pins the A/B"
   , "order bit (default: fresh OS entropy, reported on the run)."
@@ -197,6 +204,9 @@ go acc (x:xs)        = case x of
   "--batch"      -> withVal x xs $ \v ys -> do
     n <- parseInt x v
     go acc { accBatch = Just n } ys
+  "--margin"     -> withVal x xs $ \v ys -> do
+    d <- parseDouble x v
+    go acc { accMargin = Just d } ys
   "--seed"       -> withVal x xs $ \v ys -> do
     w <- parseHex x v
     go acc { accSeed = Just w } ys
@@ -307,6 +317,7 @@ finish acc = do
     , argBudget    = accBudget acc
     , argWarmup    = accWarmup acc
     , argBatch     = accBatch acc
+    , argMargin    = accMargin acc
     , argSeed      = accSeed acc
     , argOrderSeed = accOrderSeed acc
     , argFormat    = accFormat acc
@@ -404,6 +415,7 @@ buildConfig args = C.defaultConfig
   , C.cfgBudget = maybe (C.cfgBudget C.defaultConfig) id (argBudget args)
   , C.cfgWarmup = maybe (C.cfgWarmup C.defaultConfig) id (argWarmup args)
   , C.cfgBatch  = maybe (C.cfgBatch  C.defaultConfig) id (argBatch args)
+  , C.cfgMargin = argMargin args
   , C.cfgSeed   = argOrderSeed args
     -- deliberately NOT argSeed: the order bit must be independent
     -- of the sampler stream. Nothing here means fresh OS entropy,
@@ -520,6 +532,9 @@ manifestConfig args d = C.defaultConfig
   , C.cfgWarmup = pick (argWarmup args) (M.dfWarmup d)
                        (C.cfgWarmup C.defaultConfig)
   , C.cfgBatch  = 1  -- resolved per case
+  , C.cfgMargin = case argMargin args of
+      Just m  -> Just m
+      Nothing -> M.dfMargin d
   , C.cfgSeed   = case argOrderSeed args of
       Just w  -> Just w
       Nothing -> M.dfOrderSeed d

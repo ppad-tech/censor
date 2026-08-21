@@ -36,6 +36,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , attributeTests
   , attributedTests
   , signOnlyLeakTests
+  , marginTests
   , fixVsRandomTests
   , fixVsRandomCtxTests
   , rngTests
@@ -348,6 +349,81 @@ deterministicLeakTests = testGroup "deterministic leak" [
           assertFailure $
             "deterministic divergence not detected; passed n="
             ++ show n ++ " logW=" ++ show w
+  ]
+
+-- Margin (interval-null) mode, against the deterministic leak
+-- fixture: readings are 100 (class A) vs 200 (class B), so d = -100
+-- every pair, the warmup clip bound is c = 200, and the median
+-- pooled reading is 200. A relative margin of 0.75 resolves to an
+-- absolute delta = 150 > |mean d|, which the interval null
+-- tolerates; 0.25 resolves to 50 < |mean d|, which it rejects.
+marginTests :: TestTree
+marginTests = testGroup "interval-null margin" [
+    testCase "systematic within margin passes where sharp rejects" $ do
+      (hyp, meter) <- leakHyp
+      r <- C.runCT meter leakCfg { C.cfgMargin = Just 0.75 } hyp
+      case r of
+        C.Pass{} -> do
+          C.resMargin r @?= Just 150
+          -- the sign component still sees d < 0 on every pair; its
+          -- peak grows even though it no longer gates. This is the
+          -- margin-mode diagnostic signature of a sub-margin
+          -- systematic.
+          assertBool "sign peak should register the systematic"
+            (C.resPeakSign r > 0)
+        C.Reject { C.resPairs = n, C.resPeakLogW = w } ->
+          assertFailure $
+            "within-margin systematic rejected at n=" ++ show n
+            ++ " logW=" ++ show w
+  , testCase "systematic beyond margin still rejected" $ do
+      (hyp, meter) <- leakHyp
+      r <- C.runCT meter leakCfg { C.cfgMargin = Just 0.25 } hyp
+      case r of
+        C.Reject{} -> do
+          C.resMargin r @?= Just 50
+          assertBool "Reject but resPValue > alpha"
+            (C.resPValue r <= C.cfgAlpha leakCfg)
+        C.Pass { C.resPairs = n } ->
+          assertFailure $
+            "beyond-margin systematic not detected; passed n="
+            ++ show n
+  , testCase "sharp runs report no margin" $ do
+      (hyp, meter) <- leakHyp
+      r <- C.runCT meter leakCfg hyp
+      C.resMargin r @?= Nothing
+  , testCase "margin-mode result JSON carries the resolved margin" $ do
+      (hyp, meter) <- leakHyp
+      r <- C.runCT meter leakCfg { C.cfgMargin = Just 0.75 } hyp
+      assertBool "resultToJSON should include a margin field"
+        ("\"margin\":" `isInfixOf` R.resultToJSON r)
+  , testCase "nonpositive margin rejected" $ do
+      r <- try (C.runCT (constMeter 100)
+                  leakCfg { C.cfgMargin = Just 0 } noopHyp)
+             :: IO (Either C.CensorError C.Result)
+      case r of
+        Left (C.InvalidConfig _) -> pure ()
+        other -> assertFailure $
+          "expected InvalidConfig, got " ++ show other
+  , testCase "margin at or above the clip bound rejected" $ do
+      -- constMeter 100: d = 0 always, so c = 1 while the median
+      -- reading is 100; any appreciable relative margin resolves
+      -- above the clip bound and must be refused, not run.
+      r <- try (C.runCT (constMeter 100)
+                  leakCfg { C.cfgMargin = Just 0.5 } noopHyp)
+             :: IO (Either C.CensorError C.Result)
+      case r of
+        Left (C.InvalidConfig msg) ->
+          assertBool "message should name the clip bound"
+            ("clip bound" `isInfixOf` msg)
+        other -> assertFailure $
+          "expected InvalidConfig, got " ++ show other
+  , testCase "tiny margin under a flat meter passes" $ do
+      r <- C.runCT (constMeter 100)
+             leakCfg { C.cfgMargin = Just 1.0e-3 } noopHyp
+      case r of
+        C.Pass{} -> C.resMargin r @?= Just 0.1
+        C.Reject{} ->
+          assertFailure "flat meter rejected under a margin"
   ]
 
 -- resPValue is the mixture evidence recast as an anytime-valid
