@@ -154,10 +154,16 @@ data Counter =
                          --   kernel time on its behalf (the
                          --   exclusion bits are deliberately not
                          --   set). Wall minus task-clock isolates
-                         --   descheduled time. A software counter:
-                         --   needs no PMU access, so it works in
-                         --   VMs and containers where the hardware
-                         --   counters cannot be opened.
+                         --   descheduled time. A software counter,
+                         --   so it needs no PMU access and is
+                         --   available in VMs and containers where
+                         --   the hardware events are not — but
+                         --   counting kernel time is itself
+                         --   privileged: this one needs
+                         --   @kernel.perf_event_paranoid@ at most
+                         --   @1@, and 'withCounter' throws
+                         --   @'OpenFailed' 13@ (@EACCES@) at the
+                         --   @2@ the other counters tolerate.
   | BranchMisses         -- ^ @PERF_COUNT_HW_BRANCH_MISSES@: catches a
                          --   secret-dependent branch /direction/
                          --   even when retired branch counts
@@ -206,9 +212,14 @@ counterCode CacheMisses         = 6
 --   (@exclude_kernel@), which unprivileged processes may do when
 --   @kernel.perf_event_paranoid@ is at most @2@ — except
 --   'TaskClock', which deliberately counts kernel time on the
---   task's behalf (see t'Counter'). Because a @perf_event@ counter
---   is bound to the thread that opened it, the callback runs on a
---   single OS thread -- under the threaded runtime via
+--   task's behalf and so needs @1@ or lower, failing with
+--   @'OpenFailed' 13@ (@EACCES@) at @2@ (see t'Counter'). The
+--   deliberate exclusion is not retried without kernel time on
+--   failure: that would open successfully and silently return a
+--   user-only clock, collapsing the very gap the rung exists to
+--   measure. Because a @perf_event@ counter is bound to the
+--   thread that opened it, the callback runs on a single OS
+--   thread -- under the threaded runtime via
 --   'runInBoundThread', otherwise inline on the sole OS thread --
 --   so that the open and every 'measure' share one thread.
 --

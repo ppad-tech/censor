@@ -695,8 +695,14 @@ sweepMain args = do
 -- coupling gain at maximal switching activity -- an upper bound on
 -- what any real fix-vs-random data asymmetry can induce through
 -- that channel, and hence a principled floor for cfgMargin on this
--- host. Under a cycle or instruction meter the same probe should
--- read clean, which is the ladder's frequency-rung contrast.
+-- host. Only the deterministic counters -- instructions, branches
+-- -- are guaranteed to read clean, and their doing so is what
+-- certifies the two classes really do execute the same code. A
+-- cycle-meter rejection is a result rather than a malfunction: an
+-- identical instruction stream can still cost different cycles
+-- when the data changes memory-system behaviour, so cycles
+-- rejecting while instructions stay clean localises the coupling
+-- to microarchitectural latency instead of frequency.
 --
 -- The A/A control (zeros vs zeros) runs first: it shares the
 -- harness shape but not the content asymmetry, so a rejection
@@ -788,15 +794,23 @@ powerGainMain args = do
           "  coupling bound: |effect| <= %.1f units/batch (%.2g of the reading)\n"
           mag (mag / med)
         let !rel4 = 4 * mag / med
-        if rel4 < 0.05
-          then printf
-            "  suggested wall margin, 4x headroom: --margin %.1g\n" rel4
-          else putStrLn $
-               "  bound too loose to derive a useful margin. The effect\n"
-            ++ "  interval bottoms out near a tenth of the clip bound, which\n"
-            ++ "  wall pair-noise sets -- so the lever is a quieter host\n"
-            ++ "  (and more --budget), not a bigger batch: longer timed\n"
-            ++ "  windows collect proportionally more ambient wander."
+        if mname /= "wall"
+          then putStrLn $
+               "  no margin suggested: the counters are meant to support\n"
+            ++ "  the sharp null, where a tolerance only gives away\n"
+            ++ "  power. Read the bound as this meter's residual\n"
+            ++ "  class-difference sensitivity instead."
+          else if rel4 < 0.05
+            then printf
+              "  suggested wall margin, 4x headroom: --margin %.1g\n" rel4
+            else putStrLn $
+                 "  bound too loose to derive a useful margin. The effect\n"
+              ++ "  interval bottoms out near a tenth of the clip bound,\n"
+              ++ "  which wall pair-noise sets, and more --budget barely\n"
+              ++ "  moves it -- the lever is a quieter host. A bigger\n"
+              ++ "  --batch does not tighten the bound either, but it is\n"
+              ++ "  what resolves the channel at all on a noisy or\n"
+              ++ "  virtualised host (see the README's batching note)."
     case probe of
       C.Reject{} -> do
         putStrLn ""

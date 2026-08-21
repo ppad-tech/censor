@@ -6,7 +6,8 @@
 --     [--secret off:len]... [--public off:len]...
 --     [--context off:len]...
 --   censor <libpath> --manifest PATH
---     [--meter wall|instructions|cycles|branches]
+--     [--meter wall|instructions|cycles|branches|ref-cycles
+--             |task-clock|branch-misses|cache-misses]
 --     [--alpha FLOAT] [--budget INT] [--warmup INT] [--batch INT]
 --     [--seed HEX] [--order-seed HEX] [--format pretty|json|plain]
 --     [--trace PATH] [--attribute]
@@ -131,7 +132,9 @@ usage = unlines
   [ "usage: censor <libpath> --workspace BYTES [--target NAME]"
   , "              [--secret off:len]... [--public off:len]..."
   , "              [--context off:len]..."
-  , "              [--meter wall|instructions|cycles|branches]"
+  , "              [--meter wall|instructions|cycles|branches"
+  , "                      |ref-cycles|task-clock|branch-misses"
+  , "                      |cache-misses]"
   , "              [--alpha FLOAT] [--budget INT] [--warmup INT]"
   , "              [--batch INT] [--margin FLOAT]"
   , "              [--seed HEX] [--order-seed HEX]"

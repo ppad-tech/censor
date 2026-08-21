@@ -315,8 +315,11 @@ which each adjacent gap isolates one cause:
     construction);
   * task-clock differs, ref-cycles clean — kernel/interrupt time
     (`TaskClock` deliberately counts kernel time on the task's
-    behalf; as a software counter it also works in VMs and
-    containers where PMU access is denied);
+    behalf; as a software counter it needs no PMU, so it is
+    available in VMs and containers where the hardware events are
+    not — but counting kernel time is privileged, so it needs
+    `kernel.perf_event_paranoid` at most `1` and fails with
+    `OpenFailed 13` at the `2` the other counters tolerate);
   * wall differs, task-clock clean — scheduling gaps.
 
 `BranchMisses` catches a secret-dependent branch *direction* when
@@ -548,6 +551,24 @@ declare it per case as a `BatchPolicy`:
 
 `--batch N` on any suite overrides every case's policy.
 
+### Batching on virtualised hosts
+
+The PMU meters arm and disarm the counter once per batch, and in a
+VM guest those ioctls are far more expensive than on bare metal.
+On an AMD EPYC KVM guest the per-call `cycles` reading falls from
+23226 at `batch = 1` to 17675 at `8` and 16532 at `64`, while wall
+stays flat near 5.4 µs per call — roughly 6700 cycles of
+per-measurement overhead, a 29% inflation on a 5 µs target. At
+`batch = 64` the two meters agree at 3.02 GHz; at `batch = 1` they
+do not, and cycles-derived figures there are not per-call figures.
+
+The overhead is nuisance variance as well as bias, so it costs
+detection: on that host the power-gain probe resolves no channel
+at `batch = 1` even at a budget of 1e6 pairs, but rejects after
+3673 pairs at `batch = 8` and 746 at `64`. Where the target's
+policy allows batching at all (see the contract above), prefer it
+under the PMU meters on virtualised hosts.
+
 Current benchmark figures on an M4 Silicon MacBook Air (use
 `cabal bench` to reproduce):
 
@@ -634,13 +655,27 @@ ambient instability), the probe verdict, and the effect interval
 as a bound on the host's power-to-time coupling gain at maximal
 switching — an upper bound on what any real fix-vs-random data
 asymmetry can induce through that channel, and hence a principled
-floor for `cfgMargin` on this host. When the bound resolves below
-a usable threshold the tool prints a suggested `--margin` with 4x
-headroom; on a noisy host it says so instead — the effect interval
-bottoms out near a tenth of the noise-derived clip bound, so the
-lever is a quieter host, not a bigger batch. Run it under `cycles`
-or `instructions` on Linux for the ladder contrast: the same probe
-should read clean there.
+floor for `cfgMargin` on this host. Under the wall meter, and when
+the bound resolves below a usable threshold, the tool prints a
+suggested `--margin` with 4x headroom; on a noisy host it says so
+instead — the effect interval bottoms out near a tenth of the
+noise-derived clip bound, and raising `--budget` barely moves it,
+so the lever is a quieter host. Under any other meter no margin is
+suggested at all: the counters are meant to support the sharp
+null, and the bound reads as that meter's residual sensitivity.
+
+Run it under `instructions` on Linux for the ladder contrast —
+the deterministic counters are the ones that must read clean, and
+their doing so is what certifies both classes execute the same
+code. `cycles` need not: an identical instruction stream can still
+cost different cycles when the data changes memory-system
+behaviour, and a cycles rejection against a clean instruction
+count localises the coupling to microarchitectural latency rather
+than frequency. On an AMD EPYC KVM guest the probe rejects under
+both `wall` and `cycles` while `instructions` and `branches` stay
+clean across every batch and budget, driven by the CDF component
+rather than a mean shift — a channel margin mode would not gate
+on, since it demotes sign and CDF to diagnostics.
 
 A cell is **PASS** when its CI's upper bound is comfortably below
 its alpha (rejection rate is within budget), **FAIL** when the

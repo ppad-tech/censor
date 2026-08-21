@@ -101,7 +101,17 @@ withMeterArg marg k = do
       case r of
         Right a -> pure a
         Left e  -> die $ name ++ " meter unavailable: "
-          ++ show (e :: MeterError)
+          ++ show (e :: MeterError) ++ hint e
+  where
+    -- EPERM/EACCES means the kernel refused a counter that exists,
+    -- which for an unprivileged process is the paranoid level.
+    -- task-clock counts kernel time and so needs a lower one than
+    -- the rest; see Censor.Meter.
+    hint (OpenFailed n)
+      | n == 1 || n == 13 =
+          " (check kernel.perf_event_paranoid: task-clock needs 1"
+            ++ " or lower, the other counters 2 or lower)"
+    hint _ = ""
 
 -- recording -------------------------------------------------------------------
 

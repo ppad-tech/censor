@@ -42,7 +42,10 @@
     clean `Cycles` is a frequency/DVFS effect by construction),
     `TaskClock` (on-CPU nanoseconds including kernel time on the
     task's behalf; a software counter, so it needs no PMU access
-    and works in VMs), `BranchMisses` (secret-dependent branch
+    and is available in VMs -- but counting kernel time is itself
+    privileged, so it needs `perf_event_paranoid` at most 1 and
+    fails with `OpenFailed 13` at the 2 the other counters
+    tolerate), `BranchMisses` (secret-dependent branch
     direction under balanced retired counts), and `CacheMisses`
     (memory access patterns). With the existing meters, each
     adjacent rung of instructions -> cycles -> ref-cycles ->
