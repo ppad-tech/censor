@@ -328,11 +328,48 @@ data Config = Config
                           --   independent of the sampled timing
                           --   sequence for the conditional null to
                           --   hold.
+  , cfgMargin :: !(Maybe Double)
+                          -- ^ /relative/ interval-null margin, as a
+                          --   fraction of the warmup median pooled
+                          --   per-batch reading. 'Nothing' (the
+                          --   default) tests the sharp null.
+                          --   @Just m@ resolves an absolute margin
+                          --   @delta = m * median@ at warmup and
+                          --   tests @|E d_clipped| <= delta@
+                          --   instead: the three magnitude
+                          --   components become interval-null tests
+                          --   anchored at @±delta@ (via
+                          --   'EPMagn.configInterval') and alone
+                          --   gate the verdict, while the sign and
+                          --   CDF components still run and report
+                          --   peaks as diagnostics. A systematic
+                          --   mean effect smaller than @delta@
+                          --   accumulates no gating evidence.
+                          --
+                          --   The margin is relative because every
+                          --   channel that motivates it (frequency
+                          --   scaling, interrupt phase, scheduling)
+                          --   scales roughly linearly with the
+                          --   timed-region duration, so a fraction
+                          --   of the reading transfers across batch
+                          --   sizes and targets where an absolute
+                          --   nanosecond figure does not. Intended
+                          --   for the wall meter on hosts whose
+                          --   power\/frequency coupling makes the
+                          --   sharp null unattainable (see the
+                          --   README); calibrate it against
+                          --   counter-clean references, and keep it
+                          --   'Nothing' under the PMU meters. The
+                          --   resolved absolute margin must land in
+                          --   @(0, c)@ for the warmup clip bound
+                          --   @c@, else the run throws
+                          --   'InvalidConfig'; it is reported as
+                          --   'resMargin'.
   } deriving Show
 
 -- | Defaults: @alpha = 1e-6@, budget @100000@ pairs, batch 1 (no
 --   inner repetition), warmup 200 pairs, order-bit seed drawn from
---   OS entropy per run.
+--   OS entropy per run, no margin (sharp null).
 defaultConfig :: Config
 defaultConfig = Config
   { cfgAlpha  = 1.0e-6
@@ -340,6 +377,7 @@ defaultConfig = Config
   , cfgBatch  = 1
   , cfgWarmup = 200
   , cfgSeed   = Nothing
+  , cfgMargin = Nothing
   }
 
 -- | Test outcome. 'Reject' means a leak was detected; 'Pass' means
@@ -452,6 +490,16 @@ data Result
         --   supplied via 'cfgSeed' or drawn from OS entropy.
         --   Feeding it back as @'cfgSeed' = 'Just' s@ replays the
         --   same A\/B order sequence.
+      , resMargin     :: !(Maybe Double)
+        -- ^ the /absolute/ interval-null margin the run resolved
+        --   from 'cfgMargin' at warmup, in meter units per batch;
+        --   'Nothing' under the sharp null. When present, the
+        --   verdict was gated by the magnitude components alone,
+        --   testing @|E d_clipped| <= resMargin@: a 'Reject' means
+        --   the mean effect exceeds the margin, and the sign\/CDF
+        --   peaks are diagnostics only (a high 'resPeakSign' with a
+        --   margin-mode 'Pass' is the signature of a systematic
+        --   /within/ tolerance).
       }
   | Pass
       { resPairs      :: {-# UNPACK #-} !Int
@@ -468,6 +516,7 @@ data Result
       , resPeakMagn16 :: {-# UNPACK #-} !Double
       , resCdf        :: ![(Double, Double)]
       , resSeed       :: {-# UNPACK #-} !Word64
+      , resMargin     :: !(Maybe Double)
       }
   deriving Show
 
@@ -583,18 +632,27 @@ diagnose r =
 --   Only meaningful on a 'Reject' — on a 'Pass' every peak sits near
 --   the calibrated floor of @0@ and the returned shape is not
 --   informative.
+--
+--   Under a margin-mode run ('resMargin' present) only the gating
+--   magnitude components are ranked: the sign and CDF peaks did not
+--   drive the verdict there, and a sub-margin systematic routinely
+--   inflates them.
 leakShape :: Result -> LeakShape
 leakShape r =
   let !sig  = resPeakSign r
       !mag  = resPeakMagn r
       !tl   = max (resPeakMagn4 r) (resPeakMagn16 r)
       !cdf  = resPeakCdf r
-      ranked = sortBy (\a b -> compare (fst b) (fst a))
-                 [ (sig, ShapeLeak)
-                 , (mag, BulkShift)
-                 , (tl,  RareOutlier)
-                 , (cdf, CdfShift)
-                 ]
+      candidates = case resMargin r of
+        Just _  -> [ (mag, BulkShift)
+                   , (tl,  RareOutlier)
+                   ]
+        Nothing -> [ (sig, ShapeLeak)
+                   , (mag, BulkShift)
+                   , (tl,  RareOutlier)
+                   , (cdf, CdfShift)
+                   ]
+      ranked = sortBy (\a b -> compare (fst b) (fst a)) candidates
   in  case ranked of
         (p1, s1) : (p2, _) : _
           | p1 > 1.5 * max 0 p2 -> s1
@@ -681,6 +739,16 @@ data Frame = Frame
 --   'resEffect': the effect size of a detected leak, in meter
 --   units. Warmup pairs are excluded (they fix the bounds).
 --
+--   With 'cfgMargin' set, warmup additionally resolves an absolute
+--   margin @delta@ (the relative margin times the median pooled
+--   reading) and the run tests the /interval/ null
+--   @|E d_clipped| <= delta@ instead of the sharp one: the three
+--   magnitude components are anchored at @±delta@ and alone gate
+--   the verdict (mixture @K = 3@), while the sign and CDF
+--   components — which carry no meter-unit tolerance — still run
+--   and report peaks as diagnostics. See 'cfgMargin' and
+--   'resMargin'.
+--
 --   Because the order bit is randomised per pair, @(ta, tb)@ is
 --   conditionally exchangeable under H_0, so every antisymmetric
 --   functional of it is conditionally symmetric about zero — not
@@ -704,9 +772,21 @@ runCTWith meter cfg hyp observe = do
   validateConfig cfg
   (!root, !wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
   let !samplers = orderedSamplers hyp
-  (!c, !qs, !meterResolves) <- warmup meter cfg hyp samplers wSeed
+  (!c, !qs, !meterResolves, !medR) <- warmup meter cfg hyp samplers wSeed
   unless meterResolves $ throwIO WarmupZeroDuration
-  !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c qs of
+  !mdelta <- case cfgMargin cfg of
+    Nothing  -> pure Nothing
+    Just rel -> do
+      let !delta = rel * medR
+      unless (delta > 0) $ throwIO $! InvalidConfig
+        "cfgMargin resolves to a zero absolute margin (warmup \
+        \median reading is 0); raise cfgBatch"
+      unless (delta < c) $ throwIO $! InvalidConfig
+        "cfgMargin resolves to an absolute margin at or above the \
+        \warmup clip bound; lower cfgMargin (the tolerance exceeds \
+        \the pair-noise scale the test bets against)"
+      pure (Just delta)
+  !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c qs mdelta of
     Left  e -> throwIO (InvalidEprocConfig e)
     Right x -> pure x
   !cscfg <- case EPCS.config (negate (hcC3 hcfg)) (hcC3 hcfg)
@@ -725,6 +805,7 @@ runCTWith meter cfg hyp observe = do
         (EPMagn.log_evalue_sup (hsMagn3 st))
         (cdfPeaks qs (hsCdf st))
         root
+        mdelta
       -- the effect interval is latched: once the evidence pins the
       -- mean below the grid's resolution the survivor set empties,
       -- and the last resolvable interval (nested within all earlier
@@ -1094,6 +1175,10 @@ validateConfig Config{..}
       "cfgWarmup must be positive"
   | cfgBudget <  0 = throwIO $! InvalidConfig
       "cfgBudget must be nonnegative"
+  | Just m <- cfgMargin
+  , not (m > 0 && not (isNaN m) && not (isInfinite m)) =
+      throwIO $! InvalidConfig
+        "cfgMargin must be a positive finite fraction"
   | otherwise      = pure ()
 
 -- | The two samplers, indexed by the per-pair order word: slot 0
@@ -1198,18 +1283,27 @@ runPair meter cfg hyp samplers !bit = do
 -- @K@ is @4 + n@ for @n@ resolved cut points, so the hedging price
 -- is @log K@ nats — against @log(1 \/ alpha) = 13.8@ at the default
 -- alpha, adding the CDF channel costs well under a nat.
+--
+-- Under a margin ('cfgMargin'), the three magnitude components are
+-- interval-null tests anchored at @±delta@
+-- ('EPMagn.configInterval') and are the only mixture members
+-- (@K = 3@): the sign and CDF functionals carry no meter-unit
+-- tolerance, so under an interval null they are stepped for their
+-- diagnostic peaks but never gate the verdict.
 
 data HedgeCfg = HedgeCfg
-  { hcSign  :: !EPSign.Config
-  , hcMagn1 :: !EPMagn.Config
-  , hcMagn2 :: !EPMagn.Config
-  , hcMagn3 :: !EPMagn.Config
-  , hcCdf   :: !EPMagn.Config          -- shared by every cut point
-  , hcQs    :: ![Double]               -- the cut points themselves
-  , hcMix   :: !EPMix.Config
-  , hcC1    :: {-# UNPACK #-} !Double  -- tight clip level (base c)
-  , hcC2    :: {-# UNPACK #-} !Double  -- 4c
-  , hcC3    :: {-# UNPACK #-} !Double  -- 16c
+  { hcSign   :: !EPSign.Config
+  , hcMagn1  :: !EPMagn.Config
+  , hcMagn2  :: !EPMagn.Config
+  , hcMagn3  :: !EPMagn.Config
+  , hcCdf    :: !EPMagn.Config          -- shared by every cut point
+  , hcQs     :: ![Double]               -- the cut points themselves
+  , hcMix    :: !EPMix.Config
+  , hcC1     :: {-# UNPACK #-} !Double  -- tight clip level (base c)
+  , hcC2     :: {-# UNPACK #-} !Double  -- 4c
+  , hcC3     :: {-# UNPACK #-} !Double  -- 16c
+  , hcMargin :: !(Maybe Double)         -- absolute margin; Nothing =
+                                        -- sharp null
   }
 
 data HedgeState = HedgeState
@@ -1222,27 +1316,38 @@ data HedgeState = HedgeState
   }
 
 mkHedgeCfg
-  :: Double -> Double -> [Double] -> Either ConfigError HedgeCfg
-mkHedgeCfg !alpha !c qs = do
+  :: Double -> Double -> [Double] -> Maybe Double
+  -> Either ConfigError HedgeCfg
+mkHedgeCfg !alpha !c qs mmargin = do
   let !c2 = 4  * c
       !c3 = 16 * c
+      -- a magnitude component on d clipped to [-b, b]: mean-zero
+      -- under the sharp null, anchored at ±delta under a margin.
+      magn !b = case mmargin of
+        Nothing -> EPMagn.config 0 (negate b) b alpha Newton
+        Just d  ->
+          EPMagn.configInterval (negate d) d (negate b) b alpha Newton
+      !k = case mmargin of
+        Nothing -> 4 + length qs
+        Just _  -> 3
   !sc <- EPSign.config 0.5 alpha Newton
-  !m1 <- EPMagn.config 0 (negate c)  c  alpha Newton
-  !m2 <- EPMagn.config 0 (negate c2) c2 alpha Newton
-  !m3 <- EPMagn.config 0 (negate c3) c3 alpha Newton
+  !m1 <- magn c
+  !m2 <- magn c2
+  !m3 <- magn c3
   !cd <- EPMagn.config 0 (negate 1)  1  alpha Newton
-  !mx <- EPMix.config (4 + length qs) alpha
+  !mx <- EPMix.config k alpha
   pure HedgeCfg
-    { hcSign  = sc
-    , hcMagn1 = m1
-    , hcMagn2 = m2
-    , hcMagn3 = m3
-    , hcCdf   = cd
-    , hcQs    = qs
-    , hcMix   = mx
-    , hcC1    = c
-    , hcC2    = c2
-    , hcC3    = c3
+    { hcSign   = sc
+    , hcMagn1  = m1
+    , hcMagn2  = m2
+    , hcMagn3  = m3
+    , hcCdf    = cd
+    , hcQs     = qs
+    , hcMix    = mx
+    , hcC1     = c
+    , hcC2     = c2
+    , hcC3     = c3
+    , hcMargin = mmargin
     }
 
 -- Running clipped-pair tallies at the hedge's three magnitude
@@ -1287,13 +1392,23 @@ updateHedge HedgeCfg{..} HedgeState{..} !d !ta !tb =
       !m2' = EPMagn.update hcMagn2 hsMagn2 (clipD hcC2 d)
       !m3' = EPMagn.update hcMagn3 hsMagn3 (clipD hcC3 d)
       !cd' = stepCdf hcCdf hcQs hsCdf ta tb
-      !x'  = EPMix.update hcMix hsMix
-               ( EPSign.log_evalue s'
-               : EPMagn.log_evalue m1'
-               : EPMagn.log_evalue m2'
-               : EPMagn.log_evalue m3'
-               : map EPMagn.log_evalue cd'
-               )
+      -- under a margin only the magnitude components gate; the
+      -- sign and CDF components are stepped above for their
+      -- diagnostic peaks but stay out of the mixture.
+      !evs = case hcMargin of
+        Just _  ->
+          [ EPMagn.log_evalue m1'
+          , EPMagn.log_evalue m2'
+          , EPMagn.log_evalue m3'
+          ]
+        Nothing ->
+          ( EPSign.log_evalue s'
+          : EPMagn.log_evalue m1'
+          : EPMagn.log_evalue m2'
+          : EPMagn.log_evalue m3'
+          : map EPMagn.log_evalue cd'
+          )
+      !x'  = EPMix.update hcMix hsMix evs
   in  HedgeState
         { hsSign  = s'
         , hsMagn1 = m1'
@@ -1410,14 +1525,17 @@ osEntropy = fmap toWord (try (withBinaryFile urandom ReadMode grab))
 -- loop so the p99 estimate doesn't inherit a parity-locked nuisance
 -- bias.
 --
--- Returns @(c, qs, meterResolves)@ where @c = max 1 (2 * p99(|d|))@
--- is the clipping bound, @qs@ are the CDF-indicator cut points, and
--- @meterResolves@ is True iff @p99(readings) > 0@ (i.e., the meter
--- is producing nonzero readings often enough that at least the
--- upper tail is resolved). If @meterResolves@ is False the meter's
--- quantum is swallowing at least 99% of per-target timings and the
--- caller throws 'WarmupZeroDuration' with the "raise cfgBatch"
--- hint. All-zero /differences/ with well-resolved readings are the
+-- Returns @(c, qs, meterResolves, medReading)@ where
+-- @c = max 1 (2 * p99(|d|))@ is the clipping bound, @qs@ are the
+-- CDF-indicator cut points, @meterResolves@ is True iff
+-- @p99(readings) > 0@ (i.e., the meter is producing nonzero
+-- readings often enough that at least the upper tail is resolved),
+-- and @medReading@ is the median of the pooled per-class readings
+-- (the scale reference that resolves a relative 'cfgMargin' to an
+-- absolute one). If @meterResolves@ is False the meter's quantum is
+-- swallowing at least 99% of per-target timings and the caller
+-- throws 'WarmupZeroDuration' with the "raise cfgBatch" hint.
+-- All-zero /differences/ with well-resolved readings are the
 -- PMU-on-truly-CT happy path — we fall back to @c = 1@ and let the
 -- main loop proceed; under continued zero differences the wealth
 -- process stays flat and the run passes at budget.
@@ -1431,7 +1549,7 @@ osEntropy = fmap toWord (try (withBinaryFile urandom ReadMode grab))
 -- and a repeated cut point would only inflate @K@.
 warmup
   :: Meter -> Config -> Hypothesis a -> SmallArray (IO a) -> Word64
-  -> IO (Double, [Double], Bool)
+  -> IO (Double, [Double], Bool, Double)
 warmup meter cfg hyp samplers seed = do
   let go !i !rng !accD !accR
         | i >= cfgWarmup cfg = pure (accD, accR)
@@ -1447,6 +1565,7 @@ warmup meter cfg hyp samplers seed = do
       !p99d    = orderStat99 diffs
       !p99r    = orderStat99 readings
       !qs      = cutPoints sortedR
+      !medR    = fromIntegral (nth (length sortedR `div` 2) sortedR)
   -- "p99" is fuzzy: at default cfgWarmup = 200 (m = 200 diffs, m'
   -- = 400 readings) idx lands at ~99.5% empirical rank. At small
   -- warmup sizes (cfgWarmup <= 100 for diffs) idx = m - 1, so p99
@@ -1458,7 +1577,7 @@ warmup meter cfg hyp samplers seed = do
   -- The @max 1@ floor keeps @c > 0@ so the e-process configs accept
   -- it even when warmup differences are identically zero (PMU on
   -- truly CT code).
-  pure (max 1 (2 * p99d), qs, p99r > 0)
+  pure (max 1 (2 * p99d), qs, p99r > 0, medR)
 
 -- Empirical @~p99@ order statistic. Sorts and picks index
 -- @(m * 99) \/ 100@; degenerates to the sample max at small @m@
