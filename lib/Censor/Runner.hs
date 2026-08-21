@@ -260,6 +260,9 @@ resultToJSON r = concat
   , ",\"clipped4\":",   show (resClipped4 r)
   , ",\"clipped16\":",  show (resClipped16 r)
   , printf ",\"bound\":%.6g" (resBound r)
+  -- the resolved absolute interval-null margin, present only on
+  -- margin-mode runs (in meter units per batch, like the bound).
+  , maybe "" (printf ",\"margin\":%.6g") (resMargin r)
   , ",\"orderSeed\":",  jstr ("0x" ++ showHex (resSeed r) "")
   , ",\"cdf\":["
   , intercalate ","

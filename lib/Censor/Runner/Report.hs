@@ -356,13 +356,20 @@ knobSegs e = concat
 meterLine :: ReportHeader -> String
 meterLine hdr =
   let c = rhConfig hdr
-  in  intercalate " \183 "
+  in  intercalate " \183 " $
         [ rhMeter hdr
         , printf "alpha=%.1g"       (cfgAlpha c) :: String
         , "warmup=" ++ show (cfgWarmup c)
         , "budget=" ++ show (cfgBudget c)
         , "batch="  ++ batchText hdr
-        ]
+        ] ++ marginSeg c
+
+-- the relative interval-null margin, when the run tests one. The
+-- resolved absolute margin is per-case ('resMargin') and appears
+-- on each case's metadata line.
+marginSeg :: Config -> [String]
+marginSeg c =
+  maybe [] (\m -> [printf "margin=%.1g" m]) (cfgMargin c)
 
 batchText :: ReportHeader -> String
 batchText hdr
@@ -425,6 +432,8 @@ calibText cr = case segs of
       , maybe [] (\n -> [ printf "baseline med=%d iqr=%d"
                             (nsMedian n) (nsIqr n) ])
           (crBaseline cr)
+      , maybe [] (\m -> [ printf "margin=%.1f" m ])
+          (resMargin (crResult cr))
       , ["orderSeed=" ++ seedHex (resSeed (crResult cr))]
       ]
 
@@ -523,6 +532,9 @@ configJSON hdr =
         , ",\"budget\":", show (cfgBudget c)
         , ",\"warmup\":", show (cfgWarmup c)
         , batchField
+        -- the *relative* margin; each case result carries the
+        -- absolute value it resolved to.
+        , maybe "" (\m -> ",\"margin\":" ++ showF m) (cfgMargin c)
         -- the *requested* order seed; absent when the runner left
         -- it to per-run OS entropy. Each case result carries the
         -- value it actually resolved to.
@@ -645,13 +657,13 @@ plainOpen _ hdr = do
 plainMeterLine :: ReportHeader -> String
 plainMeterLine hdr =
   let c = rhConfig hdr
-  in  intercalate ", "
+  in  intercalate ", " $
         [ rhMeter hdr
         , printf "alpha=%.1g"       (cfgAlpha c) :: String
         , "warmup=" ++ show (cfgWarmup c)
         , "budget=" ++ show (cfgBudget c)
         , "batch="  ++ batchText hdr
-        ]
+        ] ++ marginSeg c
 
 plainCase :: ReportCfg -> CaseReport -> IO ()
 plainCase _ cr = do
@@ -741,9 +753,10 @@ padL n s = replicate (max 0 (n - length s)) ' ' ++ s
 -- shared suite arg surface -------------------------------------------------
 
 -- | The parsed suite argv. All censor suites share the shape
---   @[--format FMT] [--batch N] [METER] [EXTRA...]@; each runner
---   interprets @saExtra@ in its own way (trace suites take the
---   first extra as an output path; plain suites reject them).
+--   @[--format FMT] [--batch N] [--margin M] [METER] [EXTRA...]@;
+--   each runner interprets @saExtra@ in its own way (trace suites
+--   take the first extra as an output path; plain suites reject
+--   them).
 data SuiteArgs = SuiteArgs
   { saRenderer :: !Renderer
     -- ^ resolved from @--format@; defaults to 'pretty'.
@@ -756,6 +769,10 @@ data SuiteArgs = SuiteArgs
     --   targets share the applied thunk across a batch, so reps
     --   beyond the first are no-ops — @--batch 1@ is the honest
     --   setting for them (mirrors the dlopen CLI's flag).
+  , saMargin   :: !(Maybe Double)
+    -- ^ relative interval-null margin from @--margin@ (see
+    --   'Censor.cfgMargin'); 'Nothing' tests the sharp null
+    --   (mirrors the dlopen CLI's flag).
   , saExtra    :: ![String]
     -- ^ positional arguments left after meter, in order.
   }
@@ -767,7 +784,8 @@ parseSuiteArgs :: IO SuiteArgs
 parseSuiteArgs = do
   raw <- Env.getArgs
   let (farg, rest0) = takeFormatArg raw
-      (barg, rest)  = takeBatchArg rest0
+      (barg, rest1) = takeBatchArg rest0
+      (garg, rest)  = takeMarginArg rest1
   rnd <- resolveFormat farg
   bat <- case barg of
     Nothing -> pure Nothing
@@ -775,6 +793,12 @@ parseSuiteArgs = do
       [(n, "")] | n >= 1 -> pure (Just n)
       _ -> die $ "unknown --batch " ++ show s
         ++ " (expected a positive integer)"
+  mgn <- case garg of
+    Nothing -> pure Nothing
+    Just s  -> case reads s of
+      [(m, "")] | m > (0 :: Double) -> pure (Just m)
+      _ -> die $ "unknown --margin " ++ show s
+        ++ " (expected a positive number)"
   let (marg, extra) = case rest of
         []       -> (Nothing, [])
         (m:more) -> (Just m,  more)
@@ -782,6 +806,7 @@ parseSuiteArgs = do
     { saRenderer = rnd
     , saMeter    = marg
     , saBatch    = bat
+    , saMargin   = mgn
     , saExtra    = extra
     }
 
@@ -793,6 +818,15 @@ takeBatchArg = go []
     go pre ("--batch":v:rest) = (Just v, reverse pre ++ rest)
     go pre (x:xs)             = go (x:pre) xs
     go pre []                 = (Nothing, reverse pre)
+
+-- | Position-insensitively pluck a @--margin M@ pair out of an argv
+--   list, mirroring 'takeBatchArg'.
+takeMarginArg :: [String] -> (Maybe String, [String])
+takeMarginArg = go []
+  where
+    go pre ("--margin":v:rest) = (Just v, reverse pre ++ rest)
+    go pre (x:xs)              = go (x:pre) xs
+    go pre []                  = (Nothing, reverse pre)
 
 -- trace-recording suite scaffold -------------------------------------------
 
@@ -891,11 +925,13 @@ runTraceSuite ts = do
         _     -> Nothing
   withMeterArg (saMeter sa) $ \mname meter -> do
     env <- captureEnv
-    let hdr = ReportHeader
+    let cfgBase = (tsConfig ts)
+          { cfgMargin =
+              maybe (cfgMargin (tsConfig ts)) Just (saMargin sa) }
+        hdr = ReportHeader
           { rhMeter     = mname
-          , rhConfig    = (tsConfig ts)
-              { cfgBatch =
-                  fromMaybe (cfgBatch (tsConfig ts)) (saBatch sa) }
+          , rhConfig    = cfgBase
+              { cfgBatch = fromMaybe (cfgBatch cfgBase) (saBatch sa) }
           , rhSeed      = tsSeed ts
           , rhTarget    = Just (tsTarget ts)
           , rhNote      = tsNote ts
@@ -920,7 +956,7 @@ runTraceSuite ts = do
             hCal <- mkH
             cb   <- calibrateBatchReport meter hCal
             pure (C.crBatch cb, C.crNoise cb)
-        let c = (tsConfig ts) { cfgBatch = b }
+        let c = cfgBase { cfgBatch = b }
         hBase <- mkH
         base  <- baselineReading meter c hBase
         h <- mkH
@@ -986,6 +1022,10 @@ runSuite su = do
   case saBatch sa of
     Nothing -> pure ()
     Just _  -> die $ prog ++ ": --batch is a trace-suite flag; "
+            ++ "plain suites run each case under its own config"
+  case saMargin sa of
+    Nothing -> pure ()
+    Just _  -> die $ prog ++ ": --margin is a trace-suite flag; "
             ++ "plain suites run each case under its own config"
   rc <- initReportCfg
   withMeterArg (saMeter sa) $ \mname meter -> do

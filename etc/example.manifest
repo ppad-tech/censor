@@ -26,6 +26,14 @@ seed           0xc0ffee5eed0beef7
 # the union bound. Off by default: it costs power per cell.
 family-alpha   off
 
+# Relative interval-null margin (fraction of each case's warmup
+# median reading): tests |mean effect| <= delta instead of the sharp
+# null, tolerating host-mediated systematics that small (frequency
+# coupling, interrupt phase). For wall-meter batteries on hosts
+# where the sharp null is unattainable; leave unset under the PMU
+# meters. Unset here (the default) tests the sharp null.
+#margin        1e-4
+
 # case NAME [key=value ...]
 #
 #   secret=off:len   pinned in class A only -- the fix-vs-random axis
