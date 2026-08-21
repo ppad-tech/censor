@@ -1,6 +1,21 @@
 # Changelog
 
 - 0.5.0 (2026-08-21)
+  * **Margin calibration cells and a host power-gain probe** in
+    censor-validate. The margin calibration cells shift class B by
+    less than the resolved margin, so their interval null is true
+    while the sharp null is false -- empirically validating margin
+    mode's type-I claim under exactly the sub-tolerance systematic
+    the margin absorbs; margin power cells confirm shifts beyond
+    the margin are still caught, and a sharp-contrast cell shows
+    the sub-margin shift rejecting at ~100% without one.
+    `censor-validate --power-gain [METER]` measures the host
+    instead of a synthetic meter: a cycle-identical, maximally
+    power-asymmetric control (zeros vs alternating 01/10 rewrites
+    of a 64 KiB buffer) bounds the host's power-to-time coupling
+    gain from above, with an A/A control and, when the bound
+    resolves usefully, a suggested `--margin`.
+
   * **Interval nulls (margin mode).** `cfgMargin` (CLI `--margin`,
     manifest `margin`) replaces the sharp null with the interval
     null |E d_clipped| <= delta, where delta resolves at warmup as

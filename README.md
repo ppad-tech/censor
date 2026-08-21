@@ -495,9 +495,12 @@ Calibrating `delta` is a measurement, not a guess: run the wall
 meter on targets the counters certify clean and read the
 `resEffect` interval — that is the host's residual coupling — or
 run a deliberately power-asymmetric, cycle-identical control to
-bound the channel gain from above. Set the margin above that floor
-and below the effect sizes you care about, and re-calibrate when
-the host or governor configuration changes. Keep the margin unset
+bound the channel gain from above. `censor-validate --power-gain`
+packages the latter (see the calibration section below): an A/A
+control, the max-switching probe, and a suggested `--margin` when
+the bound resolves usefully. Set the margin above that floor and
+below the effect sizes you care about, and re-calibrate when the
+host or governor configuration changes. Keep the margin unset
 under the PMU meters: they support the sharp null, and a tolerance
 there only gives away power.
 
@@ -602,6 +605,42 @@ $ cabal run -f+validate censor-validate -- 10000 --csv runs/v0.1.csv
 The first positional argument is the trial count per cell (default
 10000); `--csv path` dumps a machine-readable copy of the report for
 cross-release diffing.
+
+The battery includes margin-mode cells. The margin calibration
+cells shift class B by *less* than the resolved margin, so their
+interval null is true while the sharp null is false — they validate
+margin mode's type-I claim under exactly the sub-tolerance
+systematic the margin exists to absorb (a companion sharp-mode
+contrast cell shows the same shift rejecting at ~100% without a
+margin). The margin power cells confirm that shifts beyond the
+margin are still caught.
+
+### The host power-gain probe
+
+`censor-validate --power-gain [METER] [--budget N] [--batch N]`
+runs a different job: not a synthetic-meter sweep but a measurement
+on the real host. The probe is a maximally power-asymmetric,
+cycle-identical positive control — both classes execute the
+identical instruction stream (two full rewrites of a 64 KiB buffer
+per call), but class A writes zeros while class B alternates the
+all-01 and all-10 patterns, so every bit of the buffer and store
+datapath toggles on each rewrite. Any class difference a timing
+meter resolves is therefore carried by a power-mediated channel
+(frequency scaling, in practice), not by the executed code.
+
+The report gives the A/A control (zeros vs zeros — shares the
+harness shape, not the content asymmetry; a rejection there flags
+ambient instability), the probe verdict, and the effect interval
+as a bound on the host's power-to-time coupling gain at maximal
+switching — an upper bound on what any real fix-vs-random data
+asymmetry can induce through that channel, and hence a principled
+floor for `cfgMargin` on this host. When the bound resolves below
+a usable threshold the tool prints a suggested `--margin` with 4x
+headroom; on a noisy host it says so instead — the effect interval
+bottoms out near a tenth of the noise-derived clip bound, so the
+lever is a quieter host, not a bigger batch. Run it under `cycles`
+or `instructions` on Linux for the ladder contrast: the same probe
+should read clean there.
 
 A cell is **PASS** when its CI's upper bound is comfortably below
 its alpha (rejection rate is within budget), **FAIL** when the

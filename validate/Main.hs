@@ -14,15 +14,24 @@
 -- Use case: pre-release calibration check. A full N = 10000 sweep
 -- takes ~10 minutes; pass a smaller N as the first argument
 -- (e.g. `censor-validate 1000`) for a fast pass while iterating.
+--
+-- `censor-validate --power-gain [METER]` runs a different job: the
+-- host power-coupling probe, a cycle-identical but maximally
+-- power-asymmetric positive control measured on the *real* host
+-- (default meter: wall). See the probe section below.
 
 module Main where
 
 import qualified Censor as C
+import qualified Censor.Runner as R
 import Control.Monad (forM, forM_, unless)
 import Data.IORef
 import Data.List (intercalate)
 import Data.Maybe (isJust)
 import Data.Word (Word64)
+import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (pokeElemOff)
 import qualified System.Environment as Env
 import qualified System.Exit as Exit
 import qualified System.IO as IO
@@ -390,6 +399,61 @@ edgeCaseCells =
   where
     sc = scSymUniform 0xED6E01
 
+-- margin (interval-null) cells -----------------------------------------------
+
+-- Cells exercising cfgMargin. A relative margin resolves against
+-- the warmup median pooled reading, so each base names the reading
+-- scale it was chosen for: narrow-jitter readings sit at ~10000,
+-- where rel 1e-3 lands the absolute margin at ~10 against a clip
+-- bound of ~40+; heavy-tail readings have median ~100, where rel
+-- 5e-2 lands it at ~5 against a clip bound in the thousands.
+--
+-- The calibration cells shift class B by LESS than the resolved
+-- margin, so the interval null |E d_clipped| <= delta is true
+-- while the sharp null is false: they validate margin mode's
+-- type-I claim under exactly the sub-tolerance systematic the
+-- margin exists to absorb. The sharp-contrast power cell runs the
+-- same sub-margin shift without a margin and should reject at
+-- ~100%, exhibiting the behaviour being ruled out of scope.
+marginCfg :: Double -> Int -> Double -> C.Config
+marginCfg !rel !budget !alpha =
+  (baseCfg budget 1 alpha) { C.cfgMargin = Just rel }
+
+withMarginName :: Double -> Scenario -> Scenario
+withMarginName !rel sc =
+  sc { scName = scName sc ++ "+margin=" ++ showSci rel }
+
+marginH0Bases :: [(Scenario, Double)]
+marginH0Bases =
+  [ (scNarrowJitter 0x3A6C01,              1.0e-3)  -- no systematic
+  , (addShift (scNarrowJitter 0x3A6C02) 2, 1.0e-3)  -- 2 < delta ~10
+  , (addShift (scNarrowJitter 0x3A6C03) 8, 1.0e-3)  -- 8 < delta ~10
+  , (addShift (scHeavyTail    0x3A6C04) 2, 5.0e-2)  -- 2 < delta ~5
+  ]
+
+marginCalibrationCells :: [Cell]
+marginCalibrationCells =
+  [ Cell (withMarginName rel sc) (marginCfg rel 10000 a) (Just a)
+  | (sc, rel) <- marginH0Bases
+  , a         <- gatedAlphas
+  ]
+
+marginPowerCells :: [Cell]
+marginPowerCells = beyond ++ contrast
+  where
+    -- shifts beyond the resolved margin (~10) must still be caught.
+    beyond =
+      [ Cell (withMarginName 1.0e-3
+               (addShift (scNarrowJitter 0x3A6C05) s))
+             (marginCfg 1.0e-3 budget 1e-3) Nothing
+      | s <- [20, 50], budget <- powerBudgets
+      ]
+    -- the sub-margin shift from the calibration cells, sharp mode.
+    contrast =
+      [ Cell (addShift (scNarrowJitter 0x3A6C06) 2)
+             (baseCfg 10000 1 1e-3) Nothing
+      ]
+
 powerCells :: [Cell]
 powerCells = shiftedCells ++ asymCells ++ varianceCells
   where
@@ -475,12 +539,12 @@ reportCell CellResult{..} =
       !batch   = C.cfgBatch cellCfg
       !(lo, hi) = crCI
       !verCol  = maybe "-" renderVerdict crVerdict
-  in  printf "%-30s %-9s %7d %5d %5d %9.5f  [%7.5f, %7.5f]  %-6s"
+  in  printf "%-36s %-9s %7d %5d %5d %9.5f  [%7.5f, %7.5f]  %-6s"
         (scName cellScenario) (showSci alpha) budget batch
         crRejects (rate crRejects crTrials) lo hi verCol
 
 reportHeader :: String
-reportHeader = printf "%-30s %-9s %7s %5s %5s %9s  %18s  %-6s"
+reportHeader = printf "%-36s %-9s %7s %5s %5s %9s  %18s  %-6s"
   ("scenario" :: String) ("alpha" :: String) ("budget" :: String)
   ("batch" :: String) ("rej" :: String) ("rate" :: String)
   ("CI" :: String) ("verdict" :: String)
@@ -565,9 +629,18 @@ main :: IO ()
 main = do
   IO.hSetBuffering IO.stdout IO.LineBuffering
   args <- Env.getArgs
+  if "--power-gain" `elem` args
+    then powerGainMain (filter (/= "--power-gain") args)
+    else sweepMain args
+
+sweepMain :: [String] -> IO ()
+sweepMain args = do
   let Opts{..} = parseArgs args
-      cells    = calibrationCells ++ edgeCaseCells ++ powerCells
+      cells    = calibrationCells ++ edgeCaseCells
+                   ++ marginCalibrationCells
+                   ++ powerCells ++ marginPowerCells
       gatedCount = length [ c | c <- calibrationCells ++ edgeCaseCells
+                                       ++ marginCalibrationCells
                               , isJust (cellGate c) ]
       familyConf = 1 - 0.05 / fromIntegral gatedCount
         -- Bonferroni over the gated cells. Ungated calibration and
@@ -587,17 +660,160 @@ main = do
     printf "  ... %s\n" (scName (cellScenario c))
     runCell optTrials conf c
 
-  let (calibR, rest1)  = splitAt (length calibrationCells) results
-      (edgeR,  powerR) = splitAt (length edgeCaseCells)    rest1
+  let (calibR, rest1) = splitAt (length calibrationCells)       results
+      (edgeR,  rest2) = splitAt (length edgeCaseCells)          rest1
+      (mcalR,  rest3) = splitAt (length marginCalibrationCells) rest2
+      (powerR, mpowR) = splitAt (length powerCells)             rest3
 
-  reportSection "calibration" optTrials familyConf calibR
-  reportSection "edge cases"  optTrials familyConf edgeR
-  reportSection "power"       optTrials 0.95       powerR
-  reportSummary (calibR ++ edgeR)
+  reportSection "calibration"        optTrials familyConf calibR
+  reportSection "edge cases"         optTrials familyConf edgeR
+  reportSection "margin calibration" optTrials familyConf mcalR
+  reportSection "power"              optTrials 0.95       powerR
+  reportSection "margin power"       optTrials 0.95       mpowR
+  reportSummary (calibR ++ edgeR ++ mcalR)
 
   forM_ optCsv $ \p -> writeCsv p results
 
-  let (_, fails, _) = countVerdicts (calibR ++ edgeR)
+  let (_, fails, _) = countVerdicts (calibR ++ edgeR ++ mcalR)
   if fails > 0
     then Exit.exitWith (Exit.ExitFailure 1)
     else Exit.exitSuccess
+
+-- host power-gain probe ------------------------------------------------------
+
+-- A maximally power-asymmetric, cycle-identical positive control,
+-- measured on the real host rather than a synthetic meter. Both
+-- classes run the identical instruction stream -- two full rewrites
+-- of a 64 KiB buffer per call -- and differ only in the data
+-- written: class A writes zeros twice, so after the first call no
+-- stored bit ever changes; class B alternates the all-01 and all-10
+-- patterns, so every bit of the buffer and the store datapath
+-- toggles on each rewrite. Any class difference a timing meter
+-- resolves is therefore carried by a power-mediated channel
+-- (frequency scaling being the usual transducer), not by the
+-- executed code. The probe measures the host's power-to-time
+-- coupling gain at maximal switching activity -- an upper bound on
+-- what any real fix-vs-random data asymmetry can induce through
+-- that channel, and hence a principled floor for cfgMargin on this
+-- host. Under a cycle or instruction meter the same probe should
+-- read clean, which is the ladder's frequency-rung contrast.
+--
+-- The A/A control (zeros vs zeros) runs first: it shares the
+-- harness shape but not the content asymmetry, so a rejection
+-- there indicts ambient instability rather than the power channel,
+-- and the gain estimate is flagged as confounded.
+
+powerGainWords :: Int
+powerGainWords = 8192   -- 64 KiB of Word64
+
+fillBuf :: Ptr Word64 -> Word64 -> IO ()
+fillBuf !p !w = go 0
+  where
+    go !i
+      | i >= powerGainWords = pure ()
+      | otherwise           = pokeElemOff p i w >> go (i + 1)
+
+powerGainHyp :: IO (C.Hypothesis (Word64, Word64))
+powerGainHyp = do
+  fp <- mallocForeignPtrBytes (powerGainWords * 8)
+  pure C.Hypothesis
+    { C.target  = \(!w1, !w2) -> withForeignPtr fp $ \p -> do
+        fillBuf p w1
+        fillBuf p w2
+    , C.prepare = pure ()
+    , C.sampleA = pure (0x0000000000000000, 0x0000000000000000)
+    , C.sampleB = pure (0x5555555555555555, 0xAAAAAAAAAAAAAAAA)
+    }
+
+data GainOpts = GainOpts
+  { goMeter  :: !(Maybe String)
+  , goBudget :: !Int
+  , goBatch  :: !Int
+  }
+
+parseGainArgs :: [String] -> GainOpts
+parseGainArgs =
+  go GainOpts { goMeter = Nothing, goBudget = 100000, goBatch = 1 }
+  where
+    go !o [] = o
+    go !o ("--budget":v:rest)
+      | Just n <- readMaybe v = go o { goBudget = n } rest
+    go !o ("--batch":v:rest)
+      | Just n <- readMaybe v = go o { goBatch = n } rest
+    go !o (s:rest)
+      | take 2 s /= "--" = go o { goMeter = Just s } rest
+      | otherwise        = go o rest
+
+powerGainMain :: [String] -> IO ()
+powerGainMain args = do
+  let GainOpts{..} = parseGainArgs args
+      -- alpha 1e-3, not the driver default 1e-6: the probe is a
+      -- measurement instrument, not a gate, and resEffect is a
+      -- 1 - alpha confidence sequence -- the looser alpha buys a
+      -- usefully tighter coupling bound at a confidence that is
+      -- ample for host calibration.
+      cfg = C.defaultConfig
+        { C.cfgAlpha  = 1.0e-3
+        , C.cfgBudget = goBudget
+        , C.cfgWarmup = 500
+        , C.cfgBatch  = goBatch
+        }
+  R.withMeterArg goMeter $ \mname meter -> do
+    putStrLn "censor-validate: host power-coupling probe"
+    printf "  meter %s . buffer %d KiB . batch %d . budget %d . alpha %.1g\n"
+      mname (powerGainWords * 8 `div` 1024) goBatch goBudget
+      (C.cfgAlpha cfg)
+    putStrLn ""
+    hypC <- powerGainHyp
+    ctrl <- C.runAA meter cfg hypC
+    printf "  control (zeros vs zeros)      : %s\n" (R.summary ctrl)
+    hypP <- powerGainHyp
+    base <- C.baselineReading meter cfg hypP
+    probe <- C.runCT meter cfg hypP
+    printf "  probe   (zeros vs max-toggle) : %s\n" (R.summary probe)
+    putStrLn ""
+    let !med        = fromIntegral (C.nsMedian base) :: Double
+        (!elo, !ehi) = C.resEffect probe
+        !mag        = max (abs elo) (abs ehi)
+    printf "  baseline: med=%d iqr=%d (meter units per batch)\n"
+      (C.nsMedian base) (C.nsIqr base)
+    if med <= 0
+      then putStrLn
+        "  baseline median is zero; raise --batch until it resolves"
+      else do
+      -- the effect interval covers the true coupling with
+      -- probability 1 - alpha, so its largest endpoint magnitude is
+      -- a valid upper bound on |coupling| at that level.
+        printf
+          "  coupling bound: |effect| <= %.1f units/batch (%.2g of the reading)\n"
+          mag (mag / med)
+        let !rel4 = 4 * mag / med
+        if rel4 < 0.05
+          then printf
+            "  suggested wall margin, 4x headroom: --margin %.1g\n" rel4
+          else putStrLn $
+               "  bound too loose to derive a useful margin. The effect\n"
+            ++ "  interval bottoms out near a tenth of the clip bound, which\n"
+            ++ "  wall pair-noise sets -- so the lever is a quieter host\n"
+            ++ "  (and more --budget), not a bigger batch: longer timed\n"
+            ++ "  windows collect proportionally more ambient wander."
+    case probe of
+      C.Reject{} -> do
+        putStrLn ""
+        putStrLn $ "  the meter resolved the power channel: this host converts\n"
+          ++ "  data switching activity into measurable timing differences."
+        unless (C.resPairs probe >= goBudget) $ putStrLn $
+             "  (halted early at " ++ show (C.resPairs probe)
+          ++ " pairs; detection outpaces estimation, so the bound\n"
+          ++ "  above is loose -- repeat runs or a larger budget sharpen it.)"
+      C.Pass{} -> do
+        putStrLn ""
+        putStrLn $ "  no coupling resolved at this budget; the bound above is\n"
+          ++ "  what the run can exclude."
+    case ctrl of
+      C.Reject{} -> do
+        putStrLn ""
+        putStrLn $ "  WARNING: the A/A control rejected. The harness or host is\n"
+          ++ "  unstable and the gain estimate above is confounded; quiet the\n"
+          ++ "  host and re-run."
+      C.Pass{} -> pure ()
