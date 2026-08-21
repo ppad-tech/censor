@@ -450,7 +450,56 @@ shape but not the content asymmetry; and the `RefCycles` and
 `TaskClock` rungs of the counter ladder (see the counter list
 above) measure the frequency and kernel-time channels directly, so
 a wall-only rejection can be pinned to a named channel rather than
-argued about. Prefer the counters where they are available.
+argued about. Prefer the counters where they are available; where
+only wall is, state the tolerance explicitly with a margin (next
+section).
+
+### Interval nulls: testing with a margin
+
+The sharp null — mean effect exactly zero — is unattainable for
+the wall meter on frequency-scaled hardware: the couplings above
+make the wall distributions genuinely differ by some tiny amount
+even for perfectly constant-time code, and a consistent sequential
+test will eventually find any nonzero systematic. `cfgMargin`
+(CLI: `--margin`, manifest: `margin`) replaces the sharp null with
+an *interval* null,
+
+    |E d_clipped| <= delta
+
+so a systematic smaller than `delta` accumulates no evidence and a
+`Reject` means the mean effect *exceeds the stated tolerance* —
+a claim wall can actually support on real hardware.
+
+The margin is *relative*: `cfgMargin = Just m` resolves to an
+absolute `delta = m * median` at warmup, where `median` is the
+median pooled per-batch reading. Relative, because every channel
+that motivates the margin — frequency, interrupt phase, scheduling
+— scales roughly linearly with the timed-region duration, so a
+fraction of the reading transfers across batch sizes and targets
+where an absolute nanosecond figure would not. The resolved
+absolute margin is reported as `resMargin` (JSON: `margin` on the
+result), must land strictly inside `(0, c)` for the warmup clip
+bound `c`, and the run refuses to start otherwise.
+
+Mechanically, the three magnitude components become interval-null
+tests anchored at `±delta` (`Numeric.Eproc.Bounded.configInterval`)
+and alone gate the verdict (mixture `K = 3`). The sign and CDF
+components carry no meter-unit tolerance — translating `delta`
+into a sign asymmetry would need the density of `d` at zero — so
+they are demoted to diagnostics: still stepped, peaks still
+reported, never gating. A margin-mode `Pass` with a large
+`resPeakSign` is the expected signature of a systematic *within*
+tolerance.
+
+Calibrating `delta` is a measurement, not a guess: run the wall
+meter on targets the counters certify clean and read the
+`resEffect` interval — that is the host's residual coupling — or
+run a deliberately power-asymmetric, cycle-identical control to
+bound the channel gain from above. Set the margin above that floor
+and below the effect sizes you care about, and re-calibrate when
+the host or governor configuration changes. Keep the margin unset
+under the PMU meters: they support the sharp null, and a tolerance
+there only gives away power.
 
 ## Documentation
 

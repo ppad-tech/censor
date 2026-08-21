@@ -1,6 +1,26 @@
 # Changelog
 
 - 0.5.0 (2026-08-21)
+  * **Interval nulls (margin mode).** `cfgMargin` (CLI `--margin`,
+    manifest `margin`) replaces the sharp null with the interval
+    null |E d_clipped| <= delta, where delta resolves at warmup as
+    the given fraction of the median pooled per-batch reading. The
+    three magnitude components become interval-null tests anchored
+    at +-delta (via ppad-eproc 0.5's `configInterval`) and alone
+    gate the verdict; the sign and CDF components are demoted to
+    non-gating diagnostics, since they carry no meter-unit
+    tolerance. A `Reject` then means the mean effect exceeds the
+    stated tolerance -- a claim the wall meter can actually support
+    on frequency-scaled hosts, where the sharp null is genuinely
+    false for host-mediated reasons and a consistent test
+    eventually rejects it (see the README's noisy-hosts section).
+    The resolved absolute margin is reported as `resMargin`
+    (`margin` in the result JSON) and must land in (0, c) for the
+    warmup clip bound c. `leakShape`/`diagnose` rank only the
+    gating components on margin-mode runs. Adding `cfgMargin` /
+    `resMargin` breaks positional construction of `Config` /
+    `Result`. Requires ppad-eproc >= 0.5.
+
   * **Channel-attribution counters.** Four new `Counter` meters
     complete the wall-decomposition ladder: `RefCycles`
     (constant-rate reference cycles -- a class difference here with
