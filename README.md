@@ -735,10 +735,13 @@ times and never gate the verdict.
 ### Baseline
 
 `etc/validate/baseline.csv` is the captured baseline from N=10000
-on master. Headline: zero rejections across all 62 cells (36
-calibration + 2 edge + 24 power-H_0). At `alpha = 1e-2`, all 9
-gated calibration scenarios PASS; at `alpha = 1e-3` they sit at
-INCONCLUSIVE because the Bonferroni-adjusted Wilson upper at 0
+on master: 79 cells (36 calibration + 2 edge + 8 margin
+calibration + 28 power + 5 margin power), 28 of them gated.
+Headline: zero rejections in every H_0 cell at every alpha,
+including all 8 margin-calibration cells — margin mode absorbs
+the sub-tolerance systematic it exists for. Of the gated cells 13
+PASS, all at `alpha = 1e-2`; the other 15 sit at INCONCLUSIVE at
+`alpha = 1e-3` because the Bonferroni-adjusted Wilson upper at 0
 rejections in 10000 trials is `0.00108`, marginally above `1e-3`.
 N would need to climb to ~15000 to push the upper bound below
 `1e-3`. Zero rejections is itself overwhelming evidence the alpha
@@ -763,8 +766,8 @@ detection rate. Headline findings from the baseline:
     ~500x boost in per-pair wealth growth.
   * **Heavy-tailed (95% uniform `[50, 150]` + 5% uniform
     `[5000, 10000]`)**: shifts of 5, 10, and 50 all detect at 100%
-    with `cfgBudget = 10000`; shift of 50 detects even at
-    `cfgBudget = 1000`. The sign component is what closes this
+    at both `cfgBudget = 1000` and `10000`. The sign component is
+    what closes this
     gap — a bulk shift moves `P(d > 0)` off `1/2` regardless of
     tail variance, so the sign test grows wealth cleanly even
     while the magnitude components are drowning in tail noise.
@@ -772,11 +775,14 @@ detection rate. Headline findings from the baseline:
     range; below the noise floor at any statistic).
 
 The hedge composition brings a ~10-15% threshold overhead vs a
-single component (`+log 4` on the rejection threshold), which
-shows up as a small regression at marginal detection points — e.g.
-sym-uniform shift=10 at `cfgBudget = 1000` fell from 100% (under
-the previous single-component design) to 0% (under the hedge). The
-tradeoff is qualitative: we now detect leak shapes that were
+single component (`+log 4` on the rejection threshold), which cost
+detection at marginal points when the hedge landed — sym-uniform
+shift=10 at `cfgBudget = 1000` fell from 100% under the previous
+single-component design to 0% under the hedge. Driver work since
+has bought those points back: that cell now detects at 100% again,
+as do heavy-tail shifts of 5 and 10 at the same budget, all of
+which read 0% in the capture before this one. The tradeoff was
+qualitative in any case — the hedge detects leak shapes that were
 undetectable at any budget under the single-component design.
 
 ## Development
