@@ -53,14 +53,17 @@ builds the hypothesis and encodes the measurement-hygiene rules
 (below) for you: the fixed secret is drawn once from the sampler —
 a heap value reached by the same code path as the random class —
 class A draws and discards a fresh secret per pair so the samplers
-stay allocation-symmetric, and public inputs stay fresh in both
-classes:
+stay allocation-symmetric, both classes re-materialise the pinned
+secret per sample so neither is alone in reading a long-lived,
+fixed-address value (class A completes around the fresh copy), and
+public inputs stay fresh in both classes:
 
 ```haskell
 -- pin a secret key; keep per-pair messages fresh in both classes
 hyp <- C.fixVsRandom
   (\(k, m) -> () <$ evaluate (SHA256.hmac k m))         -- target
   (random32 g)                                          -- secret
+  (\k -> evaluate (BS.copy k))                          -- re-materialise
   (\k -> do m <- randomBytes g 256; pure (k, m))        -- completion
 
 result <- C.runCT C.wallClock C.defaultConfig hyp
@@ -188,6 +191,7 @@ context.
 hyp <- C.fixVsRandomCtx
   (\(k, m) -> () <$ evaluate (mac k m))  -- target
   (C.randomBytes g 32)                   -- secret sampler
+  (\k -> evaluate (BS.copy k))           -- re-materialise
   (C.randomBytes g 256)                  -- public context, per pair
   (\msg key -> pure (key, msg))          -- build the input
 ```
@@ -392,6 +396,15 @@ A few rules keep the comparison honest:
     order. Draw and discard a random value of the same type that
     class B keeps in place of the fixed input, so nursery occupancy
     and GC scheduling do not drift between classes.
+  * Keep the classes symmetric in where the secret is *read from*.
+    A pinned input read out of one long-lived, cache-hot buffer on
+    every class-A sample, against class-B reads of a fresh
+    allocation per sample, is a locality asymmetry a sensitive
+    meter can reject on with no secret dependence at all — and the
+    A/A and B/B controls, each internally symmetric, cannot see
+    it. Re-materialise the pinned value into a fresh allocation in
+    both classes per sample; `fixVsRandom` does this through its
+    re-materialisation argument.
 
 ### Wall-clock rejections on noisy hosts
 

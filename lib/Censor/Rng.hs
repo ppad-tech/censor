@@ -22,6 +22,7 @@ module Censor.Rng (
     Rng
   , mkRng
   , nextWord
+  , reseed
 
     -- * Byte fills
   , randomBytes
@@ -51,6 +52,17 @@ mkRng s = Rng <$> newIORef s
 nextWord :: Rng -> IO Word64
 nextWord (Rng ref) = atomicModifyIORef' ref splitMix
 {-# INLINE nextWord #-}
+
+-- | Reset a generator to a seed in place: after @reseed g s@ the
+--   generator draws exactly the stream of a fresh @'mkRng' s@.
+--
+--   Lets one long-lived generator replay a pinned stream, or adopt
+--   a fresh one, without allocating per use — so the two classes
+--   of a fix-vs-random sampler can share a single generator object
+--   and differ only in the seed value written into it.
+reseed :: Rng -> Word64 -> IO ()
+reseed (Rng ref) s = atomicWriteIORef ref s
+{-# INLINE reseed #-}
 
 -- | The pure splitmix64 step: from a state, produce the successor
 --   state and an output word.

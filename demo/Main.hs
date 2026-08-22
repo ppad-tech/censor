@@ -96,6 +96,7 @@ posScalarMul = do
         !_ <- evaluate (MS.mul x y)
         pure ())
     (randomWider g)
+    pure
     (\w -> do
         !x <- evaluate (MS.to w)
         !y <- randomMont g
@@ -112,6 +113,7 @@ posScalarInv = do
         pure ())
     (randomMont g)
     pure
+    pure
 
 -- positive control: Montgomery exponentiation (constant-iteration
 -- ladder driven by select#). Should be CT in the exponent.
@@ -123,6 +125,7 @@ posScalarExp = do
         !_ <- evaluate (MS.exp b e)
         pure ())
     (randomWider g)
+    pure
     (\e -> do
         !b <- randomMont g
         pure (b, e))
@@ -139,6 +142,7 @@ posMulWNAF tex = do
         pure ())
     (randomWider g)
     pure
+    pure
 
 -- positive control: BIP0340 Schnorr signing under a precomputed
 -- context. The secret-key path runs through wNAF mul; messages and
@@ -154,6 +158,7 @@ posSignSchnorr tex = do
         !_ <- evaluate (Secp.sign_schnorr' tex sec msg aux)
         pure ())
     (randomWider g)
+    pure
     (\sec -> do
         !msg <- random32 g
         !aux <- random32 g
@@ -171,6 +176,7 @@ posSignECDSA tex = do
         !_ <- evaluate (Secp.sign_ecdsa' tex sec msg)
         pure ())
     (randomWider g)
+    pure
     (\sec -> do
         !msg <- random32 g
         pure (sec, msg))
@@ -191,6 +197,7 @@ posAEADEncrypt = do
           Right (!_, !_) -> pure ()
           Left _         -> pure ())
     (random32 g)
+    (\k -> evaluate (BS.copy k))
     (\key -> do
         !nonce <- random12 g
         !aad   <- random32 g
@@ -226,6 +233,7 @@ posAEADDecrypt = do
           Right !_ -> pure ()
           Left _   -> pure ())
     (random32 g)
+    (\k -> evaluate (BS.copy k))
     mkSample
 
 -- positive control: HMAC-SHA256 with a secret key. The inner+outer
@@ -240,6 +248,7 @@ posHMACSHA256 = do
         !_ <- evaluate (SHA256.hmac key msg)
         pure ())
     (random32 g)
+    (\k -> evaluate (BS.copy k))
     (\key -> do
         !msg <- C.randomBytes g 256
         pure (key, msg))
@@ -254,6 +263,7 @@ posHMACSHA512 = do
         !_ <- evaluate (SHA512.hmac key msg)
         pure ())
     (random32 g)
+    (\k -> evaluate (BS.copy k))
     (\key -> do
         !msg <- C.randomBytes g 256
         pure (key, msg))
@@ -364,6 +374,7 @@ posBIP32Derive = do
         !_ <- evaluate (BIP32.derive_child_priv hd i)
         pure ())
     sampleHD
+    pure
     (\hd -> do
         !w <- C.nextWord g
         let !i = fromIntegral w :: Word32

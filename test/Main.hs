@@ -613,6 +613,7 @@ fixVsRandomCtxTests = testGroup "fixVsRandomCtx" [
       base <- C.fixVsRandomCtx
         (\_ -> pure ())
         (pure ())
+        pure
         (atomicModifyIORef' ctr (\n -> (n + 1, n)))
         (\c _ -> pure c)
       let note t act = do
@@ -637,6 +638,24 @@ fixVsRandomCtxTests = testGroup "fixVsRandomCtx" [
       -- observed by either class.
       let ctxs = map (snd . fst) pairs
       ctxs @?= take 10 [1 ..]
+
+    -- as in the fixVsRandom group: class A completes around the
+    -- re-materialised copy, class B around the raw draw, one copy
+    -- per sample in each class.
+  , testCase "both classes re-materialise the pinned secret" $ do
+      ctr <- newIORef (0 :: Int)
+      hyp <- C.fixVsRandomCtx
+        (\_ -> pure ())
+        (pure (100 :: Word64))
+        (\s -> do modifyIORef' ctr (+ 1); pure (s + 1))
+        (pure ())
+        (\_ s -> pure s)
+      a <- C.sampleA hyp
+      b <- C.sampleB hyp
+      n <- readIORef ctr
+      a @?= 101
+      b @?= 100
+      n @?= 2
   ]
   where
     chunk2 (a : b : rest) = (a, b) : chunk2 rest
@@ -671,12 +690,32 @@ fixVsRandomTests = testGroup "fixVsRandom" [
             let go 0 = pure ()
                 go i = act >> go (i - 1)
             in  go k >> readIORef ref
-      hyp <- C.fixVsRandom (writeIORef ref) (pure (100 :: Word64)) pure
+      hyp <- C.fixVsRandom (writeIORef ref) (pure (100 :: Word64))
+               pure pure
       r <- C.runCT meter leakCfg hyp
       case r of
         C.Pass { C.resPairs = n } -> n @?= C.cfgBudget leakCfg
         C.Reject { C.resPairs = n } -> assertFailure $
           "constant sampler rejected at n=" ++ show n
+
+    -- the (+ 1) re-materialiser marks provenance: class A must
+    -- complete around the copy (fix + 1), class B around the raw
+    -- draw, and the copy must run once per sample in each class.
+  , testCase "both classes re-materialise the pinned secret" $ do
+      ctr <- newIORef (0 :: Int)
+      hyp <- C.fixVsRandom
+        (\_ -> pure ())
+        (pure (100 :: Word64))
+        (\s -> do modifyIORef' ctr (+ 1); pure (s + 1))
+        pure
+      a1 <- C.sampleA hyp
+      a2 <- C.sampleA hyp
+      b  <- C.sampleB hyp
+      n  <- readIORef ctr
+      a1 @?= 101
+      a2 @?= 101
+      b @?= 100
+      n @?= 3
   ]
   where
     -- first draw 100 (the pinned secret), all later draws 200.
@@ -690,7 +729,7 @@ fixVsRandomTests = testGroup "fixVsRandom" [
           sec = do
             n <- atomicModifyIORef' ctr (\i -> (i + 1, i))
             pure $! if n == 0 then 100 else 200 :: Word64
-      hyp <- C.fixVsRandom (writeIORef ref) sec pure
+      hyp <- C.fixVsRandom (writeIORef ref) sec pure pure
       pure (hyp, meter)
 
 rngTests :: TestTree
@@ -708,6 +747,15 @@ rngTests = testGroup "Censor.Rng" [
       w1 <- C.nextWord g1
       w2 <- C.nextWord g2
       assertBool "streams coincide" (w1 /= w2)
+
+  , testCase "reseed replays a fresh generator's stream in place" $ do
+      g <- C.mkRng 0xAAAA
+      _ <- C.nextWord g
+      C.reseed g 0xFEEDFACE
+      h <- C.mkRng 0xFEEDFACE
+      ws1 <- mapM (\_ -> C.nextWord g) [1 .. 8 :: Int]
+      ws2 <- mapM (\_ -> C.nextWord h) [1 .. 8 :: Int]
+      ws1 @?= ws2
   ]
 
 randomBytesTests :: TestTree

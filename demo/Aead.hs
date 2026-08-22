@@ -70,6 +70,7 @@ posAeadEncrypt = do
           Right (!_, !_) -> pure ()
           Left _         -> pure ())
     (random32 g)
+    (\k -> evaluate (BS.copy k))
     (publicCtx g)
     (\(!nonce, !aad, !pt) !key -> pure (key, nonce, aad, pt))
 
@@ -96,6 +97,7 @@ posAeadDecrypt = do
           Right !_ -> pure ()
           Left _   -> pure ())
     (random32 g)
+    (\k -> evaluate (BS.copy k))
     (publicCtx g)
     mkSample
 
