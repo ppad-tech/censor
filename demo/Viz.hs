@@ -159,6 +159,7 @@ leaky = do
         pure ())
     (randomWider g)
     pure
+    pure
 
 -- constant-time: the same operation done properly, via the ladder
 -- ppad-secp256k1 uses for secret scalars.
@@ -170,6 +171,7 @@ ct = do
         !_ <- evaluate (Secp.mul Secp._CURVE_G s)
         pure ())
     (randomWider g)
+    pure
     pure
 
 -- json ------------------------------------------------------------------------

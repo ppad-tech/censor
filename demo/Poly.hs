@@ -79,9 +79,11 @@ macCase v n = do
   case v of
     VaryKey ->
       C.fixVsRandom tgt (C.randomBytes g 32)
+        (\k -> evaluate (BS.copy k))
         (\k -> do !k' <- evaluate (BS.copy k); pure (k', m0))
     VaryMsg ->
       C.fixVsRandom tgt (C.randomBytes g n)
+        (\m -> evaluate (BS.copy m))
         (\m -> do !m' <- evaluate (BS.copy m); pure (k0, m'))
 
 main :: IO ()

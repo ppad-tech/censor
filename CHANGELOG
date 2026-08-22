@@ -1,6 +1,21 @@
 # Changelog
 
 - 0.5.0 (2026-08-21)
+  * **Copy-source symmetry in fix-vs-random** (issues/ISSUE4.md).
+    `fixVsRandom` and `fixVsRandomCtx` take a re-materialisation
+    function (`s -> IO s`), run on the pinned secret by *both*
+    classes every sample: class A completes around the fresh copy,
+    class B discards its copy and completes around its fresh draw.
+    With a function that performs a real copy (for ByteString
+    secrets, `\s -> evaluate (BS.copy s)`) the long-lived pinned
+    value is read exactly once per sample in each class, and the
+    completion's input is a fresh, same-aged allocation in both --
+    removing a copy-source locality asymmetry that surfaced as
+    intermittent CDF/shape rejections (effect CI straddling zero)
+    under the cycles meter, invisible to the A/A and B/B controls.
+    `pure` retains the old behaviour for secret types with no
+    cheap re-materialiser.
+
   * **Margin calibration cells and a host power-gain probe** in
     censor-validate. The margin calibration cells shift class B by
     less than the resolved margin, so their interval null is true

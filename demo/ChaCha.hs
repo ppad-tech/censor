@@ -47,6 +47,7 @@ cipherCase n = do
         Right r -> () <$ evaluate r
         Left e  -> die ("censor-chacha: cipher failed: " <> show e)
   C.fixVsRandom tgt (C.randomBytes g 32)
+    (\k -> evaluate (BS.copy k))
     (\k -> do !k' <- evaluate (BS.copy k); pure (k', msg))
 
 -- Same discipline for the block function: one 64-byte keystream
@@ -60,6 +61,7 @@ blockCase = do
         Right r -> () <$ evaluate r
         Left e  -> die ("censor-chacha: block failed: " <> show e)
   C.fixVsRandom tgt (C.randomBytes g 32)
+    (\k -> evaluate (BS.copy k))
     (\k -> do !k' <- evaluate (BS.copy k); pure k')
 
 main :: IO ()

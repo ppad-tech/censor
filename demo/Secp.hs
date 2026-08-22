@@ -55,6 +55,7 @@ posMul = do
     (\s -> () <$ evaluate (Secp.mul Secp._CURVE_G s))
     (randomWider g)
     pure
+    pure
 
 -- timing-safe wNAF multiplication under a precomputed context.
 posMulWNAF :: Secp.Context -> IO (C.Hypothesis Wider)
@@ -63,6 +64,7 @@ posMulWNAF tex = do
   C.fixVsRandom
     (\s -> () <$ evaluate (Secp.mul_wnaf tex s))
     (randomWider g)
+    pure
     pure
 
 -- ECDH shared secret against a fixed peer public key.
@@ -73,6 +75,7 @@ posEcdh peer = do
     (\sec -> () <$ evaluate (Secp.ecdh peer sec))
     (randomWider g)
     pure
+    pure
 
 -- public-key derivation from the secret scalar (mul _CURVE_G).
 posDerivePub :: IO (C.Hypothesis Wider)
@@ -81,6 +84,7 @@ posDerivePub = do
   C.fixVsRandom
     (\sec -> () <$ evaluate (Secp.derive_pub sec))
     (randomWider g)
+    pure
     pure
 
 -- RFC6979 ECDSA signing (default, ladder-based mul _CURVE_G). Secret
@@ -96,6 +100,7 @@ posSignECDSA msg = do
   C.fixVsRandom
     (\(!sec, !m) -> () <$ evaluate (Secp.sign_ecdsa sec m))
     (randomWider g)
+    pure
     (\sec -> pure (sec, msg))
 
 -- RFC6979 ECDSA signing under a precomputed context (wNAF mul_wnaf).
@@ -107,6 +112,7 @@ posSignECDSA' tex msg = do
   C.fixVsRandom
     (\(!sec, !m) -> () <$ evaluate (Secp.sign_ecdsa' tex sec m))
     (randomWider g)
+    pure
     (\sec -> pure (sec, msg))
 
 -- BIP0340 Schnorr signing (default, ladder-based mul _CURVE_G). Secret
@@ -121,6 +127,7 @@ posSignSchnorr msg aux = do
     (\(!sec, !m, !a) ->
        () <$ evaluate (Secp.sign_schnorr sec m a))
     (randomWider g)
+    pure
     (\sec -> pure (sec, msg, aux))
 
 -- BIP0340 Schnorr signing under a precomputed context (wNAF).
@@ -133,6 +140,7 @@ posSignSchnorr' tex msg aux = do
     (\(!sec, !m, !a) ->
        () <$ evaluate (Secp.sign_schnorr' tex sec m a))
     (randomWider g)
+    pure
     (\sec -> pure (sec, msg, aux))
 
 peerScalar :: Wider

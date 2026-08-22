@@ -176,22 +176,42 @@ data Hypothesis a = Hypothesis
   }
 
 -- | Construct a dudect-style /fix-vs-random/ t'Hypothesis' from a
---   target, a secret sampler, and a completion function building a
---   full input around a secret.
+--   target, a secret sampler, a re-materialisation function, and a
+--   completion function building a full input around a secret.
 --
 --   The fixed secret is drawn once from the sampler at construction
 --   time, so it is an ordinary heap value reached by the same code
 --   path as the random class (never a shared top-level constant).
---   Class A draws and discards a fresh secret before returning the
---   fixed one, keeping the two samplers symmetric in allocation
---   count, size, and order; class B keeps its draw. The completion
---   function runs identically in both classes, so per-pair public
---   inputs (messages, nonces, associated data) stay fresh on both
---   sides.
+--   Class A draws and discards a fresh secret before each sample,
+--   keeping the two samplers symmetric in allocation count, size,
+--   and order; class B keeps its draw.
 --
---   The sampler and completion must return values in normal form;
---   'fixVsRandom' balances allocation between the classes but cannot
---   force what they left lazy.
+--   Both classes then run the re-materialisation function on the
+--   pinned secret, every sample: class A hands its result to the
+--   completion, class B discards it and completes around the fresh
+--   draw. With a function that performs a real copy (for a
+--   'BS.ByteString' secret, @\\s -> evaluate (BS.copy s)@) this
+--   makes the classes symmetric in where the secret is /read from/:
+--   the long-lived pinned value is read exactly once per sample in
+--   each class, and what reaches the completion is a fresh,
+--   same-aged allocation in both. Under 'pure', class A instead
+--   reads one hot, fixed-address value for the whole run while
+--   class B reads a fresh allocation per sample — a locality
+--   asymmetry with no secret dependence that a sensitive meter can
+--   reject on, and that the A\/A and B\/B controls (each internally
+--   symmetric) cannot see. Pass 'pure' only for types with no
+--   cheap re-materialiser. The residual asymmetries are second
+--   order: the completion's input is its sample's second
+--   allocation in class A and its first in class B, written by the
+--   copy in one and by the sampler in the other.
+--
+--   The completion runs identically in both classes, so per-pair
+--   public inputs (messages, nonces, associated data) stay fresh
+--   on both sides.
+--
+--   The sampler, re-materialisation, and completion must return
+--   values in normal form; 'fixVsRandom' balances allocation
+--   between the classes but cannot force what they left lazy.
 --
 --   For a whole-input fix-vs-random hypothesis, pass 'pure' as the
 --   completion:
@@ -199,22 +219,26 @@ data Hypothesis a = Hypothesis
 --   > hyp <- fixVsRandom
 --   >   (\x -> () <$ evaluate (inv x))   -- target
 --   >   (randomMont g)                   -- secret sampler
+--   >   pure                             -- no re-materialiser
 --   >   pure                             -- input is just the secret
 fixVsRandom
   :: (a -> IO ())   -- ^ target
   -> IO s           -- ^ secret sampler
+  -> (s -> IO s)    -- ^ re-materialise a secret into a fresh value
   -> (s -> IO a)    -- ^ complete an input around a secret
   -> IO (Hypothesis a)
-fixVsRandom tgt sec embed = do
+fixVsRandom tgt sec dup embed = do
   !fix <- sec
   pure Hypothesis
     { target  = tgt
     , prepare = pure ()
     , sampleA = do
         !_ <- sec        -- draw and discard: balance class B
-        embed fix
+        !s <- dup fix
+        embed s
     , sampleB = do
         !s <- sec
+        !_ <- dup fix    -- copy and discard: balance class A
         embed s
     }
 
@@ -240,18 +264,25 @@ fixVsRandom tgt sec embed = do
 --   depend on the secret, so given the context the two readings are
 --   conditionally i.i.d. and the pair stays exchangeable.
 --
+--   The re-materialisation function plays the same role as in
+--   'fixVsRandom': both classes copy the pinned secret each
+--   sample, class A building around the copy, so neither class is
+--   alone in reading the long-lived pinned value.
+--
 --   > hyp <- fixVsRandomCtx
 --   >   (\(k, m) -> () <$ evaluate (mac k m))  -- target
 --   >   (randomBytes g 32)                     -- secret sampler
+--   >   (\k -> evaluate (BS.copy k))           -- re-materialise
 --   >   (randomBytes g 256)                    -- public context
 --   >   (\msg key -> pure (key, msg))          -- build the input
 fixVsRandomCtx
   :: (a -> IO ())      -- ^ target
   -> IO s              -- ^ secret sampler
+  -> (s -> IO s)       -- ^ re-materialise a secret into a fresh value
   -> IO c              -- ^ public-context sampler (once per pair)
   -> (c -> s -> IO a)  -- ^ build an input from context and secret
   -> IO (Hypothesis a)
-fixVsRandomCtx tgt sec ctx embed = do
+fixVsRandomCtx tgt sec dup ctx embed = do
   !fix <- sec
   -- seeded with a real draw so the ref is total; 'prepare'
   -- overwrites it before the first pair is ever measured.
@@ -264,10 +295,12 @@ fixVsRandomCtx tgt sec ctx embed = do
         writeIORef ref c
     , sampleA = do
         !_ <- sec        -- draw and discard: balance class B
+        !s <- dup fix
         !c <- readIORef ref
-        embed c fix
+        embed c s
     , sampleB = do
         !s <- sec
+        !_ <- dup fix    -- copy and discard: balance class A
         !c <- readIORef ref
         embed c s
     }
