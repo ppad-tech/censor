@@ -747,6 +747,15 @@ rngTests = testGroup "Censor.Rng" [
       w1 <- C.nextWord g1
       w2 <- C.nextWord g2
       assertBool "streams coincide" (w1 /= w2)
+
+  , testCase "reseed replays a fresh generator's stream in place" $ do
+      g <- C.mkRng 0xAAAA
+      _ <- C.nextWord g
+      C.reseed g 0xFEEDFACE
+      h <- C.mkRng 0xFEEDFACE
+      ws1 <- mapM (\_ -> C.nextWord g) [1 .. 8 :: Int]
+      ws2 <- mapM (\_ -> C.nextWord h) [1 .. 8 :: Int]
+      ws1 @?= ws2
   ]
 
 randomBytesTests :: TestTree

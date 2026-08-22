@@ -22,9 +22,14 @@
 -- bytes filled with fresh pseudorandom bytes (independent per-class
 -- streams).
 --
---   * --secret off:len  ranges are overwritten in class A only with
---                       bytes from a single fixed buffer drawn at
---                       setup. This is the fix-vs-random test axis.
+--   * --secret off:len  ranges are refilled each sample in BOTH
+--                       classes through the same reseed-and-fill
+--                       path: class A from a seed pinned at setup
+--                       (the same bytes every sample), class B
+--                       from a fresh seed per sample. This is the
+--                       fix-vs-random test axis; no long-lived
+--                       secret buffer exists for one class alone
+--                       to read (see issues/ISSUE4.md).
 --   * --public off:len  ranges are overwritten in BOTH classes with
 --                       bytes from a shared fixed buffer drawn at
 --                       setup (common public context: message, IV,
@@ -347,57 +352,79 @@ finish acc = do
 defaultSeed :: Word64
 defaultSeed = 0xC0FFEE5EED0BEEF7
 
--- setup: draw the fixed --secret and --public overlay buffers once
--- from a seeded RNG; keep independent per-class RNGs for the random
--- fill of everything else. Context ranges live in a third buffer
--- that the prologue redraws once per pair, so both classes see the
--- same fresh public bytes there. Returns an FFIHypothesis ready to
--- hand to 'withFFIHypothesis'.
+-- setup: derive the pinned secret seed and draw the fixed --public
+-- overlay buffer once from a seeded RNG; keep independent
+-- per-class RNGs for the random fill of everything else. Context
+-- ranges live in a second buffer that the prologue redraws once
+-- per pair, so both classes see the same fresh public bytes there.
+-- Returns an FFIHypothesis ready to hand to 'withFFIHypothesis'.
 --
--- The three buffers are ForeignPtrs held by the sampler closures,
+-- Secret ranges are deliberately not overlaid from a long-lived
+-- buffer: a buffer that only class A reads, every sample, is the
+-- FFI form of the copy-source locality asymmetry described in
+-- issues/ISSUE4.md. Instead both classes refill their secret
+-- ranges in place through one shared generator, reseeded before
+-- every use: class A to the pinned seed, class B to a word drawn
+-- from its own stream. The classes run identical code and differ
+-- only in the seed value written into the generator state.
+--
+-- The two buffers are ForeignPtrs held by the sampler closures,
 -- so they live exactly as long as the hypothesis does and are
 -- reclaimed with it. Phase isolation builds up to three hypotheses
 -- per cell (calibration, run, controls); raw mallocs would strand
--- three workspaces apiece for the length of a battery.
+-- workspaces apiece for the length of a battery.
 buildHypothesis
   :: Int                 -- ^ workspace bytes
-  -> [Range]             -- ^ secret ranges (class A only)
+  -> [Range]             -- ^ secret ranges (class A pinned)
   -> [Range]             -- ^ public ranges (both classes, pinned)
   -> [Range]             -- ^ context ranges (both classes, per pair)
   -> Word64              -- ^ sampler seed
   -> (Ptr Word8 -> IO ())
   -> IO F.FFIHypothesis
 buildHypothesis ws secrets publics contexts seed target = do
-  fixSec <- mallocForeignPtrBytes ws
   fixPub <- mallocForeignPtrBytes ws
   ctxBuf <- mallocForeignPtrBytes ws
   gFix <- C.mkRng seed
-  withForeignPtr fixSec $ \p -> F.fillRandom gFix p ws
+  !s0 <- C.nextWord gFix
   withForeignPtr fixPub $ \p -> F.fillRandom gFix p ws
   ga  <- C.mkRng (seed `xor` 0x0A0A0A0A0A0A0A0A)
   gb  <- C.mkRng (seed `xor` 0x0B0B0B0B0B0B0B0B)
   gCtx <- C.mkRng (seed `xor` 0x0C0C0C0C0C0C0C0C)
+  rSec <- C.mkRng s0
   let refresh
         | null contexts = pure ()
         | otherwise = withForeignPtr ctxBuf $ \p ->
             mapM_ (\(Range o l) ->
               F.fillRandom gCtx (p `plusPtr` o) l) contexts
+      -- both classes draw one word from their own stream and
+      -- reseed the shared secret generator -- class A pins the
+      -- seed ('const' s0) and discards its draw, class B seeds
+      -- with its draw ('id') -- then fill the secret ranges in
+      -- place. Short-circuits on no secret ranges, like 'overlay'.
+      fillSecrets !g pick !p
+        | null secrets = pure ()
+        | otherwise = do
+            !w <- C.nextWord g
+            C.reseed rSec (pick w)
+            mapM_ (\(Range o l) ->
+              F.fillRandom rSec (p `plusPtr` o) l) secrets
   refresh
   pure F.FFIHypothesis
     { F.ffiWorkspaceBytes = ws
     , F.ffiPrepare = refresh
-      -- role ranges are validated pairwise disjoint, so the overlay
-      -- order below is immaterial: no two of them write the same
+      -- role ranges are validated pairwise disjoint, so the write
+      -- order below is immaterial: no two of them touch the same
       -- byte.
     , F.ffiSampleA = \p -> do
         F.fillRandom ga p ws
         overlay p ctxBuf contexts
         overlay p fixPub publics
-        overlay p fixSec secrets
+        fillSecrets ga (const s0) p
     , F.ffiSampleB = \p -> do
         F.fillRandom gb p ws
         overlay p ctxBuf contexts
         overlay p fixPub publics
+        fillSecrets gb id p
     , F.ffiTarget = target
     }
 

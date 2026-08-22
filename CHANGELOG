@@ -16,6 +16,17 @@
     `pure` retains the old behaviour for secret types with no
     cheap re-materialiser.
 
+  * **Secret regeneration in the dlopen CLI.** The CLI's secret
+    ranges are no longer overlaid from a long-lived buffer that
+    only class A reads -- the FFI form of the copy-source
+    asymmetry above. Both classes now refill their secret ranges
+    in place each sample through one shared generator, reseeded
+    before every use (`Censor.Rng.reseed`, new): class A to a
+    seed pinned at setup, class B to a word drawn from its own
+    stream, so the classes run identical code and differ only in
+    the seed value written into the generator state. Sampler
+    streams for a given `--seed` shift accordingly.
+
   * **Margin calibration cells and a host power-gain probe** in
     censor-validate. The margin calibration cells shift class B by
     less than the resolved margin, so their interval null is true

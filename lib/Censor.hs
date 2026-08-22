@@ -116,6 +116,7 @@ module Censor (
   , Rng
   , mkRng
   , nextWord
+  , reseed
   , randomBytes
   ) where
 
@@ -137,7 +138,8 @@ import qualified Numeric.Eproc.Mixture as EPMix
 import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
 
 import Censor.Meter
-import Censor.Rng (Rng, mkRng, nextWord, randomBytes, splitMix)
+import Censor.Rng
+  (Rng, mkRng, nextWord, randomBytes, reseed, splitMix)
 
 -- | A constant-time hypothesis.
 --
