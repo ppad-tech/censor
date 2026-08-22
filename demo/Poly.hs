@@ -86,6 +86,32 @@ macCase v n = do
         (\m -> evaluate (BS.copy m))
         (\m -> do !m' <- evaluate (BS.copy m); pure (k0, m'))
 
+-- mac under two pinned keys: class A always computes under k1,
+-- class B always under k2, both drawn once at setup. Neither class
+-- draws or re-materialises per sample, so both classes read one
+-- long-lived key buffer apiece -- symmetric by construction -- and
+-- a rejection here is key-content-dependent timing alone. This is
+-- the discriminator that separated the instrument's copy-source
+-- artefact from a real leak in issues/ISSUE4.md.
+macFixedCase :: Int -> IO (C.Hypothesis (BS.ByteString, BS.ByteString))
+macFixedCase n = do
+  g <- C.mkRng fixedSeed
+  !k1 <- C.randomBytes g 32
+  !k2 <- C.randomBytes g 32
+  !m0 <- C.randomBytes g n
+  let tgt (!k, !m) = case Poly1305.mac k m of
+        Just (Poly1305.MAC r) -> () <$ evaluate r
+        Nothing               -> die "censor-poly: poly1305 mac failed"
+      mk k = do
+        !k' <- evaluate (BS.copy k)
+        pure (k', m0)
+  pure C.Hypothesis
+    { C.target  = tgt
+    , C.prepare = pure ()
+    , C.sampleA = mk k1
+    , C.sampleB = mk k2
+    }
+
 main :: IO ()
 main = R.runTraceSuite R.TraceSuite
   { R.tsTarget = "ppad-poly1305 MAC == (mismatch-position independence)"
@@ -106,5 +132,7 @@ main = R.runTraceSuite R.TraceSuite
           (macCase VaryMsg 245)
       , R.TraceCase "mac key fix-vs-random 320B" R.SingleShot
           (macCase VaryKey 320)
+      , R.TraceCase "mac k1 vs k2 320B" R.SingleShot
+          (macFixedCase 320)
       ]
   }
