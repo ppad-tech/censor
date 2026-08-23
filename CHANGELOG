@@ -1,6 +1,6 @@
 # Changelog
 
-- unreleased
+- 0.5.1 (2026-08-23)
   * **Copy-source symmetry in fix-vs-random**
     (issues/handled/ISSUE4.md).
     `fixVsRandom` and `fixVsRandomCtx` take a re-materialisation
