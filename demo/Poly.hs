@@ -92,7 +92,7 @@ macCase v n = do
 -- long-lived key buffer apiece -- symmetric by construction -- and
 -- a rejection here is key-content-dependent timing alone. This is
 -- the discriminator that separated the instrument's copy-source
--- artefact from a real leak in issues/ISSUE4.md.
+-- artefact from a real leak in issues/handled/ISSUE4.md.
 macFixedCase :: Int -> IO (C.Hypothesis (BS.ByteString, BS.ByteString))
 macFixedCase n = do
   g <- C.mkRng fixedSeed

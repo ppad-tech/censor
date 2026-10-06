@@ -1249,7 +1249,7 @@ orderedSamplers hyp =
 --   code paths, coupling the bit into the measured readings through
 --   microarchitectural state and breaking the conditional
 --   exchangeability the test's null rests on; this is not
---   hypothetical (see @issues/ISSUE2.md@: A\/A controls rejected
+--   hypothetical (see @issues/handled/ISSUE2.md@: A\/A controls rejected
 --   through exactly that channel on timing meters).
 runPair
   :: Meter -> Config -> Hypothesis a -> SmallArray (IO a) -> Word64

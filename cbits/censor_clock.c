@@ -5,7 +5,7 @@
  * microseconds. That collapses sub-microsecond structure and
  * concentrates wall readings onto 1000 ns atoms, which in turn
  * lands warmup-calibrated CDF cut points exactly on quantisation
- * boundaries (see issues/ISSUE2.md). CLOCK_UPTIME_RAW is backed
+ * boundaries (see issues/handled/ISSUE2.md). CLOCK_UPTIME_RAW is backed
  * by the hardware counter (the mach_absolute_time time base) and
  * resolves at its tick rate -- ~42 ns on 24 MHz Apple Silicon
  * counters, finer where the counter runs faster.

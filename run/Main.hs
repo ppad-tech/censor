@@ -29,7 +29,7 @@
 --                       from a fresh seed per sample. This is the
 --                       fix-vs-random test axis; no long-lived
 --                       secret buffer exists for one class alone
---                       to read (see issues/ISSUE4.md).
+--                       to read (see issues/handled/ISSUE4.md).
 --   * --public off:len  ranges are overwritten in BOTH classes with
 --                       bytes from a shared fixed buffer drawn at
 --                       setup (common public context: message, IV,
@@ -362,7 +362,7 @@ defaultSeed = 0xC0FFEE5EED0BEEF7
 -- Secret ranges are deliberately not overlaid from a long-lived
 -- buffer: a buffer that only class A reads, every sample, is the
 -- FFI form of the copy-source locality asymmetry described in
--- issues/ISSUE4.md. Instead both classes refill their secret
+-- issues/handled/ISSUE4.md. Instead both classes refill their secret
 -- ranges in place through one shared generator, reseeded before
 -- every use: class A to the pinned seed, class B to a word drawn
 -- from its own stream. The classes run identical code and differ
