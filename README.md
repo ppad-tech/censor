@@ -5,520 +5,109 @@
 [![](https://img.shields.io/badge/haddock-censor-lightblue)](https://docs.ppad.tech/censor)
 
 A pure Haskell framework for sequential constant-time testing via
-anytime-valid e-processes. Declare a constant-time hypothesis (an `IO`
-action plus two input samplers); the driver interleaves paired timings
-of the two classes, streams them through an anytime-valid two-sample
-test, and either rejects (a leak is detected) or exhausts its budget.
+anytime-valid e-processes.
 
-The statistical layer is anytime-valid: type-I error is controlled at
-`alpha` regardless of when sampling stops, so the driver halts as soon
-as the wealth process crosses threshold rather than running a fixed
-budget every time. (The "wealth process" is a notional bankroll that
-bets on the data and grows only when the null is wrong; see
-[ppad-eproc][eproc] for the mechanics.) The claim that the run-wide
-false-alarm probability is at most `alpha` is itself checked
-empirically by the calibration battery described below.
+Declare a constant-time hypothesis (an `IO` action plus two input
+samplers). The driver times the action on paired inputs from the two
+classes, in random order, and streams the pairs through an
+anytime-valid two-sample test (via [ppad-eproc][eproc]). It either
+rejects, i.e. detects a leak, or exhausts its budget.
 
-A `Pass` is not a proof of constant-time execution — it is absence of
-detectable evidence at the given budget, hardware, and meter. censor
-is a falsifier whose alarm rate you can put a number on.
+Type-I error is controlled at `alpha` whenever sampling stops, so the
+driver halts as soon as the evidence suffices. The test hedges over
+several statistics of the timing difference, so it sees mean shifts,
+rare outliers, and leaks that change only the variance.
+
+A `Pass` is not a proof of constant-time execution. It means not enough
+contrary evidence was found at the given budget, on the given hardware,
+under the given meter.
 
 ## Usage
 
-A minimal constant-time test:
+The standard [dudect][dudect]-style fix-vs-random test, here of a HMAC
+under a pinned secret key:
 
 ```haskell
 import qualified Censor as C
+import Control.Exception (evaluate)
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Data.ByteString as BS
 
-let hyp = C.Hypothesis
-      { C.target  = \x -> ...               -- IO action under test
-      , C.sampleA = ...                     -- IO producing class-A input
-      , C.sampleB = ...                     -- IO producing class-B input
-      }
+main :: IO ()
+main = do
+  g <- C.mkRng 42
 
-result <- C.runCT C.wallClock C.defaultConfig hyp
+  -- class A pins one secret key; class B draws a fresh one per
+  -- sample. messages are fresh in both classes.
+  hyp <- C.fixVsRandom
+    (\(k, m) -> () <$ evaluate (SHA256.hmac k m))  -- target
+    (C.randomBytes g 32)                           -- secret
+    (\k -> evaluate (BS.copy k))                   -- re-materialise
+    (\k -> do                                      -- complete input
+      m <- C.randomBytes g 256
+      pure (k, m))
 
-case result of
-  C.Reject {} -> putStrLn $
-    "leak detected after " ++ show (C.resPairs result)
-    ++ " sample pairs"
-  C.Pass {} -> putStrLn $
-    "no leak detected within budget ("
-    ++ show (C.resPairs result) ++ " pairs, "
-    ++ show (C.resClipped result) ++ " clipped)"
+  r <- C.runCT C.wallClock C.defaultConfig hyp
+  case r of
+    C.Reject {} -> putStrLn $ "leak after " ++ show (C.resPairs r)
+    C.Pass {}   -> putStrLn "no leak detected within budget"
 ```
 
-For the standard dudect-style fix-vs-random protocol, `fixVsRandom`
-builds the hypothesis and encodes the measurement-hygiene rules
-(below) for you: the fixed secret is drawn once from the sampler —
-a heap value reached by the same code path as the random class —
-class A draws and discards a fresh secret per pair so the samplers
-stay allocation-symmetric, both classes re-materialise the pinned
-secret per sample so neither is alone in reading a long-lived,
-fixed-address value (class A completes around the fresh copy), and
-public inputs stay fresh in both classes:
+`fixVsRandom` keeps the two samplers symmetric in everything but the
+secret (laziness, allocation, memory locality). The result also
+carries an anytime-valid p-value, an effect-size confidence
+interval, and per-component evidence.
 
-```haskell
--- pin a secret key; keep per-pair messages fresh in both classes
-hyp <- C.fixVsRandom
-  (\(k, m) -> () <$ evaluate (SHA256.hmac k m))         -- target
-  (random32 g)                                          -- secret
-  (\k -> evaluate (BS.copy k))                          -- re-materialise
-  (\k -> do m <- randomBytes g 256; pure (k, m))        -- completion
+Beyond that:
 
-result <- C.runCT C.wallClock C.defaultConfig hyp
-```
-
-(`Censor.Rng` provides the splitmix64 generator — `mkRng`,
-`nextWord`, `randomBytes` — that samplers typically build on:
-deterministic under a fixed seed, cheap, and allocation-light.
-`randomBytes` returns a strict, fully-forced `ByteString`, so a
-sampler can hand its result straight to the driver.)
-
-`Reject` and `Pass` carry the same run report: pairs consumed
-(`resPairs`), the mixture's peak log e-value (`resPeakLogW`; starts
-at 0, crosses `log(1/alpha)` on rejection), the anytime-valid
-p-value (`resPValue`; at or below `cfgAlpha` exactly when the
-verdict is `Reject`, and valid at any data-dependent stopping
-time), an effect-size interval (`resEffect`, below), per-component
-peak log e-values (`resPeakSign`, `resPeakMagn`, `resPeakMagn4`,
-`resPeakMagn16`), the warmup-estimated clip bound (`resBound`), and
-a clip count at each of the three magnitude bounds (`resClipped` at
-`c`, `resClipped4` at `4c`, `resClipped16` at `16c`): the number of
-pairs whose absolute difference `|d| = |ta - tb|` exceeded that
-bound and was truncated before being fed to the component behind
-it. Clipping preserves the type-I error guarantee but reduces power
-against tail-shifting leaks, so a `resClipped` that is a
-substantial fraction of `resPairs` indicates the warmup bound was
-too tight. Raise `cfgWarmup`, enlarge `cfgBatch`, or treat the run
-with suspicion.
-
-The counts nest — `|d| > 16c` implies `|d| > 4c` implies `|d| > c`
-— and they answer different questions. `resClipped` bounds what the
-tight component could see; `resClipped16` is the count that
-qualifies `resEffect`, `16c` being the bound the effect interval's
-own input is clipped to. A run can starve the tight component
-heavily and leave the interval's input untouched, so a consumer
-quoting the interval should read `resClipped16`, not `resClipped`.
-
-### Effect size
-
-`resEffect` is an anytime-valid `1 - alpha` confidence interval
-(the hedged-capital construction of Waudby-Smith & Ramdas, via
-`Numeric.Eproc.ConfSeq`) for the mean of `d` clipped to the widest
-hedge interval `[-16c, 16c]` — `resClipped16` says on how many
-pairs that clipping actually bit, and so how far the interval can
-be read as bounding the unrestricted effect — in meter units per
-batch. On a truly
-constant-time target it covers zero; on a `Pass` at full budget it
-bounds the size of any undetected effect ("no leak found, and the
-mean effect is within ±X"). On a `Reject` it covers the true
-(clipped) shift but may still straddle zero: detection is more
-sample-efficient than estimation, so a strong leak halts the run
-before the interval tightens. On long runs the evidence can pin
-the mean below the estimation grid's resolution; the reported
-interval is then the last resolvable one — a few grid steps wide,
-still covering the true mean, since the sequence's intervals are
-nested and the coverage guarantee is time-uniform. Coverage of the
-interval and type-I control of the verdict are separate marginal
-guarantees, each at `cfgAlpha`.
-
-### A/A and B/B negative controls
-
-Before trusting a `Reject` on a new hypothesis, run the A/A
-control to look for harness asymmetry:
-
-```haskell
-result <- C.runAA meter C.defaultConfig hyp
--- or, composably:
-result <- C.runCT meter C.defaultConfig (C.toAA hyp)
-```
-
-`toAA` replaces `sampleB` with `sampleA`, so both classes measure
-the same distribution — the A/A hypothesis is H_0 by construction
-and should always `Pass`. A `Reject` verdict on `toAA` indicts the
-*harness* (unbalanced allocation between the samplers, RTS state
-leaking between calls, unfair sample order) rather than a leak in
-the target; the real-hypothesis result is not informative until the
-asymmetry is fixed.
-
-`toBB` / `runBB` are the symmetric companions — they run
-`sampleB` vs `sampleB`, which exercises asymmetries specific to
-`sampleB` that `toAA` can't see (a heavier-allocation-path
-sampler, RTS state that only its fresh objects trigger). Running
-both controls sorts any `Reject` into: (a) neither control
-convicted, (b) a `sampleA`-specific harness bug, (c) a
-`sampleB`-specific harness bug, or (d) pervasive harness asymmetry
-across both.
-
-`attribute` packages the whole protocol — it runs both controls and
-returns an `Attribution` carrying the `ControlVerdict` alongside
-*both* control runs in full, so the evidence behind the verdict can
-be inspected rather than taken on trust:
-
-```haskell
-att <- C.attribute meter C.defaultConfig hyp
-C.attVerdict att   -- ControlsPass | SampleAAsymmetry | ...
-C.attAA att        -- the complete A/A run
-C.attBB att        -- the complete B/B run
-```
-
-**These are controls, not an attribution mechanism.** They can
-convict the harness; they cannot acquit it. A/A compares `sampleA`
-against itself and B/B compares `sampleB` against itself, so an
-asymmetry existing only *between* the two samplers is invisible to
-both. If `sampleA` returns a fully forced input while `sampleB`
-leaves a thunk that the target forces inside the timed region, the
-primary run rejects on that harness artefact and both controls
-pass. `ControlsPass` therefore reads as "no within-class control
-failure was found" — which is why it is not called `TargetLeak`.
-Establishing that a rejection really is the target's requires
-harness symmetry argued by construction, or an independent harness.
-
-### Paired public context
-
-`fixVsRandom` runs its completion independently for each class, so
-per-pair public inputs (message, nonce, AAD, modulus) end up either
-independently random across the pair — injecting nuisance variance
-into `d` that has nothing to do with the secret — or pinned for the
-whole run, which tests exactly one public input.
-
-`fixVsRandomCtx` takes the third option: draw one fresh public
-context per pair, then build both classes around *that same*
-context.
-
-```haskell
-hyp <- C.fixVsRandomCtx
-  (\(k, m) -> () <$ evaluate (mac k m))  -- target
-  (C.randomBytes g 32)                   -- secret sampler
-  (\k -> evaluate (BS.copy k))           -- re-materialise
-  (C.randomBytes g 256)                  -- public context, per pair
-  (\msg key -> pure (key, msg))          -- build the input
-```
-
-The tested axis is then secret dependence *conditional on identical
-fresh public input*. Conditioning on the context removes it as a
-source of paired variance, which sharpens power, and states the
-intended axis explicitly rather than leaving it implicit in how the
-completion was written. The null is unaffected: under H_0 the timing
-law does not depend on the secret, so given the context the two
-readings are conditionally i.i.d. and the pair stays exchangeable.
-
-The mechanism is a `prepare` field on `Hypothesis` — a per-pair
-prologue run before either sampler and outside the timed region.
-It is `pure ()` for an ordinary hypothesis.
-
-### Battery manifests
-
-Auditing a library one symbol at a time means one `censor` process
-per symbol plus a shell loop to stitch the single-case reports back
-together — which duplicates the tool version and config by hand in
-every script and produces no single artefact covering the battery.
-
-`--manifest` replaces that with a declarative file:
-
-```
-meter          wall
-alpha          1e-6
-budget         20000
-warmup         500
-target-prefix  censor_target_
-workspace      128
-
-case mul   secret=0:32
-case ecdh  secret=0:32 context=32:64
-case inv   secret=0:32 replicates=3
-```
+* `attribute` runs A/A and B/B negative controls. A rejection on
+  either indicts the harness rather than the target; run them before
+  trusting a `Reject`.
+* `withCounter` (Linux) replaces the wall clock with a hardware
+  performance counter (instructions retired, cycles, etc.), which is
+  far less noisy, and can attribute a difference to a channel.
+* `Censor.FFI` adapts foreign (C, Rust, etc.) targets.
+* The `censor` executable (`-f+run`) tests symbols in a shared
+  library directly, singly or as a battery declared in a manifest
+  (see `etc/example.manifest`):
 
 ```
 $ censor libfoo.dylib --manifest battery.manifest --attribute
 ```
 
-One dlopen, one `censor/report-v3` object containing every case,
-its controls, the host environment, and the family-wise alpha. The
-per-case layout flags (`--workspace`, `--target`, `--secret`,
-`--public`, `--context`, `--trace`) are rejected in this mode rather
-than silently ignored; run-wide flags still override manifest
-directives. See `etc/example.manifest` for the annotated format.
+## Caveats
 
-A case's ranges come in three kinds. `secret=off:len` is pinned in
-class A only — the fix-vs-random axis. `public=off:len` is pinned in
-both classes for the whole run. `context=off:len` is redrawn once
-per *pair* and written into both classes, which is the manifest's
-route to the paired public context described above. Everything
-outside a declared range is random per pair, per class.
+The driver times only the target, so any asymmetry in how the
+samplers prepare inputs (laziness, allocation, where the secret is
+read from) shows up as a class difference. `fixVsRandom` handles the
+usual cases.
 
-`replicates=N` runs a case against N independent fixed secrets, as
-N ordinary case rows. A dudect-style cell pins *one* fixed secret,
-so on its own it answers "does this secret time differently from
-random", not "does any secret"; replicating guards against an
-unlucky draw, and each replicate counts toward the family-wise
-alpha as it should. Replicate #1 keeps the seed the unreplicated
-case had, so raising `replicates` extends a battery without
-redefining the cell already in it; each case also mixes its own
-name into the run-wide seed, so cases do not all begin from
-identical bytes.
+`cfgBatch` repeats the target on one sample, which multiplies real
+work only if each repetition recomputes (e.g. an FFI call). A pure
+Haskell target is forced once per batch, so use `batch = 1` there.
+Under the hardware counters on virtualised hosts, per-batch counter
+overhead is large, so batch where the target allows it.
 
-`family-alpha on` turns the reported union bound into an actual
-correction: each of the M expanded cells runs at `alpha / M`, so
-"any cell rejects" is a test at `alpha` family-wise. It is off by
-default, since it costs power in every cell.
+On frequency-scaled hosts, the wall clock can reject even
+constant-time code: constant time is not constant power, and DVFS
+converts a data-dependent power draw into a timing difference. A
+wall-only rejection with clean counters is the signature. Prefer the
+counters; where only the wall clock is available, pin the frequency,
+or test an interval null with `cfgMargin` (`--margin`), calibrated on
+the host with `censor-validate --power-gain`.
 
-### Reproducibility
+## Calibration
 
-`cfgSeed :: Maybe Word64` in `Config` controls the per-pair A/B
-order-bit PRNG. The default `Nothing` draws a fresh seed from OS
-entropy (`/dev/urandom`) per run, so the conditional independence
-of the order bit from any periodic ambient noise (timer interrupts,
-scheduler quanta) is a fact rather than an assumption. A clock
-reading would not do: it is not independent entropy, and the
-nuisance process may itself be periodic in that very clock.
+The `censor-validate` executable (`-f+validate`) checks the type-I
+error claim empirically, running the driver against synthetic meters
+with known distributions, and tabulates power against effect size:
 
-That is the normal path rather than an unconditional one. If
-`/dev/urandom` cannot be read, the driver falls back to the
-monotonic clock — better than a constant, but it forfeits the
-independence argument above. Pin `cfgSeed` explicitly if you need
-to know which of the two you got.
-
-Whichever way it resolves, the seed actually used comes back as
-`resSeed` on the `Result`, appears under each case row in the human
-report, and is recorded as `orderSeed` in the JSON. A fresh audit
-run is therefore statistically randomised *and* exactly replayable
-afterwards — feed `resSeed` back as `cfgSeed = Just s`.
-
-Keep this seed distinct from whatever seeds your input samplers.
-The conditional null needs the order bit independent of the sampled
-timing sequence; deriving both from one seed forfeits that. The
-`censor` CLI enforces the split: `--seed` pins the samplers,
-`--order-seed` pins the order bit.
-
-On Linux, `withCounter` swaps the wall-clock meter for a hardware
-performance counter, which is deterministic and immune to the
-frequency-scaling, cache, and scheduling noise that limits wall-clock
-on sub-microsecond targets:
-
-```haskell
--- throws Censor.MeterError if perf_event_open is unavailable
-result <- C.withCounter C.InstructionsRetired $ \meter ->
-  C.runCT meter C.defaultConfig hyp
+```
+$ cabal run -f+validate censor-validate -- 10000 --csv out.csv
 ```
 
-Available counters are `InstructionsRetired`, `BranchesRetired`,
-`Cycles`, `RefCycles`, `TaskClock`, `BranchMisses`, and
-`CacheMisses`. The first two are deterministic properties of the
-executed code; `Cycles` is additionally sensitive to data-dependent
-latency and microarchitectural state. The rest exist to *attribute*
-a difference to a channel. With the wall clock they form a ladder in
-which each adjacent gap isolates one cause:
-
-  * instructions differ — code-path leak;
-  * cycles differ, instructions clean — microarchitectural latency;
-  * ref-cycles differ, cycles clean — frequency (`RefCycles` counts
-    constant-rate cycles over the same scheduled user-mode interval
-    as `Cycles`, so this gap is a DVFS/power effect by
-    construction);
-  * task-clock differs, ref-cycles clean — kernel/interrupt time
-    (`TaskClock` deliberately counts kernel time on the task's
-    behalf; as a software counter it needs no PMU, so it is
-    available in VMs and containers where the hardware events are
-    not — but counting kernel time is privileged, so it needs
-    `kernel.perf_event_paranoid` at most `1` and fails with
-    `OpenFailed 13` at the `2` the other counters tolerate);
-  * wall differs, task-clock clean — scheduling gaps.
-
-`BranchMisses` catches a secret-dependent branch *direction* when
-retired counts balance; `CacheMisses` attributes a cycles-level
-difference to memory access patterns. `RefCycles` availability is
-microarchitecture-dependent — `withCounter` throws where the event
-is unsupported.
-
-### Foreign targets
-
-For C, Rust, or cgo-shimmed Go constructs, `Censor.FFI` brackets a
-single pinned workspace outside the timed region and presents a
-regular `Hypothesis (Ptr Word8)` for `runCT` to consume. Samplers fill
-the workspace in place; the target reads (and optionally writes) it
-via offsets the caller chooses.
-
-```haskell
-import qualified Censor as C
-import qualified Censor.FFI as F
-import Foreign.Marshal.Utils (fillBytes)
-import Foreign.Ptr (Ptr, plusPtr)
-import Data.Word (Word8)
-
--- C side: void ct_mul(const uint8_t *a, const uint8_t *b,
---                     uint8_t *out);   -- 32-byte operands.
-foreign import ccall unsafe "ct_mul"
-  c_mul :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> IO ()
-
-let hyp = F.FFIHypothesis
-      { F.ffiWorkspaceBytes = 96     -- two 32B inputs + 32B output
-      , F.ffiSampleA = \p -> do
-          F.fillRandom g (p `plusPtr`  0) 32  -- draw and discard,
-          fillBytes      (p `plusPtr`  0) 0 32  -- then fix input a
-          F.fillRandom g (p `plusPtr` 32) 32  -- input b: random
-      , F.ffiSampleB = \p -> do
-          F.fillRandom g (p `plusPtr`  0) 32
-          F.fillRandom g (p `plusPtr` 32) 32
-      , F.ffiTarget = \p ->
-          c_mul p (p `plusPtr` 32) (p `plusPtr` 64)
-      }
-
-result <- F.withFFIHypothesis hyp $ \h ->
-  C.runCT C.wallClock C.defaultConfig h
-```
-
-(`fillRandom` fills workspace bytes from a `Censor.Rng` generator;
-the discarded class-A fill keeps the samplers' generator work
-symmetric before the fixed operand overwrites it.)
-
-`ffiTarget` should be a single FFI call with no in-Haskell
-preparation — any marshalling done inside it lands in the timed
-region and shows up as A/B noise. Use `ccall unsafe`, not `safe`, to
-avoid the RTS thread-state save/restore on every call.
-
-### Measurement hygiene
-
-The driver times only `target`, so any input-preparation work that
-leaks into the timed region shows up as a spurious class difference.
-A few rules keep the comparison honest:
-
-  * Return inputs in *normal form* from the samplers (force any lazy
-    conversions); otherwise the first use inside `target` pays for
-    them.
-  * Build the fixed class the *same way* as the random class — a
-    heap-allocated value differing only in its data — rather than a
-    top-level constant. A CAF and a fresh heap value are reached by
-    different code, a difference an instruction-counter meter will
-    (correctly) flag.
-  * Make the two samplers symmetric in allocation count, size, and
-    order. Draw and discard a random value of the same type that
-    class B keeps in place of the fixed input, so nursery occupancy
-    and GC scheduling do not drift between classes.
-  * Keep the classes symmetric in where the secret is *read from*.
-    A pinned input read out of one long-lived, cache-hot buffer on
-    every class-A sample, against class-B reads of a fresh
-    allocation per sample, is a locality asymmetry a sensitive
-    meter can reject on with no secret dependence at all — and the
-    A/A and B/B controls, each internally symmetric, cannot see
-    it. Re-materialise the pinned value into a fresh allocation in
-    both classes per sample; `fixVsRandom` does this through its
-    re-materialisation argument.
-
-### Wall-clock rejections on noisy hosts
-
-Even a hypothesis that obeys every rule above can reject under the
-wall meter, far in excess of `alpha`, on a busy or frequency-scaled
-host — while the hardware counters consistently pass the same
-target. This is not a failure of the anytime guarantee, and "host
-noise" in the innocent sense cannot explain it: class-independent
-noise, however heavy-tailed, drifting, or autocorrelated, cannot
-inflate the false-alarm rate, because the guarantee is
-distribution-free given within-pair exchangeability, which the
-randomised order supplies whatever the noise's marginal law.
-Symmetric noise costs power, never validity. A wall rejection that
-*reproduces* is therefore a systematic: the exchangeability null
-really is false for the wall readings, and the question is which
-channel falsified it.
-
-The meter signature localises the channel. Wall time is on-thread
-user cycles divided by frequency, plus interrupt and kernel time,
-plus descheduled time. The perf meters count on-thread, user-only
-events: clean instructions rules out any class difference in the
-executed stream, and clean cycles additionally rules out
-data-dependent latency and microarchitectural state inside the
-timed region. What remains is exactly the wall-exclusive residue —
-frequency variation, interrupt service, scheduling gaps — all of
-it host-mediated.
-
-Class reaches those channels through *interference*, the one thing
-order randomisation cannot remove (the nuisance-process caveat
-under "The null, and what it does and does not cover", made
-concrete). The coin makes position independent of class; it does
-nothing about one arm's class modulating host state that the other
-arm's reading then absorbs. Concretely: constant time is not
-constant power. Writing and processing random bytes has higher
-switching activity than re-writing a fixed value, and DVFS
-hardware converts power to frequency on sub-millisecond
-timescales — so the second arm of a pair is slowed by an amount
-that depends on the *first* arm's class, an asymmetry that
-survives randomisation and leaves cycle counts invariant by
-construction. Interrupt phase behaves the same way:
-content-dependent wobble in the untimed sampler code shifts where
-the periodic tick lands relative to the timed window, and wall
-absorbs interrupt time that an `exclude_kernel` counter does not
-count.
-
-The sequential layer then does what it is built to do: the test is
-consistent, so any stable systematic — sub-nanosecond is enough
-for the sign and indicator components over enough pairs — becomes
-near-certain eventual rejection. A reproducible wall-only `Reject`
-with clean counters therefore reads as "the class difference lives
-in host-mediated time, not in the executed instruction stream" —
-the expected signature of a power or phase coupling, though a
-genuine power side channel in the target produces the same
-signature and the meters alone cannot tell the two apart. Pinning
-the frequency (performance governor, turbo off) removes the
-dominant channel; the A/A control above separates residual order
-coupling from class-side coupling, since it shares the harness
-shape but not the content asymmetry; and the `RefCycles` and
-`TaskClock` rungs of the counter ladder (see the counter list
-above) measure the frequency and kernel-time channels directly, so
-a wall-only rejection can be pinned to a named channel rather than
-argued about. Prefer the counters where they are available; where
-only wall is, state the tolerance explicitly with a margin (next
-section).
-
-### Interval nulls: testing with a margin
-
-The sharp null — mean effect exactly zero — is unattainable for
-the wall meter on frequency-scaled hardware: the couplings above
-make the wall distributions genuinely differ by some tiny amount
-even for perfectly constant-time code, and a consistent sequential
-test will eventually find any nonzero systematic. `cfgMargin`
-(CLI: `--margin`, manifest: `margin`) replaces the sharp null with
-an *interval* null,
-
-    |E d_clipped| <= delta
-
-so a systematic smaller than `delta` accumulates no evidence and a
-`Reject` means the mean effect *exceeds the stated tolerance* —
-a claim wall can actually support on real hardware.
-
-The margin is *relative*: `cfgMargin = Just m` resolves to an
-absolute `delta = m * median` at warmup, where `median` is the
-median pooled per-batch reading. Relative, because every channel
-that motivates the margin — frequency, interrupt phase, scheduling
-— scales roughly linearly with the timed-region duration, so a
-fraction of the reading transfers across batch sizes and targets
-where an absolute nanosecond figure would not. The resolved
-absolute margin is reported as `resMargin` (JSON: `margin` on the
-result), must land strictly inside `(0, c)` for the warmup clip
-bound `c`, and the run refuses to start otherwise.
-
-Mechanically, the three magnitude components become interval-null
-tests anchored at `±delta` (`Numeric.Eproc.Bounded.configInterval`)
-and alone gate the verdict (mixture `K = 3`). The sign and CDF
-components carry no meter-unit tolerance — translating `delta`
-into a sign asymmetry would need the density of `d` at zero — so
-they are demoted to diagnostics: still stepped, peaks still
-reported, never gating. A margin-mode `Pass` with a large
-`resPeakSign` is the expected signature of a systematic *within*
-tolerance.
-
-Calibrating `delta` is a measurement, not a guess: run the wall
-meter on targets the counters certify clean and read the
-`resEffect` interval — that is the host's residual coupling — or
-run a deliberately power-asymmetric, cycle-identical control to
-bound the channel gain from above. `censor-validate --power-gain`
-packages the latter (see the calibration section below): an A/A
-control, the max-switching probe, and a suggested `--margin` when
-the bound resolves usefully. Set the margin above that floor and
-below the effect sizes you care about, and re-calibrate when the
-host or governor configuration changes. Keep the margin unset
-under the PMU meters: they support the sharp null, and a tolerance
-there only gives away power.
+The current baseline is in `etc/validate/baseline.csv`; it records
+zero rejections in every null cell at every alpha.
 
 ## Documentation
 
@@ -527,63 +116,10 @@ Haddocks (API documentation, etc.) are hosted at
 
 ## Performance
 
-The hedge runs `K = 4 + n` e-processes per pair — sign, three
-clipped magnitudes, and one CDF indicator per resolved cut point —
-plus the mixture composition, and the effect-size confidence
-sequence updates its live candidate grid every pair. The estimator
-dominates the driver cost early — O(live candidates) per pair, ~300
-at the start — and amortizes down as evidence rejects candidates,
-so the per-pair driver cost falls from ~1 μs over short runs toward
-~250 ns over long ones. For any target that itself takes a
-microsecond or longer per call the overhead is dominated by the
-target; for sub-microsecond targets, raise `cfgBatch` (which the
-wall-clock quantum demands anyway) — but only if repetition
-genuinely recomputes. See the batching contract below.
-
-### The batching contract
-
-`cfgBatch` repeats the *same* `target a` action on one pre-drawn
-sample. That only multiplies real work when each repetition
-genuinely recomputes: a foreign (FFI) call, or a target driving
-mutable state. For a pure Haskell target `\a -> evaluate (f a)`
-the `f a` thunk is shared across the batch and forced once, so the
-remaining repetitions are no-ops on an already-evaluated value and
-a per-batch reading divided by `cfgBatch` is *not* a per-call
-figure.
-
-This is a property of the target that cannot be inferred, so suites
-declare it per case as a `BatchPolicy`:
-
-  * `SingleShot` — force `batch = 1`. The correct policy for pure
-    Haskell targets. If such a target is sub-quantum under the
-    meter, widen the work rather than batching.
-  * `RepeatableAuto` — each repetition recomputes; calibrate the
-    batch with `calibrateBatchReport`. For FFI calls and targets
-    driving mutable state.
-  * `FixedBatch n` — pin it, for comparability across meters.
-
-`--batch N` on any suite overrides every case's policy.
-
-### Batching on virtualised hosts
-
-The PMU meters arm and disarm the counter once per batch, and in a
-VM guest those ioctls are far more expensive than on bare metal.
-On an AMD EPYC KVM guest the per-call `cycles` reading falls from
-23226 at `batch = 1` to 17675 at `8` and 16532 at `64`, while wall
-stays flat near 5.4 µs per call — roughly 6700 cycles of
-per-measurement overhead, a 29% inflation on a 5 µs target. At
-`batch = 64` the two meters agree at 3.02 GHz; at `batch = 1` they
-do not, and cycles-derived figures there are not per-call figures.
-
-The overhead is nuisance variance as well as bias, so it costs
-detection: on that host the power-gain probe resolves no channel
-at `batch = 1` even at a budget of 1e6 pairs, but rejects after
-3673 pairs at `batch = 8` and 746 at `64`. Where the target's
-policy allows batching at all (see the contract above), prefer it
-under the PMU meters on virtualised hosts.
-
-Current benchmark figures on an M4 Silicon MacBook Air (use
-`cabal bench` to reproduce):
+Driver overhead is roughly 250 ns to 1 μs per pair, negligible for
+targets that take a microsecond or more. Current benchmark figures
+on an M4 Silicon MacBook Air look like (use `cabal bench` to run the
+benchmark suite):
 
 ```
   benchmarking runCT (noop target, const meter, batch=1)/budget=1000
@@ -596,242 +132,7 @@ Current benchmark figures on an M4 Silicon MacBook Air (use
   time                 25.40 ms   (25.14 ms .. 25.61 ms)
 ```
 
-Per-pair allocation is independent of batch size, attesting that
-the driver does not accumulate any state proportional to the
-inner-loop count. It is front-loaded rather than linear in budget:
-the estimator's live-candidate list is rebuilt each pair and
-shrinks as candidates are rejected:
-
-```
-  runCT (noop target, const meter, batch=1)
-
-    Case            Allocated  GCs
-    budget=100      1,708,008    0
-    budget=1000     4,827,208    1
-    budget=10000   15,123,368    3
-    budget=100000  91,979,168   22
-
-  runCT (noop target, const meter, budget=1000)
-
-    Case        Allocated  GCs
-    batch=1     4,827,208    1
-    batch=10    4,827,208    1
-    batch=100   4,827,208    1
-    batch=1000  4,827,208    1
-```
-
-You should compile with the `llvm` flag for maximum performance.
-
-## Empirical calibration
-
-The framework's pitch — type-I error controlled at `alpha`, anytime
-— is a statistical claim, not a code-correctness one. The
-`censor-validate` executable runs the driver against synthetic
-meters with known H_0 / H_1 distributions, counts rejections across
-N independent trials per cell, and reports Wilson 95% binomial CIs
-against each cell's alpha bound. It also produces a power table
-characterising detection rate vs effect size.
-
-```
-$ cabal run -f+validate censor-validate -- 10000 --csv runs/v0.1.csv
-```
-
-The first positional argument is the trial count per cell (default
-10000); `--csv path` dumps a machine-readable copy of the report for
-cross-release diffing.
-
-The battery includes margin-mode cells. The margin calibration
-cells shift class B by *less* than the resolved margin, so their
-interval null is true while the sharp null is false — they validate
-margin mode's type-I claim under exactly the sub-tolerance
-systematic the margin exists to absorb (a companion sharp-mode
-contrast cell shows the same shift rejecting at ~100% without a
-margin). The margin power cells confirm that shifts beyond the
-margin are still caught.
-
-### The host power-gain probe
-
-`censor-validate --power-gain [METER] [--budget N] [--batch N]`
-runs a different job: not a synthetic-meter sweep but a measurement
-on the real host. The probe is a maximally power-asymmetric,
-cycle-identical positive control — both classes execute the
-identical instruction stream (two full rewrites of a 64 KiB buffer
-per call), but class A writes zeros while class B alternates the
-all-01 and all-10 patterns, so every bit of the buffer and store
-datapath toggles on each rewrite. Any class difference a timing
-meter resolves is therefore carried by a power-mediated channel
-(frequency scaling, in practice), not by the executed code.
-
-The report gives the A/A control (zeros vs zeros — shares the
-harness shape, not the content asymmetry; a rejection there flags
-ambient instability), the probe verdict, and the effect interval
-as a bound on the host's power-to-time coupling gain at maximal
-switching — an upper bound on what any real fix-vs-random data
-asymmetry can induce through that channel, and hence a principled
-floor for `cfgMargin` on this host. Under the wall meter, and when
-the bound resolves below a usable threshold, the tool prints a
-suggested `--margin` with 4x headroom; on a noisy host it says so
-instead — the effect interval bottoms out near a tenth of the
-noise-derived clip bound, and raising `--budget` barely moves it,
-so the lever is a quieter host. Under any other meter no margin is
-suggested at all: the counters are meant to support the sharp
-null, and the bound reads as that meter's residual sensitivity.
-
-Run it under `instructions` on Linux for the ladder contrast —
-the deterministic counters are the ones that must read clean, and
-their doing so is what certifies both classes execute the same
-code. `cycles` need not: an identical instruction stream can still
-cost different cycles when the data changes memory-system
-behaviour, and a cycles rejection against a clean instruction
-count localises the coupling to microarchitectural latency rather
-than frequency. On an AMD EPYC KVM guest the probe rejects under
-both `wall` and `cycles` while `instructions` and `branches` stay
-clean across every batch and budget, driven by the CDF component
-rather than a mean shift — a channel margin mode would not gate
-on, since it demotes sign and CDF to diagnostics.
-
-A cell is **PASS** when its CI's upper bound is comfortably below
-its alpha (rejection rate is within budget), **FAIL** when the
-lower bound exceeds alpha (a real statistical violation), and
-**INCONCLUSIVE** when the CI straddles alpha (more trials needed).
-The cell grid uses a Bonferroni-adjusted family confidence so that
-a family-wide PASS is meaningful. Cells at very tight alpha levels
-(`1e-4`, `1e-6`) and the power table are reported but not gated —
-their value is characterisation, not assertion.
-
-This is a pre-release calibration check, not a per-commit gate; a
-full run at the current battery size takes roughly an hour under
-the hedge. The default test suite carries a lightweight tier that
-catches gross wiring regressions only.
-
-### The null, and what it does and does not cover
-
-The null censor tests is **conditional exchangeability** of the
-measured pair `(ta, tb)`: given everything observed so far,
-swapping the two class labels leaves the joint law unchanged.
-
-This is *stronger* than the informal property "the two input
-classes induce the same timing distribution", not weaker.
-Exchangeability implies the two readings share a marginal law;
-equal marginals on their own say nothing about the joint, and so
-cannot deliver it. What does deliver it is the randomised per-pair
-A/B order — under the assumption that the within-pair nuisance
-dynamics (cache and predictor state, frequency drift) are
-themselves blind to the class labels. Randomisation makes
-*position* independent of class; it cannot undo a nuisance process
-that reacts to the class itself.
-
-Every component of the test bets on an **antisymmetric functional**
-of the pair, a statistic `g` with `g(ta, tb) = -g(tb, ta)`. Under
-exchangeability each such functional is conditionally symmetric
-about zero, hence has conditional mean zero, which is what makes it
-a valid input to a two-sided mean-zero e-process.
-
-The alternatives censor can detect are exactly those that move at
-least one functional in its family off zero. That family is finite
-and therefore **not a complete cover**: no fixed set of functionals
-detects every departure from exchangeability. A `Pass` means "none
-of these channels found evidence", never "this code is constant
-time".
-
-### Hedged e-process composition
-
-The driver runs a convex-hedge mixture of anytime-valid e-processes
-over that family:
-
-  * **Sign** — a two-sided Bernoulli test at `p_0 = 1/2` on
-    `sign d`, where `d = ta - tb` (ties skipped). No bounds, no
-    clipping. Detects asymmetry of the difference itself
-    (`P(d > 0) /= 1/2`), including heavy-tail bulk shifts where the
-    mean signal is swamped by tail variance. Note that it does
-    *not* detect every distributional difference: if both classes
-    are symmetric about a common centre, `d` is symmetric and this
-    channel sees nothing however different the two shapes are.
-  * **Magnitude at c, 4c, 16c** — three two-sided bounded-mean
-    tests on `d` clipped to progressively wider intervals. The
-    tight bound (`c`, from warmup `p99(|d|)`) gives the largest
-    `lambda_max` and dominates against small consistent bulk
-    shifts; the wider bounds preserve signal from rare-outlier
-    leaks (e.g. a rarely-taken data-dependent branch) that the
-    tight clip would truncate away.
-  * **CDF indicators** — one bounded-mean test on
-    `1[ta <= q] - 1[tb <= q]` per cut point `q`, with the cut
-    points fixed during warmup as order statistics of the *pooled*
-    readings (deciles and quartiles, deduplicated). Each has
-    conditional mean `F_A(q) - F_B(q)`, so together they see any
-    difference between the two classes' CDFs at those points. This
-    is the channel that catches **dispersion leaks** — a target
-    whose timing *variance* depends on the secret while its mean
-    does not — which leave `d` symmetric and are invisible to every
-    other component.
-
-The convex combination itself is delegated to
-`Numeric.Eproc.Mixture`: uniform weights over the `K = 4 + n`
-components (`n` resolved cut points), rejecting when the mixture
-e-value crosses `1/alpha`. The `+log K` on the log scale over a
-single component is the price of hedging — against
-`log(1/alpha) = 13.8` at the default alpha, the indicator channel
-costs well under a nat. Rejection latches on the supremum of the
-mixture's log e-value, not on the components' individual suprema.
-Each component's own peak log e-value is surfaced in the `Result`
-for diagnosis — a rejection driven by the sign component points at
-a shape leak, one driven by the wide magnitude components at rare
-outliers, one driven by the indicators at a dispersion or general
-CDF difference — but the peaks are attained at possibly different
-times and never gate the verdict.
-
-### Baseline
-
-`etc/validate/baseline.csv` is the captured baseline from N=10000
-on master: 79 cells (36 calibration + 2 edge + 8 margin
-calibration + 28 power + 5 margin power), 28 of them gated.
-Headline: zero rejections in every H_0 cell at every alpha,
-including all 8 margin-calibration cells — margin mode absorbs
-the sub-tolerance systematic it exists for. Of the gated cells 13
-PASS, all at `alpha = 1e-2`; the other 15 sit at INCONCLUSIVE at
-`alpha = 1e-3` because the Bonferroni-adjusted Wilson upper at 0
-rejections in 10000 trials is `0.00108`, marginally above `1e-3`.
-N would need to climb to ~15000 to push the upper bound below
-`1e-3`. Zero rejections is itself overwhelming evidence the alpha
-guarantee holds in practice; the INCONCLUSIVE label is a property
-of conservative gating, not of the framework.
-
-### Power
-
-The power-H_1 cells inject a positive shift to class B and measure
-detection rate. Headline findings from the baseline:
-
-  * **Symmetric uniform `[0, 200]`**: shift of 5 (2.5% of noise
-    range) detects at 100% with `cfgBudget = 10000`; not detected
-    at `cfgBudget = 1000`. Shift of 50 detects at 100% from
-    `cfgBudget = 1000`.
-  * **Narrow-jitter (baseline 10000, noise `±10`)**: shift of 1
-    (10% of noise) detects at 100% from `cfgBudget = 1000`. This
-    scenario is the regime where betting on the clipped paired
-    difference `d = ta - tb` (rather than on the clipped per-class
-    readings) earns its keep — `lambda_max` scales with noise
-    magnitude (~20) instead of baseline magnitude (~10000), a
-    ~500x boost in per-pair wealth growth.
-  * **Heavy-tailed (95% uniform `[50, 150]` + 5% uniform
-    `[5000, 10000]`)**: shifts of 5, 10, and 50 all detect at 100%
-    at both `cfgBudget = 1000` and `10000`. The sign component is
-    what closes this
-    gap — a bulk shift moves `P(d > 0)` off `1/2` regardless of
-    tail variance, so the sign test grows wealth cleanly even
-    while the magnitude components are drowning in tail noise.
-    Shift of 1 remains undetected at these budgets (0.2% of tail
-    range; below the noise floor at any statistic).
-
-The hedge composition brings a ~10-15% threshold overhead vs a
-single component (`+log 4` on the rejection threshold), which cost
-detection at marginal points when the hedge landed — sym-uniform
-shift=10 at `cfgBudget = 1000` fell from 100% under the previous
-single-component design to 0% under the hedge. Driver work since
-has bought those points back: that cell now detects at 100% again,
-as do heavy-tail shifts of 5 and 10 at the same budget, all of
-which read 0% in the capture before this one. The tradeoff was
-qualitative in any case — the hedge detects leak shapes that were
-undetectable at any budget under the single-component design.
+You should compile with the 'llvm' flag for maximum performance.
 
 ## Development
 
@@ -850,6 +151,15 @@ $ cabal repl ppad-censor
 
 to get a REPL for the main library.
 
+## References
+
+- Reparaz, Balasch & Verbauwhede (2017), "[Dude, is my code constant
+  time?][dudect]" DATE.
+- Waudby-Smith & Ramdas (2024), "[Estimating means of bounded random
+  variables by betting][wsr24]." JRSS-B.
+
 [eproc]: https://git.ppad.tech/eproc
+[dudect]: https://eprint.iacr.org/2016/1123
+[wsr24]: https://arxiv.org/abs/2010.09686
 [nixos]: https://nixos.org/
 [flake]: https://nixos.org/manual/nix/unstable/command-ref/new-cli/nix3-flake.html
