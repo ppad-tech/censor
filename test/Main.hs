@@ -395,7 +395,7 @@ marginTests = testGroup "interval-null margin" [
       (hyp, meter) <- leakHyp
       r <- C.runCT meter leakCfg { C.cfgMargin = Just 0.75 } hyp
       assertBool "resultToJSON should include a margin field"
-        ("\"margin\":" `isInfixOf` R.resultToJSON r)
+        ("\"margin\":" `isInfixOf` Rep.resultToJSON r)
   , testCase "nonpositive margin rejected" $ do
       r <- try (C.runCT (constMeter 100)
                   leakCfg { C.cfgMargin = Just 0 } noopHyp)
@@ -1120,7 +1120,7 @@ renderingTests = testGroup "summary / resultToJSON" [
 
   , testCase "resultToJSON on Pass exposes expected keys" $ do
       r <- runFlatPass
-      let j = R.resultToJSON r
+      let j = Rep.resultToJSON r
       mapM_ (\k -> assertBool ("expected " ++ k ++ " in " ++ j)
                               (k `isInfixOf` j))
         [ "\"verdict\":\"PASS\""
@@ -1144,7 +1144,7 @@ renderingTests = testGroup "summary / resultToJSON" [
 
   , testCase "resultToJSON on Reject reports the driver in advisories" $ do
       r <- runLeak
-      let j = R.resultToJSON r
+      let j = Rep.resultToJSON r
       assertBool ("expected verdict REJECT in " ++ j)
         ("\"verdict\":\"REJECT\"" `isInfixOf` j)
       assertBool ("expected RejectionDriver in " ++ j)
@@ -1152,7 +1152,7 @@ renderingTests = testGroup "summary / resultToJSON" [
 
   , testCase "a HighClipRate advisory serialises all three rates" $ do
       r <- runClipping 1000000
-      let j = R.resultToJSON r
+      let j = Rep.resultToJSON r
       mapM_ (\k -> assertBool ("expected " ++ k ++ " in " ++ j)
                               (k `isInfixOf` j))
         [ "\"clipFraction\":", "\"clipFraction4\":", "\"clipFraction16\":" ]

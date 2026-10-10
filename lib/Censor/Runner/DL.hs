@@ -47,7 +47,9 @@ foreign import ccall unsafe "censor_dlclose"
 foreign import ccall unsafe "censor_dlerror"
   c_dlerror :: IO CString
 
-foreign import ccall "dynamic"
+-- unsafe: this is the timed call, and a safe one would put the RTS's
+-- suspend/resume of the calling thread inside the timed region.
+foreign import ccall unsafe "dynamic"
   mkTargetFun :: FunPtr (Ptr Word8 -> IO ()) -> Ptr Word8 -> IO ()
 
 -- | An opened shared library. Bracketed by 'withLibrary'; do not

@@ -12,8 +12,9 @@
 -- something.
 --
 -- Use case: pre-release calibration check. A full N = 10000 sweep
--- takes ~10 minutes; pass a smaller N as the first argument
--- (e.g. `censor-validate 1000`) for a fast pass while iterating.
+-- takes on the order of an hour; pass a smaller N as the first
+-- argument (e.g. `censor-validate 1000`) for a fast pass while
+-- iterating.
 --
 -- `censor-validate --power-gain [METER]` runs a different job: the
 -- host power-coupling probe, a cycle-identical but maximally

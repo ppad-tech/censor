@@ -7,18 +7,10 @@
 -- License: MIT
 -- Maintainer: Jared Tobin <jared@ppad.tech>
 --
--- A declarative battery description for the @censor@ foreign
--- runner: a list of cases, each naming a target symbol and the
--- workspace layout to drive it with, plus run-wide defaults.
---
--- Without one, auditing a library means one @censor@ process per
--- symbol and a shell loop to stitch the single-case reports back
--- together — which duplicates the tool version and config by hand
--- in every script, and produces no single artefact carrying the
--- whole battery. With one, a single invocation opens the library
--- once and emits one @censor\/report-v3@ object containing every
--- case, its controls, the host environment, and the family-wise
--- alpha.
+-- A declarative battery for the @censor@ CLI: run-wide defaults and
+-- a list of cases, each naming a target symbol and the workspace
+-- layout to drive it with. One invocation opens the library once and
+-- emits one @censor\/report-v3@ object covering every case.
 --
 -- The format is line-oriented. Blank lines and @#@ comments are
 -- ignored; every other line is either a run-wide directive
@@ -51,6 +43,8 @@ module Censor.Runner.Manifest (
     -- * Parsing
   , parseManifest
   , emptyDefaults
+  , readRange
+  , readSeed
 
     -- * Layout validation
   , checkLayout
@@ -136,26 +130,14 @@ data ManifestCase = ManifestCase
   , mcPublic     :: ![Range]
   , mcContext    :: ![Range]
     -- ^ ranges redrawn once per /pair/ and written identically into
-    --   both classes: a shared fresh public context.
-    --
-    --   'mcPublic' pins its ranges for the whole cell, which tests
-    --   one public input; leaving them to the per-class random fill
-    --   gives each class a different one, injecting nuisance
-    --   variance into @d@ that has nothing to do with the secret.
-    --   A context range is the third option — fresh every pair, but
-    --   common to A and B — so the tested axis is secret dependence
-    --   /given identical public input/.
+    --   both classes: a fresh public input shared by the pair (see
+    --   'Censor.fixVsRandomCtx').
   , mcBatch      :: !(Maybe BatchSpec)
   , mcReplicates :: {-# UNPACK #-} !Int
     -- ^ how many independent fixed secrets to run this case
-    --   against, each an ordinary case row of its own.
-    --
-    --   A dudect-style fix-vs-random cell pins /one/ fixed secret,
-    --   so it answers "does this secret time differently from
-    --   random", not "does any secret". Replicating guards against
-    --   a single unlucky (or unluckily typical) draw. Each
-    --   replicate counts toward the family-wise alpha, as it
-    --   should.
+    --   against, each its own case row. One pinned secret only asks
+    --   whether /that/ secret times differently from random;
+    --   replicating guards against an unlucky draw.
   } deriving (Eq, Show)
 
 -- | A parsed manifest.
@@ -242,14 +224,20 @@ flag _ _ "off" = Right False
 flag n nm v = Left (at n (nm ++ " expects 'on' or 'off', got " ++ show v))
 
 hex :: Int -> String -> String -> Either String Word64
-hex n nm v =
+hex n nm v = case readSeed v of
+  Just w  -> Right w
+  Nothing -> Left (at n (nm ++ " expects a hex Word64, got " ++ show v))
+
+-- | Read a hex 'Word64', with or without a @0x@ prefix.
+readSeed :: String -> Maybe Word64
+readSeed v =
   let s = case v of
         '0' : 'x' : r -> r
         '0' : 'X' : r -> r
         _             -> v
   in  case readHex s of
-        [(w, "")] -> Right w
-        _ -> Left (at n (nm ++ " expects a hex Word64, got " ++ show v))
+        [(w, "")] -> Just w
+        _         -> Nothing
 
 parseCase
   :: Int -> Defaults -> [String] -> Either String ManifestCase
@@ -296,14 +284,18 @@ applyKV n c kv = case break (== '=') kv of
   _ -> Left (at n ("expected key=value, got " ++ show kv))
 
 range :: Int -> String -> String -> Either String Range
-range n nm v = case break (== ':') v of
+range n nm v = case readRange v of
+  Just r  -> Right r
+  Nothing -> Left (at n (nm ++ " expects off:len with off >= 0, len > 0,"
+                         ++ " got " ++ show v))
+
+-- | Read an @off:len@ byte range, with @off >= 0@ and @len > 0@.
+readRange :: String -> Maybe Range
+readRange v = case break (== ':') v of
   (off, ':' : len) -> case (reads off, reads len) of
-    ([(o, "")], [(l, "")]) | o >= 0 && l > 0 -> Right (Range o l)
-    _ -> bad
-  _ -> bad
-  where
-    bad = Left (at n (nm ++ " expects off:len with off >= 0, len > 0,"
-                      ++ " got " ++ show v))
+    ([(o, "")], [(l, "")]) | o >= 0 && l > 0 -> Just (Range o l)
+    _ -> Nothing
+  _ -> Nothing
 
 validateCase :: Int -> ManifestCase -> Either String ManifestCase
 validateCase n c

@@ -20,11 +20,11 @@
 --   and 'plain' (ASCII-only, grep-safe).
 -- * 'withReport' streams cases through the chosen renderer and
 --   returns the accumulated list so callers can drive exit codes.
--- * At the top, t'Suite' and t'TraceSuite' package up the entire
---   censor test-suite shape (arg parse, meter selection, header
---   assembly, per-case calibration and attribution, trace record,
---   JSON artefact write) into one call, so a suite's @Main.hs@
---   contains only the hypotheses and case list.
+-- * At the top, t'TraceSuite' packages up the entire censor
+--   test-suite shape (arg parse, meter selection, header assembly,
+--   per-case calibration and attribution, trace record, JSON
+--   artefact write) into one call, so a suite's @Main.hs@ contains
+--   only the hypotheses and case list.
 
 module Censor.Runner.Report (
     -- * Report config
@@ -65,11 +65,10 @@ module Censor.Runner.Report (
   , TraceCase(..)
   , TraceSuite(..)
   , runTraceSuite
-  , Suite(..)
-  , runSuite
 
     -- * JSON serialisation
   , reportJSON
+  , resultToJSON
   ) where
 
 import Control.Monad (forM_)
@@ -88,7 +87,7 @@ import Censor hiding (crBatch, crNoise)
 import qualified Censor as C
 import Censor.Runner
   ( traceResult, traceFrames, record, thin
-  , verdictName, shapeName, clipText, resultToJSON, withMeterArg
+  , verdictName, shapeName, clipText, withMeterArg
   )
 import Censor.Runner.Env (Env(..), captureEnv)
 import qualified Paths_ppad_censor as Paths
@@ -142,10 +141,9 @@ data ReportHeader = ReportHeader
   , rhNote      :: !(Maybe String)
     -- ^ optional one-line caveat under the header block.
   , rhEnv       :: !(Maybe Env)
-    -- ^ host-environment snapshot taken at run start. The suite
-    --   scaffolds ('runTraceSuite', 'runSuite') always populate it;
-    --   'Nothing' when the caller assembled the header by hand
-    --   without capturing one.
+    -- ^ host-environment snapshot taken at run start. 'runTraceSuite'
+    --   always populates it; 'Nothing' when the caller assembled the
+    --   header by hand without capturing one.
   , rhPerCaseBatch :: !Bool
     -- ^ 'True' when each case picks its own 'cfgBatch' from its
     --   'BatchPolicy' (see 'runTraceSuite'). Header renders
@@ -229,14 +227,17 @@ rendererFor FmtPlain  = plain
 
 -- | Position-insensitively pluck a @--format FMT@ pair out of an
 --   argv list. Returns the format token if present and the argv with
---   that pair removed. Handy for demos whose remaining arguments are
---   positional.
+--   that pair removed.
 takeFormatArg :: [String] -> (Maybe String, [String])
-takeFormatArg = go []
+takeFormatArg = takeFlagArg "--format"
+
+-- pluck a @FLAG VALUE@ pair out of an argv list, wherever it sits.
+takeFlagArg :: String -> [String] -> (Maybe String, [String])
+takeFlagArg flag = go []
   where
-    go pre ("--format":v:rest) = (Just v, reverse pre ++ rest)
-    go pre (x:xs)              = go (x:pre) xs
-    go pre []                  = (Nothing, reverse pre)
+    go pre (x:v:rest) | x == flag = (Just v, reverse pre ++ rest)
+    go pre (x:xs)                 = go (x:pre) xs
+    go pre []                     = (Nothing, reverse pre)
 
 -- | Resolve an optional format token to a 'Renderer', dying with a
 --   clear message on unknown values. Defaults to 'pretty' when the
@@ -312,16 +313,24 @@ prettyOpen rc hdr = do
 
 prettyHeaderBlock :: ReportCfg -> ReportHeader -> String
 prettyHeaderBlock rc hdr =
-  let entries = concat
-        [ [("meter", meterLine hdr)]
-        , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
-        , maybe [] (\w -> [("sampler seed", seedHex w)]) (rhSeed hdr)
-        , maybe [] (envEntries " \183 ") (rhEnv hdr)
-        , maybe [] (\n -> [("note",   n)])           (rhNote hdr)
-        ]
-      keyW = maximum (1 : map (length . fst) entries)
+  let entries = headerEntries " \183 " hdr
+      keyW = keyWidth entries
       row (k, v) = "  " ++ cDim rc (padR keyW k) ++ "  " ++ v ++ "\n"
   in  concatMap row entries
+
+-- the header block's key/value rows, joining multi-part values with
+-- the given separator.
+headerEntries :: String -> ReportHeader -> [(String, String)]
+headerEntries sep hdr = concat
+  [ [("meter", meterLine sep hdr)]
+  , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
+  , maybe [] (\w -> [("sampler seed", seedHex w)]) (rhSeed hdr)
+  , maybe [] (envEntries sep) (rhEnv hdr)
+  , maybe [] (\n -> [("note", n)]) (rhNote hdr)
+  ]
+
+keyWidth :: [(String, String)] -> Int
+keyWidth entries = maximum (1 : map (length . fst) entries)
 
 -- header rows for a host-environment snapshot: a system line
 -- (os/kernel/arch, CPU model, cores), a knob line when any Linux
@@ -353,10 +362,10 @@ knobSegs e = concat
   , maybe [] (\v -> ["paranoid=" ++ v]) (envParanoid e)
   ]
 
-meterLine :: ReportHeader -> String
-meterLine hdr =
+meterLine :: String -> ReportHeader -> String
+meterLine sep hdr =
   let c = rhConfig hdr
-  in  intercalate " \183 " $
+  in  intercalate sep $
         [ rhMeter hdr
         , printf "alpha=%.1g"       (cfgAlpha c) :: String
         , "warmup=" ++ show (cfgWarmup c)
@@ -399,20 +408,24 @@ prettyCase rc cr = do
     ++ "  " ++ evid
     ++ "  " ++ sep
     ++ "  " ++ crName cr
-  case r of
-    Reject{} -> do
-      let (elo, ehi) = resEffect r
-          detail = printf "effect=[%.1f,%.1f]  %s"
-                     elo ehi (clipText r) :: String
-      putStrLn $ replicate detailIndent ' ' ++ cDim rc detail
-    Pass{} -> pure ()
-  case calibText cr of
-    Just t  -> putStrLn $ replicate detailIndent ' ' ++ cDim rc t
-    Nothing -> pure ()
-  case crAttribution cr of
-    Just a  -> putStrLn $ replicate detailIndent ' '
-                          ++ cDim rc (attributionText a)
-    Nothing -> pure ()
+  mapM_ (\l -> putStrLn $ replicate detailIndent ' ' ++ cDim rc l)
+    (detailLines "  " cr)
+
+-- the lines under a case row: on 'Reject' the effect interval and
+-- clipping (joined by the given gap), then the run metadata, then
+-- the controls when they ran.
+detailLines :: String -> CaseReport -> [String]
+detailLines gap cr = concat
+  [ case r of
+      Reject{} ->
+        let (elo, ehi) = resEffect r
+        in  [printf "effect=[%.1f,%.1f]%s%s" elo ehi gap (clipText r)]
+      Pass{} -> []
+  , maybe [] pure (calibText cr)
+  , maybe [] (pure . attributionText) (crAttribution cr)
+  ]
+  where
+    r = crResult cr
 
 -- the run-metadata line under a case row: resolved batch, the
 -- meter's noise floor at that batch when recorded, the target's
@@ -445,9 +458,7 @@ detailIndent = 30
 prettyClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
 prettyClose rc hdr tl = do
   let cs   = btCases tl
-      nrej = length (filter (isReject . crResult) cs)
-      npas = length cs - nrej
-      pairs = sum (map (resPairs . crResult) cs)
+      (nrej, npas, pairs) = tally cs
       parts = concat
         [ [ colorCount cRed   rc nrej " reject"
           , colorCount cGreen rc npas " pass"
@@ -578,6 +589,64 @@ caseJSON cr = concat
   , "}"
   ]
 
+-- | Serialise a t'Result' as a stable JSON object. Includes verdict,
+--   pairs, mixture peak log e-value, anytime-valid p-value, effect
+--   interval, clip counts at each of the three magnitude bounds,
+--   warmup bound, the resolved order seed, the CDF channel as
+--   @[cut point, peak]@ pairs, per-component peaks, and the
+--   'diagnose' advisories.
+--
+--   The seed here is the /order/ seed ('resSeed'), the one that
+--   replays the A\/B order sequence. The sampler seed is a property
+--   of the harness, not of a run, and appears in the report header.
+--
+--   The object is a single line; pipe multiple runs into a
+--   line-oriented store and diff or filter with @jq@.
+resultToJSON :: Result -> String
+resultToJSON r = concat
+  [ "{\"verdict\":",    jstr (verdictName r)
+  , ",\"pairs\":",      show (resPairs r)
+  , printf ",\"peakLogW\":%.6g" (resPeakLogW r)
+  , printf ",\"pvalue\":%.6g"   (resPValue r)
+  , printf ",\"effect\":[%.6g,%.6g]"
+      (fst (resEffect r)) (snd (resEffect r))
+  , ",\"clipped\":",    show (resClipped r)
+  , ",\"clipped4\":",   show (resClipped4 r)
+  , ",\"clipped16\":",  show (resClipped16 r)
+  , printf ",\"bound\":%.6g" (resBound r)
+  -- the resolved absolute interval-null margin, present only on
+  -- margin-mode runs (in meter units per batch, like the bound).
+  , maybe "" (printf ",\"margin\":%.6g") (resMargin r)
+  , ",\"orderSeed\":",  jstr (seedHex (resSeed r))
+  , ",\"cdf\":["
+  , intercalate ","
+      [ printf "[%.6g,%.6g]" q p | (q, p) <- resCdf r ]
+  , "]"
+  , ",\"peaks\":{"
+  ,       printf "\"sign\":%.6g"    (resPeakSign r)
+  , printf ",\"magn\":%.6g"         (resPeakMagn r)
+  , printf ",\"magn4\":%.6g"        (resPeakMagn4 r)
+  , printf ",\"magn16\":%.6g"       (resPeakMagn16 r)
+  , printf ",\"cdf\":%.6g"          (resPeakCdf r)
+  , "}"
+  , ",\"advisories\":["
+  , intercalate "," (map advisoryJSON (diagnose r))
+  , "]}"
+  ]
+
+advisoryJSON :: Advisory -> String
+advisoryJSON a = case a of
+  HighClipRate cr -> printf
+    ("{\"kind\":\"HighClipRate\",\"clipFraction\":%.4g"
+      ++ ",\"clipFraction4\":%.4g,\"clipFraction16\":%.4g}")
+    (clipTight cr) (clipWide cr) (clipWidest cr)
+  LowPower h -> printf
+    "{\"kind\":\"LowPower\",\"widthOverBound\":%.4g}" h
+  RejectionDriver s -> concat
+    [ "{\"kind\":\"RejectionDriver\",\"shape\":"
+    , jstr (shapeName s), "}"
+    ]
+
 traceArrayJSON :: [Frame] -> String
 traceArrayJSON frs =
   "[" ++ intercalate "," (map frameJSON (thin frs)) ++ "]"
@@ -587,10 +656,8 @@ traceArrayJSON frs =
 
 totalsJSON :: Double -> [CaseReport] -> String
 totalsJSON alpha cs =
-  let n  = length cs
-      nr = length (filter (isReject . crResult) cs)
-      np = n - nr
-      pr = sum (map (resPairs . crResult) cs)
+  let n            = length cs
+      (nr, np, pr) = tally cs
   in  concat
         [ "{\"cases\":",  show n
         , ",\"reject\":", show nr
@@ -643,27 +710,10 @@ plain = Renderer
 plainOpen :: ReportCfg -> ReportHeader -> IO ()
 plainOpen _ hdr = do
   putStrLn $ "ppad " ++ brand ++ " v" ++ brandVersion
-  let entries = concat
-        [ [("meter", plainMeterLine hdr)]
-        , maybe [] (\t -> [("target", t)]) (rhTarget hdr)
-        , maybe [] (\w -> [("sampler seed", seedHex w)]) (rhSeed hdr)
-        , maybe [] (envEntries ", ") (rhEnv hdr)
-        , maybe [] (\n -> [("note",   n)])           (rhNote hdr)
-        ]
-      keyW = maximum (1 : map (length . fst) entries)
+  let entries = headerEntries ", " hdr
+      keyW = keyWidth entries
   mapM_ (\(k, v) -> putStrLn $ padR keyW k ++ "  " ++ v) entries
   putStrLn ""
-
-plainMeterLine :: ReportHeader -> String
-plainMeterLine hdr =
-  let c = rhConfig hdr
-  in  intercalate ", " $
-        [ rhMeter hdr
-        , printf "alpha=%.1g"       (cfgAlpha c) :: String
-        , "warmup=" ++ show (cfgWarmup c)
-        , "budget=" ++ show (cfgBudget c)
-        , "batch="  ++ batchText hdr
-        ] ++ marginSeg c
 
 plainCase :: ReportCfg -> CaseReport -> IO ()
 plainCase _ cr = do
@@ -675,25 +725,12 @@ plainCase _ cr = do
         Reject{} -> " driver=" ++ shapeName (leakShape r)
         Pass{}   -> ""
   putStrLn (hd ++ drv)
-  case r of
-    Reject{} -> do
-      let (elo, ehi) = resEffect r
-      putStrLn $ printf "  effect=[%.1f,%.1f] %s"
-        elo ehi (clipText r)
-    Pass{} -> pure ()
-  case calibText cr of
-    Just t  -> putStrLn ("  " ++ t)
-    Nothing -> pure ()
-  case crAttribution cr of
-    Just a  -> putStrLn ("  " ++ attributionText a)
-    Nothing -> pure ()
+  mapM_ (putStrLn . ("  " ++)) (detailLines " " cr)
 
 plainClose :: ReportCfg -> ReportHeader -> BatteryTail -> IO ()
 plainClose _ hdr tl = do
   let cs = btCases tl
-      nr = length (filter (isReject . crResult) cs)
-      np = length cs - nr
-      pr = sum (map (resPairs . crResult) cs)
+      (nr, np, pr) = tally cs
       fam = case familySeg hdr cs of
         (s:_) -> " " ++ s
         []    -> ""
@@ -708,6 +745,12 @@ plainClose _ hdr tl = do
     ++ wrote
 
 -- shared helpers -----------------------------------------------------------
+
+-- (rejects, passes, pairs consumed) across a battery.
+tally :: [CaseReport] -> (Int, Int, Int)
+tally cs =
+  let nr = length (filter (isReject . crResult) cs)
+  in  (nr, length cs - nr, sum (map (resPairs . crResult) cs))
 
 isReject :: Result -> Bool
 isReject Reject{} = True
@@ -752,11 +795,9 @@ padL n s = replicate (max 0 (n - length s)) ' ' ++ s
 
 -- shared suite arg surface -------------------------------------------------
 
--- | The parsed suite argv. All censor suites share the shape
---   @[--format FMT] [--batch N] [--margin M] [METER] [EXTRA...]@;
---   each runner interprets @saExtra@ in its own way (trace suites
---   take the first extra as an output path; plain suites reject
---   them).
+-- | The parsed suite argv:
+--   @[--format FMT] [--batch N] [--margin M] [METER] [EXTRA...]@.
+--   'runTraceSuite' takes the first extra as an output path.
 data SuiteArgs = SuiteArgs
   { saRenderer :: !Renderer
     -- ^ resolved from @--format@; defaults to 'pretty'.
@@ -764,11 +805,8 @@ data SuiteArgs = SuiteArgs
     -- ^ meter name (@wall@, @instructions@, ...); 'Nothing' means
     --   accept the runner's default.
   , saBatch    :: !(Maybe Int)
-    -- ^ fixed batch from @--batch@; 'Nothing' means the runner's
-    --   default (trace suites auto-calibrate). Pure Haskell
-    --   targets share the applied thunk across a batch, so reps
-    --   beyond the first are no-ops — @--batch 1@ is the honest
-    --   setting for them (mirrors the dlopen CLI's flag).
+    -- ^ fixed batch from @--batch@, overriding every case's
+    --   'BatchPolicy'; 'Nothing' leaves each case's own.
   , saMargin   :: !(Maybe Double)
     -- ^ relative interval-null margin from @--margin@ (see
     --   'Censor.cfgMargin'); 'Nothing' tests the sharp null
@@ -784,8 +822,8 @@ parseSuiteArgs :: IO SuiteArgs
 parseSuiteArgs = do
   raw <- Env.getArgs
   let (farg, rest0) = takeFormatArg raw
-      (barg, rest1) = takeBatchArg rest0
-      (garg, rest)  = takeMarginArg rest1
+      (barg, rest1) = takeFlagArg "--batch" rest0
+      (garg, rest)  = takeFlagArg "--margin" rest1
   rnd <- resolveFormat farg
   bat <- case barg of
     Nothing -> pure Nothing
@@ -809,24 +847,6 @@ parseSuiteArgs = do
     , saMargin   = mgn
     , saExtra    = extra
     }
-
--- | Position-insensitively pluck a @--batch N@ pair out of an argv
---   list, mirroring 'takeFormatArg'.
-takeBatchArg :: [String] -> (Maybe String, [String])
-takeBatchArg = go []
-  where
-    go pre ("--batch":v:rest) = (Just v, reverse pre ++ rest)
-    go pre (x:xs)             = go (x:pre) xs
-    go pre []                 = (Nothing, reverse pre)
-
--- | Position-insensitively pluck a @--margin M@ pair out of an argv
---   list, mirroring 'takeBatchArg'.
-takeMarginArg :: [String] -> (Maybe String, [String])
-takeMarginArg = go []
-  where
-    go pre ("--margin":v:rest) = (Just v, reverse pre ++ rest)
-    go pre (x:xs)              = go (x:pre) xs
-    go pre []                  = (Nothing, reverse pre)
 
 -- trace-recording suite scaffold -------------------------------------------
 
@@ -859,8 +879,8 @@ data BatchPolicy
 --   quantified over the hypothesis input type so a suite can hold
 --   cases with different payload shapes in one list.
 --
---   >>> TraceCase "encrypt" SingleShot     posAeadEncrypt
---   >>> TraceCase "mul"     RepeatableAuto posFfiMul
+--   > TraceCase "encrypt" SingleShot     posAeadEncrypt
+--   > TraceCase "mul"     RepeatableAuto posFfiMul
 --
 --   The action is re-executed for the calibration probe (under
 --   'RepeatableAuto'), the main run, and (on 'Reject') the negative
@@ -981,65 +1001,4 @@ runTraceSuite ts = do
       cases <- fmap reverse (readIORef ref)
       writeFile path (reportJSON hdr cases)
       pure (Just path)
-    pure ()
-
--- plain suite scaffold -----------------------------------------------------
-
--- | A censor test suite: a fixed set of heterogeneous hypotheses
---   (each with its own type and possibly its own 'Config'), no
---   trace recording, no per-case parameter passing. The tool
---   supplies a callback that runs the whole battery under the
---   chosen meter and emits each result; 'runSuite' handles the
---   surrounding scaffolding.
-data Suite = Suite
-  { suTarget :: !String
-  , suConfig :: !Config
-    -- ^ base driver config (shown in the header). Individual cases
-    --   may run under different configs internally; the header only
-    --   surfaces this one.
-  , suSeed   :: !(Maybe Word64)
-  , suNote   :: !(Maybe String)
-  , suRun    :: !(String -> Meter -> (CaseReport -> IO ()) -> IO ())
-    -- ^ battery driver. Receives the meter name, the meter, and an
-    --   @emit@ action that records one 'CaseReport'.
-  }
-
--- | Drive a t'Suite' end to end. Rejects positional arguments past
---   the meter with a usage error — plain suites do not take an
---   output path.
-runSuite :: Suite -> IO ()
-runSuite su = do
-  hSetBuffering stdout LineBuffering
-  prog <- Env.getProgName
-  sa   <- parseSuiteArgs
-  case saExtra sa of
-    [] -> pure ()
-    xs -> die $ prog ++ ": unexpected positional arg(s) "
-            ++ show xs
-            ++ " (usage: " ++ prog
-            ++ " [--format pretty|json|plain] "
-            ++ "[wall|instructions|cycles|branches])"
-  case saBatch sa of
-    Nothing -> pure ()
-    Just _  -> die $ prog ++ ": --batch is a trace-suite flag; "
-            ++ "plain suites run each case under its own config"
-  case saMargin sa of
-    Nothing -> pure ()
-    Just _  -> die $ prog ++ ": --margin is a trace-suite flag; "
-            ++ "plain suites run each case under its own config"
-  rc <- initReportCfg
-  withMeterArg (saMeter sa) $ \mname meter -> do
-    env <- captureEnv
-    let hdr = ReportHeader
-          { rhMeter     = mname
-          , rhConfig    = suConfig su
-          , rhSeed      = suSeed su
-          , rhTarget    = Just (suTarget su)
-          , rhNote      = suNote su
-          , rhEnv       = Just env
-          , rhPerCaseBatch = False
-          }
-    _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
-      suRun su mname meter emit
-      pure Nothing
     pure ()

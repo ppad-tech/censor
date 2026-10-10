@@ -11,28 +11,13 @@
 -- Measurement abstraction.
 --
 -- A t'Meter' wraps an @IO@ action and returns a 'Word64' reading.
--- 'wallClock' is available everywhere: on Darwin it is backed by
--- @clock_gettime_nsec_np(CLOCK_UPTIME_RAW)@ (the
--- @mach_absolute_time@ counter), elsewhere by
--- @GHC.Clock.getMonotonicTimeNSec@. On Linux, 'withCounter' provides
--- performance-counter meters (retired instructions, retired
--- branches, CPU cycles, constant-rate reference cycles, on-CPU task
--- clock, branch misses, or cache misses) via @perf_event_open@. The
--- instruction and branch counters are deterministic properties of
--- the executed code, immune to the frequency-scaling, cache, and
--- scheduling noise that limits 'wallClock' on sub-microsecond
--- targets; the cycle counter is additionally sensitive to
--- data-dependent latency within identical instruction streams (e.g.
--- variable-time divider units, cache misses), at the cost of
--- run-to-run microarchitectural noise. The remaining counters exist
--- to /attribute/ a difference to a channel — see t'Counter' for the
--- ladder they form with 'wallClock'.
---
--- Resolution caveat ('wallClock'): on Apple Silicon, the hardware
--- counter ticks at roughly 24 MHz (~42 ns per tick). Targets
--- faster than a microsecond should be measured under batching (see
--- 'Censor.cfgBatch'). On Linux x86, the underlying counter is
--- typically cycle-resolved.
+-- 'wallClock' is available everywhere. On Linux, 'withCounter'
+-- provides performance-counter meters via @perf_event_open@: the
+-- retired-instruction and retired-branch counts are deterministic
+-- properties of the executed code, immune to the frequency, cache,
+-- and scheduling noise that limits the wall clock on fast targets,
+-- while the other counters help attribute a difference to a channel
+-- (see t'Counter').
 
 module Censor.Meter (
     -- * Meter type
@@ -58,42 +43,24 @@ import Control.Exception (finally)
 import Foreign.C.Types (CInt(..))
 #endif
 
--- | A measurement device.
---
---   @'measure' m k act@ runs @act@ @k@ times back-to-back and returns
---   a single 'Word64' reading for the whole batch. The unit and
---   semantics depend on the meter (nanoseconds for 'wallClock';
---   retired instructions, retired branches, or CPU cycles for a
---   'withCounter' meter).
---
---   Bundling the batch count into the meter API lets each meter
---   decide where the inner loop lives -- the wall-clock meter samples
---   the monotonic clock once at each end of the batch; the PMU meters
---   arm and disarm the counter once per batch -- and avoids
---   per-pair closure allocation in the driver wrapping the loop.
+-- | A measurement device. @'measure' m k act@ runs @act@ @k@ times
+--   back to back and returns one reading for the batch: nanoseconds
+--   for 'wallClock', counted events for a 'withCounter' meter. Each
+--   meter owns its inner loop, reading the clock or arming the
+--   counter once per batch.
 newtype Meter = Meter
   { measure :: Int -> IO () -> IO Word64
   }
 
--- | Wall-clock meter. Reads the monotonic clock before and after the
---   @k@-fold batch and returns the elapsed nanoseconds.
+-- | Wall-clock meter: elapsed nanoseconds over the batch.
 --
---   On Darwin, backed by
---   @clock_gettime_nsec_np(CLOCK_UPTIME_RAW)@ — the
---   @mach_absolute_time@ counter, resolved at its hardware tick
---   rate. Not @GHC.Clock.getMonotonicTimeNSec@, whose
---   @CLOCK_MONOTONIC@ macOS quantises to /microseconds/: a
---   microsecond-atomised reading distribution puts warmup-fixed
---   CDF cut points exactly on quantisation boundaries, where the
---   indicator channel is maximally sensitive to nanosecond-scale
---   harness perturbations (see @issues\/ISSUE2.md@). On other
---   platforms, backed by @GHC.Clock.getMonotonicTimeNSec@
---   (@clock_gettime(CLOCK_MONOTONIC)@ on Linux).
---
---   Resolution caveat: on Apple Silicon the hardware counter ticks
---   at roughly 24 MHz (~42 ns per tick), so sub-microsecond targets
---   need batching (see 'Censor.cfgBatch'). On Linux x86 the
---   underlying counter is typically cycle-resolved.
+--   On Darwin, backed by @clock_gettime_nsec_np(CLOCK_UPTIME_RAW)@,
+--   which resolves the hardware tick (~42 ns on Apple Silicon, so
+--   sub-microsecond targets need batching; see 'Censor.cfgBatch').
+--   Not @GHC.Clock.getMonotonicTimeNSec@, which macOS quantises to
+--   microseconds, putting CDF cut points on quantisation boundaries
+--   (see @issues\/handled\/ISSUE2.md@). Elsewhere, backed by
+--   @GHC.Clock.getMonotonicTimeNSec@.
 wallClock :: Meter
 wallClock = Meter measureWall
 
@@ -124,55 +91,36 @@ rep !k !act = go k
     go i = act >> go (i - 1)
 {-# INLINE rep #-}
 
--- | A hardware (or, for 'TaskClock', kernel software) event to
---   count.
+-- | A hardware (or, for 'TaskClock', software) event to count.
 --
---   Together with 'wallClock' the counters form a ladder in which
---   each adjacent gap isolates one cause of a class difference:
---   instructions (code path) -> cycles (microarchitectural
---   latency) -> ref-cycles (frequency) -> task-clock (kernel \/
---   interrupt time) -> wall (scheduling gaps). A rejection that
---   first appears at a given rung localises the difference to that
---   rung's channel.
+--   With 'wallClock' the counters form a ladder in which each
+--   adjacent gap isolates one cause of a class difference:
+--   instructions (code path) -> cycles (microarchitectural latency)
+--   -> ref-cycles (frequency) -> task-clock (kernel and interrupt
+--   time) -> wall (scheduling gaps).
 data Counter =
     InstructionsRetired  -- ^ @PERF_COUNT_HW_INSTRUCTIONS@; deterministic.
-  | BranchesRetired      -- ^ @PERF_COUNT_HW_BRANCH_INSTRUCTIONS@; deterministic.
-  | Cycles               -- ^ @PERF_COUNT_HW_CPU_CYCLES@; sensitive to
-                         --   data-dependent latency and microarch state,
-                         --   not deterministic.
+  | BranchesRetired      -- ^ @PERF_COUNT_HW_BRANCH_INSTRUCTIONS@;
+                         --   deterministic.
+  | Cycles               -- ^ @PERF_COUNT_HW_CPU_CYCLES@; also sensitive
+                         --   to data-dependent latency.
   | RefCycles            -- ^ @PERF_COUNT_HW_REF_CPU_CYCLES@: cycles at
-                         --   the /constant/ reference rate, over the
-                         --   same scheduled user-mode interval as
-                         --   'Cycles'. A class difference here with
-                         --   clean 'Cycles' is a frequency (DVFS \/
-                         --   power) effect by construction.
-                         --   Availability is microarchitecture-
-                         --   dependent; 'withCounter' throws
-                         --   'OpenFailed' where unsupported.
-  | TaskClock            -- ^ @PERF_COUNT_SW_TASK_CLOCK@: nanoseconds
-                         --   the task spent on-CPU, /including/
-                         --   kernel time on its behalf (the
-                         --   exclusion bits are deliberately not
-                         --   set). Wall minus task-clock isolates
-                         --   descheduled time. A software counter,
-                         --   so it needs no PMU access and is
-                         --   available in VMs and containers where
-                         --   the hardware events are not — but
-                         --   counting kernel time is itself
-                         --   privileged: this one needs
-                         --   @kernel.perf_event_paranoid@ at most
-                         --   @1@, and 'withCounter' throws
-                         --   @'OpenFailed' 13@ (@EACCES@) at the
-                         --   @2@ the other counters tolerate.
+                         --   the constant reference rate, so a
+                         --   difference here with clean 'Cycles' is a
+                         --   frequency effect. Not available on every
+                         --   microarchitecture.
+  | TaskClock            -- ^ @PERF_COUNT_SW_TASK_CLOCK@: on-CPU
+                         --   nanoseconds, including kernel time on the
+                         --   task's behalf. A software counter, so
+                         --   available in VMs, but counting kernel time
+                         --   needs @kernel.perf_event_paranoid@ at most
+                         --   @1@.
   | BranchMisses         -- ^ @PERF_COUNT_HW_BRANCH_MISSES@: catches a
-                         --   secret-dependent branch /direction/
-                         --   even when retired branch counts
-                         --   balance (one branch, two directions,
-                         --   same total). Not deterministic.
-  | CacheMisses          -- ^ @PERF_COUNT_HW_CACHE_MISSES@: attributes
-                         --   a cycles-level difference to memory
-                         --   access patterns (the table-lookup
-                         --   signature). Not deterministic.
+                         --   secret-dependent branch direction when
+                         --   retired branch counts balance.
+  | CacheMisses          -- ^ @PERF_COUNT_HW_CACHE_MISSES@: attributes a
+                         --   cycles-level difference to memory access
+                         --   patterns.
   deriving (Eq, Show)
 
 -- | Why a 'withCounter' meter could not be opened.
@@ -205,34 +153,16 @@ counterCode TaskClock           = 4
 counterCode BranchMisses        = 5
 counterCode CacheMisses         = 6
 
--- | Acquire a hardware performance-counter t'Meter' for the duration of
---   the callback, then release it.
+-- | Acquire a performance-counter t'Meter' for the duration of the
+--   callback, then release it. Throws 'MeterError' if the counter
+--   cannot be opened.
 --
---   The counter is opened in user-space-only mode
---   (@exclude_kernel@), which unprivileged processes may do when
---   @kernel.perf_event_paranoid@ is at most @2@ — except
---   'TaskClock', which deliberately counts kernel time on the
---   task's behalf and so needs @1@ or lower, failing with
---   @'OpenFailed' 13@ (@EACCES@) at @2@ (see t'Counter'). The
---   deliberate exclusion is not retried without kernel time on
---   failure: that would open successfully and silently return a
---   user-only clock, collapsing the very gap the rung exists to
---   measure. Because a @perf_event@ counter is bound to the
---   thread that opened it, the callback runs on a single OS
---   thread -- under the threaded runtime via
---   'runInBoundThread', otherwise inline on the sole OS thread --
---   so that the open and every 'measure' share one thread.
---
---   Throws 'MeterError' if the counter cannot be opened. For
---   'InstructionsRetired' and 'BranchesRetired' the reading is a
---   deterministic property of the executed code, so a constant-time
---   target yields identical readings across input classes regardless
---   of operand values, cache state, or CPU frequency. For the other
---   counters the reading additionally reflects data-dependent
---   latency, microarchitectural state, frequency ('RefCycles'), or
---   kernel-time attribution ('TaskClock'), so equality across
---   classes is not guaranteed even for CT code — class-conditional
---   /differences/ are the signal.
+--   Counters count user space only, which unprivileged processes may
+--   open at @kernel.perf_event_paranoid@ @2@ or lower; 'TaskClock'
+--   deliberately includes kernel time and needs @1@ or lower, failing
+--   with @'OpenFailed' 13@ otherwise rather than silently degrading
+--   to a user-only clock. A counter is bound to the thread that
+--   opened it, so the callback runs on one OS thread.
 withCounter :: Counter -> (Meter -> IO a) -> IO a
 withCounter counter k = onOneThread $ do
   fd <- c_perf_open (counterCode counter)
