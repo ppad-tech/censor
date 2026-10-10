@@ -1,5 +1,14 @@
 # Changelog
 
+- unreleased
+  * The demo executables (censor-demo, censor-viz, censor-demo-ffi,
+    and the per-library suites censor-poly, censor-chacha,
+    censor-sha, censor-sha512, censor-aead, censor-secp), their
+    cabal flags, the rs-demo Rust crate, and the flake inputs they
+    pulled in are removed. Target-specific harnesses belong
+    outside censor, built on the library's suite scaffolds in
+    Censor.Runner.Report, which are unchanged.
+
 - 0.5.1 (2026-08-23)
   * **Copy-source symmetry in fix-vs-random**
     (issues/handled/ISSUE4.md).
