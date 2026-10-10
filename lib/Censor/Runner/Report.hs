@@ -805,11 +805,8 @@ data SuiteArgs = SuiteArgs
     -- ^ meter name (@wall@, @instructions@, ...); 'Nothing' means
     --   accept the runner's default.
   , saBatch    :: !(Maybe Int)
-    -- ^ fixed batch from @--batch@; 'Nothing' means the runner's
-    --   default (trace suites auto-calibrate). Pure Haskell
-    --   targets share the applied thunk across a batch, so reps
-    --   beyond the first are no-ops — @--batch 1@ is the honest
-    --   setting for them (mirrors the dlopen CLI's flag).
+    -- ^ fixed batch from @--batch@, overriding every case's
+    --   'BatchPolicy'; 'Nothing' leaves each case's own.
   , saMargin   :: !(Maybe Double)
     -- ^ relative interval-null margin from @--margin@ (see
     --   'Censor.cfgMargin'); 'Nothing' tests the sharp null
@@ -882,8 +879,8 @@ data BatchPolicy
 --   quantified over the hypothesis input type so a suite can hold
 --   cases with different payload shapes in one list.
 --
---   >>> TraceCase "encrypt" SingleShot     posAeadEncrypt
---   >>> TraceCase "mul"     RepeatableAuto posFfiMul
+--   > TraceCase "encrypt" SingleShot     posAeadEncrypt
+--   > TraceCase "mul"     RepeatableAuto posFfiMul
 --
 --   The action is re-executed for the calibration probe (under
 --   'RepeatableAuto'), the main run, and (on 'Reject') the negative

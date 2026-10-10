@@ -7,18 +7,10 @@
 -- License: MIT
 -- Maintainer: Jared Tobin <jared@ppad.tech>
 --
--- A declarative battery description for the @censor@ foreign
--- runner: a list of cases, each naming a target symbol and the
--- workspace layout to drive it with, plus run-wide defaults.
---
--- Without one, auditing a library means one @censor@ process per
--- symbol and a shell loop to stitch the single-case reports back
--- together — which duplicates the tool version and config by hand
--- in every script, and produces no single artefact carrying the
--- whole battery. With one, a single invocation opens the library
--- once and emits one @censor\/report-v3@ object containing every
--- case, its controls, the host environment, and the family-wise
--- alpha.
+-- A declarative battery for the @censor@ CLI: run-wide defaults and
+-- a list of cases, each naming a target symbol and the workspace
+-- layout to drive it with. One invocation opens the library once and
+-- emits one @censor\/report-v3@ object covering every case.
 --
 -- The format is line-oriented. Blank lines and @#@ comments are
 -- ignored; every other line is either a run-wide directive
@@ -138,26 +130,14 @@ data ManifestCase = ManifestCase
   , mcPublic     :: ![Range]
   , mcContext    :: ![Range]
     -- ^ ranges redrawn once per /pair/ and written identically into
-    --   both classes: a shared fresh public context.
-    --
-    --   'mcPublic' pins its ranges for the whole cell, which tests
-    --   one public input; leaving them to the per-class random fill
-    --   gives each class a different one, injecting nuisance
-    --   variance into @d@ that has nothing to do with the secret.
-    --   A context range is the third option — fresh every pair, but
-    --   common to A and B — so the tested axis is secret dependence
-    --   /given identical public input/.
+    --   both classes: a fresh public input shared by the pair (see
+    --   'Censor.fixVsRandomCtx').
   , mcBatch      :: !(Maybe BatchSpec)
   , mcReplicates :: {-# UNPACK #-} !Int
     -- ^ how many independent fixed secrets to run this case
-    --   against, each an ordinary case row of its own.
-    --
-    --   A dudect-style fix-vs-random cell pins /one/ fixed secret,
-    --   so it answers "does this secret time differently from
-    --   random", not "does any secret". Replicating guards against
-    --   a single unlucky (or unluckily typical) draw. Each
-    --   replicate counts toward the family-wise alpha, as it
-    --   should.
+    --   against, each its own case row. One pinned secret only asks
+    --   whether /that/ secret times differently from random;
+    --   replicating guards against an unlucky draw.
   } deriving (Eq, Show)
 
 -- | A parsed manifest.
