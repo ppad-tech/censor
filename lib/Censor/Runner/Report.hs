@@ -20,11 +20,11 @@
 --   and 'plain' (ASCII-only, grep-safe).
 -- * 'withReport' streams cases through the chosen renderer and
 --   returns the accumulated list so callers can drive exit codes.
--- * At the top, t'Suite' and t'TraceSuite' package up the entire
---   censor test-suite shape (arg parse, meter selection, header
---   assembly, per-case calibration and attribution, trace record,
---   JSON artefact write) into one call, so a suite's @Main.hs@
---   contains only the hypotheses and case list.
+-- * At the top, t'TraceSuite' packages up the entire censor
+--   test-suite shape (arg parse, meter selection, header assembly,
+--   per-case calibration and attribution, trace record, JSON
+--   artefact write) into one call, so a suite's @Main.hs@ contains
+--   only the hypotheses and case list.
 
 module Censor.Runner.Report (
     -- * Report config
@@ -65,8 +65,6 @@ module Censor.Runner.Report (
   , TraceCase(..)
   , TraceSuite(..)
   , runTraceSuite
-  , Suite(..)
-  , runSuite
 
     -- * JSON serialisation
   , reportJSON
@@ -142,10 +140,9 @@ data ReportHeader = ReportHeader
   , rhNote      :: !(Maybe String)
     -- ^ optional one-line caveat under the header block.
   , rhEnv       :: !(Maybe Env)
-    -- ^ host-environment snapshot taken at run start. The suite
-    --   scaffolds ('runTraceSuite', 'runSuite') always populate it;
-    --   'Nothing' when the caller assembled the header by hand
-    --   without capturing one.
+    -- ^ host-environment snapshot taken at run start. 'runTraceSuite'
+    --   always populates it; 'Nothing' when the caller assembled the
+    --   header by hand without capturing one.
   , rhPerCaseBatch :: !Bool
     -- ^ 'True' when each case picks its own 'cfgBatch' from its
     --   'BatchPolicy' (see 'runTraceSuite'). Header renders
@@ -752,11 +749,9 @@ padL n s = replicate (max 0 (n - length s)) ' ' ++ s
 
 -- shared suite arg surface -------------------------------------------------
 
--- | The parsed suite argv. All censor suites share the shape
---   @[--format FMT] [--batch N] [--margin M] [METER] [EXTRA...]@;
---   each runner interprets @saExtra@ in its own way (trace suites
---   take the first extra as an output path; plain suites reject
---   them).
+-- | The parsed suite argv:
+--   @[--format FMT] [--batch N] [--margin M] [METER] [EXTRA...]@.
+--   'runTraceSuite' takes the first extra as an output path.
 data SuiteArgs = SuiteArgs
   { saRenderer :: !Renderer
     -- ^ resolved from @--format@; defaults to 'pretty'.
@@ -981,65 +976,4 @@ runTraceSuite ts = do
       cases <- fmap reverse (readIORef ref)
       writeFile path (reportJSON hdr cases)
       pure (Just path)
-    pure ()
-
--- plain suite scaffold -----------------------------------------------------
-
--- | A censor test suite: a fixed set of heterogeneous hypotheses
---   (each with its own type and possibly its own 'Config'), no
---   trace recording, no per-case parameter passing. The tool
---   supplies a callback that runs the whole battery under the
---   chosen meter and emits each result; 'runSuite' handles the
---   surrounding scaffolding.
-data Suite = Suite
-  { suTarget :: !String
-  , suConfig :: !Config
-    -- ^ base driver config (shown in the header). Individual cases
-    --   may run under different configs internally; the header only
-    --   surfaces this one.
-  , suSeed   :: !(Maybe Word64)
-  , suNote   :: !(Maybe String)
-  , suRun    :: !(String -> Meter -> (CaseReport -> IO ()) -> IO ())
-    -- ^ battery driver. Receives the meter name, the meter, and an
-    --   @emit@ action that records one 'CaseReport'.
-  }
-
--- | Drive a t'Suite' end to end. Rejects positional arguments past
---   the meter with a usage error — plain suites do not take an
---   output path.
-runSuite :: Suite -> IO ()
-runSuite su = do
-  hSetBuffering stdout LineBuffering
-  prog <- Env.getProgName
-  sa   <- parseSuiteArgs
-  case saExtra sa of
-    [] -> pure ()
-    xs -> die $ prog ++ ": unexpected positional arg(s) "
-            ++ show xs
-            ++ " (usage: " ++ prog
-            ++ " [--format pretty|json|plain] "
-            ++ "[wall|instructions|cycles|branches])"
-  case saBatch sa of
-    Nothing -> pure ()
-    Just _  -> die $ prog ++ ": --batch is a trace-suite flag; "
-            ++ "plain suites run each case under its own config"
-  case saMargin sa of
-    Nothing -> pure ()
-    Just _  -> die $ prog ++ ": --margin is a trace-suite flag; "
-            ++ "plain suites run each case under its own config"
-  rc <- initReportCfg
-  withMeterArg (saMeter sa) $ \mname meter -> do
-    env <- captureEnv
-    let hdr = ReportHeader
-          { rhMeter     = mname
-          , rhConfig    = suConfig su
-          , rhSeed      = suSeed su
-          , rhTarget    = Just (suTarget su)
-          , rhNote      = suNote su
-          , rhEnv       = Just env
-          , rhPerCaseBatch = False
-          }
-    _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
-      suRun su mname meter emit
-      pure Nothing
     pure ()

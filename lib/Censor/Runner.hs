@@ -9,8 +9,8 @@
 --
 -- Batteries-included harness support for "Censor": meter selection
 -- from a command-line token, trace recording (built on
--- 'Censor.runCTWith', so it does not reimplement the driver),
--- auto-attributing case batteries, and parameter sweeps.
+-- 'Censor.runCTWith', so it does not reimplement the driver), and
+-- parameter sweeps.
 
 module Censor.Runner (
     -- * Meter selection
@@ -24,13 +24,8 @@ module Censor.Runner (
   , record
   , thin
 
-    -- * Batteries
-  , Case(..)
-  , runBattery
-
     -- * Sweeps
   , sweep
-  , partitionVerdicts
 
     -- * Verdicts and rendering
   , verdictName
@@ -46,7 +41,6 @@ import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.List (intercalate)
 import Numeric (showHex)
 import System.Exit (die)
-import System.IO (hFlush, stdout)
 import Text.Printf (printf)
 
 import Censor
@@ -146,59 +140,17 @@ thin frs =
              || frPair fr == m
   in  filter keep frs
 
--- batteries -------------------------------------------------------------------
-
--- | A named hypothesis to run. The hypothesis is built in @IO@ so each
---   case can seed its own sampler.
-data Case a = Case
-  { caseName :: !String
-  , caseHyp  :: !(IO (Hypothesis a))
-  }
-
--- | Run a battery of cases under one meter, auto-attributing every
---   rejection ('runCTAttributed'). Prints a concise verdict line per
---   case and returns the results.
-runBattery
-  :: Meter
-  -> Config
-  -> [Case a]
-  -> IO [(String, Result, Maybe Attribution)]
-runBattery meter cfg cs = forM cs $ \(Case name mkH) -> do
-  putStr (name ++ " ... ") >> hFlush stdout
-  h <- mkH
-  (r, ma) <- runCTAttributed meter cfg h
-  putStrLn $ verdictName r ++ " after " ++ show (resPairs r) ++ " pairs"
-    ++ maybe "" (\att -> "  [" ++ attribLabel att ++ "]") ma
-  pure (name, r, ma)
-
-attribLabel :: Attribution -> String
-attribLabel a = case attVerdict a of
-  ControlsPass         -> "controls pass"
-  SampleAAsymmetry     -> "sampleA asymmetry"
-  SampleBAsymmetry     -> "sampleB asymmetry"
-  PervasiveAsymmetry   -> "harness asymmetry"
-
 -- sweeps ----------------------------------------------------------------------
 
 -- | Run a parameterised family of hypotheses under one meter and
---   return each parameter's result. The recurring "control vs swept
---   input" pattern (a mismatch position, a length, ...); pair with
---   'partitionVerdicts' to read off where the verdict flips.
+--   return each parameter's result: the recurring "control vs swept
+--   input" pattern (a mismatch position, a length, ...).
 sweep
   :: Meter -> Config -> (p -> IO (Hypothesis a)) -> [p] -> IO [(p, Result)]
 sweep meter cfg mk ps = forM ps $ \p -> do
   h <- mk p
   r <- runCT meter cfg h
   pure (p, r)
-
--- | Split swept results into (passing params, rejecting params) — the
---   boundary of a leak's structure (e.g. same-lane pass vs cross-lane
---   reject).
-partitionVerdicts :: [(p, Result)] -> ([p], [p])
-partitionVerdicts = foldr step ([], [])
-  where
-    step (p, Pass{})   (ps, rs) = (p : ps, rs)
-    step (p, Reject{}) (ps, rs) = (ps, p : rs)
 
 -- verdicts and rendering ------------------------------------------------------
 
