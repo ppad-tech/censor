@@ -32,14 +32,11 @@ module Censor.Runner (
   , shapeName
   , summary
   , clipText
-  , resultToJSON
   ) where
 
 import Control.Exception (try)
 import Control.Monad (forM)
 import Data.IORef (newIORef, modifyIORef', readIORef)
-import Data.List (intercalate)
-import Numeric (showHex)
 import System.Exit (die)
 import Text.Printf (printf)
 
@@ -197,66 +194,8 @@ clipText r
   where
     tight = printf "clipped=%d/%d" (resClipped r) (resPairs r) :: String
 
--- | Serialise a t'Result' as a stable JSON object. Includes verdict,
---   pairs, mixture peak log e-value, anytime-valid p-value, effect
---   interval, clip counts at each of the three magnitude bounds,
---   warmup bound, the resolved order seed, the CDF channel as
---   @[cut point, peak]@ pairs, per-component peaks, and the
---   'diagnose' advisories.
---
---   The seed here is the /order/ seed ('resSeed'), the one that
---   replays the A\/B order sequence. The sampler seed is a property
---   of the harness, not of a run, and appears in the report header.
---
---   The object is a single line; pipe multiple runs into a
---   line-oriented store and diff or filter with @jq@.
-resultToJSON :: Result -> String
-resultToJSON r = concat
-  [ "{\"verdict\":",    jstr (verdictName r)
-  , ",\"pairs\":",      show (resPairs r)
-  , printf ",\"peakLogW\":%.6g" (resPeakLogW r)
-  , printf ",\"pvalue\":%.6g"   (resPValue r)
-  , printf ",\"effect\":[%.6g,%.6g]"
-      (fst (resEffect r)) (snd (resEffect r))
-  , ",\"clipped\":",    show (resClipped r)
-  , ",\"clipped4\":",   show (resClipped4 r)
-  , ",\"clipped16\":",  show (resClipped16 r)
-  , printf ",\"bound\":%.6g" (resBound r)
-  -- the resolved absolute interval-null margin, present only on
-  -- margin-mode runs (in meter units per batch, like the bound).
-  , maybe "" (printf ",\"margin\":%.6g") (resMargin r)
-  , ",\"orderSeed\":",  jstr ("0x" ++ showHex (resSeed r) "")
-  , ",\"cdf\":["
-  , intercalate ","
-      [ printf "[%.6g,%.6g]" q p | (q, p) <- resCdf r ]
-  , "]"
-  , ",\"peaks\":{"
-  ,       printf "\"sign\":%.6g"    (resPeakSign r)
-  , printf ",\"magn\":%.6g"         (resPeakMagn r)
-  , printf ",\"magn4\":%.6g"        (resPeakMagn4 r)
-  , printf ",\"magn16\":%.6g"       (resPeakMagn16 r)
-  , printf ",\"cdf\":%.6g"          (resPeakCdf r)
-  , "}"
-  , ",\"advisories\":["
-  , intercalate "," (map advisoryJSON (diagnose r))
-  , "]}"
-  ]
-
-advisoryJSON :: Advisory -> String
-advisoryJSON a = case a of
-  HighClipRate cr -> printf
-    ("{\"kind\":\"HighClipRate\",\"clipFraction\":%.4g"
-      ++ ",\"clipFraction4\":%.4g,\"clipFraction16\":%.4g}")
-    (clipTight cr) (clipWide cr) (clipWidest cr)
-  LowPower h -> printf
-    "{\"kind\":\"LowPower\",\"widthOverBound\":%.4g}" h
-  RejectionDriver s -> concat
-    [ "{\"kind\":\"RejectionDriver\",\"shape\":"
-    , jstr (shapeName s), "}"
-    ]
-
 -- | The short label for a 'LeakShape', as it appears on a case row
---   and in the @advisories@ block of 'resultToJSON'.
+--   and in the @advisories@ block of the JSON report.
 shapeName :: LeakShape -> String
 shapeName s = case s of
   BulkShift   -> "bulk"
@@ -264,6 +203,3 @@ shapeName s = case s of
   RareOutlier -> "tail"
   CdfShift    -> "cdf"
   MixedShape  -> "mixed"
-
-jstr :: String -> String
-jstr s = "\"" ++ s ++ "\""
