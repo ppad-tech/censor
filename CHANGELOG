@@ -9,6 +9,23 @@
     outside censor, built on the library's suite scaffolds in
     Censor.Runner.Report, which are unchanged.
 
+  * **Breaking:** Censor.Runner drops Case, runBattery, and
+    partitionVerdicts, and Censor.Runner.Report drops Suite and
+    runSuite, all unused. resultToJSON moves from Censor.Runner to
+    Censor.Runner.Report. Censor.Runner.Manifest newly exports
+    readRange and readSeed.
+
+  * The dlopen CLI now calls its target through an unsafe FFI
+    import. The import had defaulted to a safe call, which put the
+    RTS's thread suspend/resume inside every timed region.
+
+  * In the CLI's single-target mode the A/A and B/B controls get a
+    fresh hypothesis instance, as in manifest mode, rather than
+    continuing the main run's sampler streams.
+
+  * The haddocks are trimmed and deduplicated, with stale text
+    fixed (including a Censor.FFI example that did not compile).
+
 - 0.5.1 (2026-08-23)
   * **Copy-source symmetry in fix-vs-random**
     (issues/handled/ISSUE4.md).
