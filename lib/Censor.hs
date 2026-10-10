@@ -1013,29 +1013,25 @@ calibrateBatchReport meter hyp = do
 -- single 0 (fast target straddling the quantum) or a single spike
 -- (a scheduler hiccup on the wall clock).
 probeReading :: Meter -> IO () -> Int -> IO Word64
-probeReading meter act b = fmap median (collect calibProbes)
-  where
-    collect 0 = pure []
-    collect i = do
-      !r <- measure meter b act
-      fmap (r :) (collect (i - 1 :: Int))
-
-median :: [Word64] -> Word64
-median xs = case drop (length xs `div` 2) (sort xs) of
-  (m : _) -> m
-  []      -> 0
+probeReading meter act b =
+  fmap (nsMedian . dispersion) (samples calibProbes (measure meter b act))
 
 -- dispersion of repeated readings at the selected batch: median and
 -- interquartile range (nearest-rank quantiles), in per-batch meter
 -- units. This is the meter's noise floor at the scale the driver
 -- will observe, recorded as a snapshot of measurement conditions.
 noiseReading :: Meter -> IO () -> Int -> IO Noise
-noiseReading meter act b = fmap dispersion (collect noiseSamples)
+noiseReading meter act b =
+  fmap dispersion (samples noiseSamples (measure meter b act))
+
+-- run a reading action @n@ times, forcing each reading as it lands.
+samples :: Int -> IO Word64 -> IO [Word64]
+samples n act = go n
   where
-    collect 0 = pure []
-    collect i = do
-      !r <- measure meter b act
-      fmap (r :) (collect (i - 1 :: Int))
+    go 0 = pure []
+    go i = do
+      !r <- act
+      fmap (r :) (go (i - 1))
 
 -- median and nearest-rank interquartile range of a reading list.
 dispersion :: [Word64] -> Noise
@@ -1065,19 +1061,20 @@ dispersion rs =
 --   its own hypothesis instance when the run's sampler stream must
 --   start undisturbed.
 baselineReading :: Meter -> Config -> Hypothesis a -> IO Noise
-baselineReading meter cfg hyp = fmap dispersion (collect baselineSamples)
+baselineReading meter cfg hyp =
+  fmap dispersion (samples baselineSamples fresh)
   where
-    collect 0 = pure []
-    collect i = do
+    fresh = do
       prepare hyp
       !x <- sampleA hyp
-      !r <- measure meter (cfgBatch cfg) (target hyp x)
-      fmap (r :) (collect (i - 1 :: Int))
+      measure meter (cfgBatch cfg) (target hyp x)
 
 baselineSamples :: Int
 baselineSamples = 15
 
-nth :: Int -> [Word64] -> Word64
+-- the @k@th element of a sorted list (nearest-rank order statistic);
+-- @0@ past the end.
+nth :: Num a => Int -> [a] -> a
 nth k xs = case drop k xs of
   (v : _) -> v
   []      -> 0
@@ -1620,11 +1617,7 @@ warmup meter cfg hyp samplers seed = do
 orderStat99 :: Ord a => Num a => [a] -> a
 orderStat99 xs =
   let !sorted = sort xs
-      !m      = length sorted
-      !idx    = max 0 (min (m - 1) ((m * 99) `div` 100))
-  in  case drop idx sorted of
-        (x : _) -> x
-        []      -> 0
+  in  nth ((length sorted * 99) `div` 100) sorted
 {-# INLINE orderStat99 #-}
 
 -- The levels at which the CDF-indicator components cut the pooled
@@ -1647,10 +1640,8 @@ cutPoints sorted
   where
     !m = length sorted
     pick !p =
-      let !idx = max 0 (min (m - 1) (floor (p * fromIntegral m)))
-      in  case drop idx sorted of
-            (x : _) -> fromIntegral x
-            []      -> 0
+      fromIntegral (nth (max 0 (min (m - 1) (floor (p * fromIntegral m))))
+                        sorted)
 
 -- Drop repeats from an ascending list.
 dedupAsc :: [Double] -> [Double]
