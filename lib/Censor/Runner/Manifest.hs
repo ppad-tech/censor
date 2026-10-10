@@ -51,6 +51,8 @@ module Censor.Runner.Manifest (
     -- * Parsing
   , parseManifest
   , emptyDefaults
+  , readRange
+  , readSeed
 
     -- * Layout validation
   , checkLayout
@@ -242,14 +244,20 @@ flag _ _ "off" = Right False
 flag n nm v = Left (at n (nm ++ " expects 'on' or 'off', got " ++ show v))
 
 hex :: Int -> String -> String -> Either String Word64
-hex n nm v =
+hex n nm v = case readSeed v of
+  Just w  -> Right w
+  Nothing -> Left (at n (nm ++ " expects a hex Word64, got " ++ show v))
+
+-- | Read a hex 'Word64', with or without a @0x@ prefix.
+readSeed :: String -> Maybe Word64
+readSeed v =
   let s = case v of
         '0' : 'x' : r -> r
         '0' : 'X' : r -> r
         _             -> v
   in  case readHex s of
-        [(w, "")] -> Right w
-        _ -> Left (at n (nm ++ " expects a hex Word64, got " ++ show v))
+        [(w, "")] -> Just w
+        _         -> Nothing
 
 parseCase
   :: Int -> Defaults -> [String] -> Either String ManifestCase
@@ -296,14 +304,18 @@ applyKV n c kv = case break (== '=') kv of
   _ -> Left (at n ("expected key=value, got " ++ show kv))
 
 range :: Int -> String -> String -> Either String Range
-range n nm v = case break (== ':') v of
+range n nm v = case readRange v of
+  Just r  -> Right r
+  Nothing -> Left (at n (nm ++ " expects off:len with off >= 0, len > 0,"
+                         ++ " got " ++ show v))
+
+-- | Read an @off:len@ byte range, with @off >= 0@ and @len > 0@.
+readRange :: String -> Maybe Range
+readRange v = case break (== ':') v of
   (off, ':' : len) -> case (reads off, reads len) of
-    ([(o, "")], [(l, "")]) | o >= 0 && l > 0 -> Right (Range o l)
-    _ -> bad
-  _ -> bad
-  where
-    bad = Left (at n (nm ++ " expects off:len with off >= 0, len > 0,"
-                      ++ " got " ++ show v))
+    ([(o, "")], [(l, "")]) | o >= 0 && l > 0 -> Just (Range o l)
+    _ -> Nothing
+  _ -> Nothing
 
 validateCase :: Int -> ManifestCase -> Either String ManifestCase
 validateCase n c
