@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               ppad-censor
-version:            0.5.1
+version:            0.5.2
 synopsis:           Anytime-valid sequential constant-time testing.
 license:            MIT
 license-file:       LICENSE
@@ -8,7 +8,7 @@ author:             Jared Tobin
 maintainer:         jared@ppad.tech
 category:           Testing
 build-type:         Simple
-tested-with:        GHC == { 9.10.3 }
+tested-with:        GHC == { 9.8.4, 9.10.3 }
 extra-doc-files:    CHANGELOG
 description:
   A pure Haskell framework for sequential constant-time testing via

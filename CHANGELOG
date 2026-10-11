@@ -1,6 +1,9 @@
 # Changelog
 
-- unreleased
+- 0.5.2 (2026-10-11)
+  * Supports GHC 9.8, via ppad-eproc 0.5.1. The package description
+    no longer renders "A/A and B/B" as emphasis on Hackage.
+
   * The demo executables (censor-demo, censor-viz, censor-demo-ffi,
     and the per-library suites censor-poly, censor-chacha,
     censor-sha, censor-sha512, censor-aead, censor-secp), their
