@@ -19,7 +19,7 @@ description:
   classes, in random order, and tests them with a hedged mixture of
   ppad-eproc e-processes, halting as soon as the evidence suffices.
 
-  Provides dudect-style fix-vs-random hypotheses, A/A and B/B negative
+  Provides dudect-style fix-vs-random hypotheses, A\/A and B\/B negative
   controls, wall-clock and Linux hardware-counter meters, foreign
   targets via FFI or a dlopen CLI, and anytime-valid p-values and
   effect-size intervals.
