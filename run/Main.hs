@@ -454,6 +454,7 @@ runCase args mname meter cfg name mk = do
     , Rep.crNoise       = Nothing
     , Rep.crBaseline    = Just base
     , Rep.crTrace       = mfrs
+    , Rep.crChannels    = []
     }
   where
     withHyp k = mk >>= \fh -> F.withFFIHypothesis fh k

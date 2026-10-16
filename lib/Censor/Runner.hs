@@ -18,6 +18,8 @@ module Censor.Runner (
   , parseMeter
   , meterName
   , withMeterArg
+  , splitMeterName
+  , withSplitMeterArg
 
     -- * Recording traces
   , Trace(..)
@@ -92,17 +94,33 @@ withMeterArg marg k = do
       case r of
         Right a -> pure a
         Left e  -> die $ name ++ " meter unavailable: "
-          ++ show (e :: MeterError) ++ hint e
-  where
-    -- EPERM/EACCES means the kernel refused a counter that exists,
-    -- which for an unprivileged process is the paranoid level.
-    -- task-clock counts kernel time and so needs a lower one than
-    -- the rest; see Censor.Meter.
-    hint (OpenFailed n)
-      | n == 1 || n == 13 =
-          " (check kernel.perf_event_paranoid: task-clock needs 1"
-            ++ " or lower, the other counters 2 or lower)"
-    hint _ = ""
+          ++ show (e :: MeterError) ++ paranoidHint e
+
+-- | The split meter's name on the command line and in reports
+--   (@cycles+wall@; see 'withSplitMeter').
+splitMeterName :: String
+splitMeterName = "cycles+wall"
+
+-- | Run the callback with a t'SplitMeter', dying with a clear message
+--   if the cycle counter cannot be opened, as 'withMeterArg' does.
+withSplitMeterArg :: (SplitMeter -> IO a) -> IO a
+withSplitMeterArg k = do
+  r <- try (withSplitMeter k)
+  case r of
+    Right a -> pure a
+    Left e  -> die $ splitMeterName ++ " meter unavailable: "
+      ++ show (e :: MeterError) ++ paranoidHint e
+
+-- EPERM/EACCES means the kernel refused a counter that exists, which
+-- for an unprivileged process is the paranoid level. task-clock
+-- counts kernel time and so needs a lower one than the rest; see
+-- Censor.Meter.
+paranoidHint :: MeterError -> String
+paranoidHint (OpenFailed n)
+  | n == 1 || n == 13 =
+      " (check kernel.perf_event_paranoid: task-clock needs 1"
+        ++ " or lower, the other counters 2 or lower)"
+paranoidHint _ = ""
 
 -- recording -------------------------------------------------------------------
 
