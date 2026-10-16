@@ -66,6 +66,12 @@ Beyond that:
 * `withCounter` (Linux) replaces the wall clock with a hardware
   performance counter (instructions retired, cycles, etc.), which is
   far less noisy, and can attribute a difference to a channel.
+* `runSplit` (Linux, `withSplitMeter`; meter `cycles+wall` in a
+  suite) reads cycles and wall time over the same execution and tests
+  three channels on the same pairs: cycles, the clock period (wall
+  time per cycle), and wall time. The verdict is the cycles
+  channel's; the other two say whether the clock, or elapsed time,
+  moved with the class.
 * `Censor.FFI` adapts foreign (C, Rust, etc.) targets.
 * The `censor` executable (`-f+run`) tests symbols in a shared
   library directly, singly or as a battery declared in a manifest
@@ -92,9 +98,12 @@ On frequency-scaled hosts, the wall clock can reject even
 constant-time code: constant time is not constant power, and DVFS
 converts a data-dependent power draw into a timing difference. A
 wall-only rejection with clean counters is the signature. Prefer the
-counters; where only the wall clock is available, pin the frequency,
-or test an interval null with `cfgMargin` (`--margin`), calibrated on
-the host with `censor-validate --power-gain`.
+counters, and the split meter in particular: it measures the
+mechanism on the same samples, where a separate counter run only
+suggests it. A frequency effect shows as a period rejection beside a
+cycles pass. Where only the wall clock is available, pin the
+frequency, or test an interval null with `cfgMargin` (`--margin`),
+calibrated on the host with `censor-validate --power-gain`.
 
 ## Calibration
 
