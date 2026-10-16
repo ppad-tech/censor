@@ -78,6 +78,12 @@ module Censor (
   , Frame(..)
   , runCTAttributed
 
+    -- * Split runs
+  , Split(..)
+  , runSplit
+  , runSplitWith
+  , attributeSplit
+
     -- * Batch calibration
   , calibrateBatch
   , CalibReport(..)
@@ -102,6 +108,8 @@ module Censor (
   , Counter(..)
   , MeterError(..)
   , withCounter
+  , SplitMeter(..)
+  , withSplitMeter
 
     -- * Sampler support (re-exports)
   , Rng
@@ -583,73 +591,25 @@ runCTWith meter cfg hyp observe = do
   validateConfig cfg
   (!root, !wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
   let !samplers = orderedSamplers hyp
-  (!c, !qs, !meterResolves, !medR) <- warmup meter cfg hyp samplers wSeed
-  unless meterResolves $ throwIO WarmupZeroDuration
-  !mdelta <- case cfgMargin cfg of
-    Nothing  -> pure Nothing
-    Just rel -> do
-      let !delta = rel * medR
-      unless (delta > 0) $ throwIO $! InvalidConfig
-        "cfgMargin resolves to a zero absolute margin (warmup \
-        \median reading is 0); raise cfgBatch"
-      unless (delta < c) $ throwIO $! InvalidConfig
-        "cfgMargin resolves to an absolute margin at or above the \
-        \warmup clip bound; lower cfgMargin (the tolerance exceeds \
-        \the pair-noise scale the test bets against)"
-      pure (Just delta)
-  !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c qs mdelta of
-    Left  e -> throwIO (InvalidEprocConfig e)
-    Right x -> pure x
-  !cscfg <- case EPCS.config (negate (hcC3 hcfg)) (hcC3 hcfg)
-                   (cfgAlpha cfg) effectGrid of
-    Left  e -> throwIO (InvalidEprocConfig e)
-    Right x -> pure x
-  let !mixc = hcMix hcfg
-      finish ctor !n !st !iv !cl = ctor
-        n (EPMix.log_evalue_sup mixc (hsMix st))
-        (EPMix.p_value mixc (hsMix st))
-        iv
-        (clAtC cl) (clAt4C cl) (clAt16C cl) c
-        (EPSign.log_evalue_sup (hsSign st))
-        (EPMagn.log_evalue_sup (hsMagn1 st))
-        (EPMagn.log_evalue_sup (hsMagn2 st))
-        (EPMagn.log_evalue_sup (hsMagn3 st))
-        (cdfPeaks qs (hsCdf st))
-        root
-        mdelta
-      -- the effect interval is latched: once the evidence pins the
-      -- mean below the grid's resolution the survivor set empties,
-      -- and the last resolvable interval (nested within all earlier
-      -- ones, so still covered by the time-uniform guarantee) is
-      -- what finish reports.
-      go !n !st !cs !iv !rng !cl
-        | n >= cfgBudget cfg =
-            pure $! finish Pass n st iv cl
+      pair      = runPair meter cfg hyp samplers
+  ws  <- warmup cfg pair wSeed
+  !ch <- channel cfg [ (fromIntegral x, fromIntegral y) | (x, y) <- ws ]
+  let go !n !st !rng
+        | n >= cfgBudget cfg = pure $! chanResult ch root n st
         | otherwise = do
             let (!rng', !bit) = nextOrderBit rng
-            (!ta, !tb) <- runPair meter cfg hyp samplers bit
-            let !xa      = fromIntegral ta :: Double
-                !xb      = fromIntegral tb :: Double
-                !d       = xa - xb
-                !clipped = abs d > c
-                !st'     = updateHedge hcfg st d xa xb
-                !cs'     = EPCS.update cscfg cs (clipD (hcC3 hcfg) d)
-                !iv'     = case EPCS.interval cscfg cs' of
-                             Just x  -> x
-                             Nothing -> iv
-                !cl'     = bumpClips hcfg cl d
-                !n'      = n + 1
+            (!ta, !tb) <- pair bit
+            let !xa  = fromIntegral ta :: Double
+                !xb  = fromIntegral tb :: Double
+                !st' = stepChan ch st xa xb
+                !n'  = n + 1
             -- lazy: the frame's fields (mixture reads) are forced
             -- only if the observer forces them, so runCT pays nothing.
-            observe (Frame n' d
-                       (EPMix.log_evalue mixc (hsMix st'))
-                       (EPMix.log_evalue_sup mixc (hsMix st'))
-                       (fst iv') (snd iv') clipped)
-            case EPMix.decide mixc (hsMix st') of
-              EPMix.Reject -> pure $! finish Reject n' st' iv' cl'
-              _            -> go n' st' cs' iv' rng' cl'
-      !iv0 = (negate (hcC3 hcfg), hcC3 hcfg)
-  go 0 (initialHedge hcfg) (EPCS.initial cscfg) iv0 mSeed noClips
+            observe (chanFrame ch n' (xa - xb) st')
+            if chanRejects ch st'
+              then pure $! chanResult ch root n' st'
+              else go n' st' rng'
+  go 0 (chanInitial ch) mSeed
 
 -- | Run a constant-time test. See 'runCTWith' for the phase-by-phase
 --   description; this is that driver with the per-pair observer
@@ -672,6 +632,99 @@ runCTAttributed meter cfg hyp = do
       att <- attribute meter cfg hyp
       pure (r, Just att)
     Pass{}   -> pure (r, Nothing)
+
+-- | One value per channel of a split run ('runSplitWith'): a
+--   t'Result' each, or the controls' t'Attribution' each.
+data Split a = Split
+  { splitCycles :: !a
+    -- ^ the cycle count: whether the code's execution depends on
+    --   the class. The verdict is this channel's.
+  , splitPeriod :: !a
+    -- ^ wall time per cycle, in femtoseconds: whether the clock the
+    --   cycles ran at does.
+  , splitWall   :: !a
+    -- ^ wall time, in nanoseconds: the two together, as elapsed
+    --   time shows them to an observer.
+  } deriving (Eq, Show)
+
+instance Functor Split where
+  fmap f (Split c p w) = Split (f c) (f p) (f w)
+
+-- | Run a constant-time test under a t'SplitMeter', handing the
+--   cycles channel's t'Frame' to the observer after every
+--   main-phase pair.
+--
+--   Every pair is read once, as cycles and wall time, and tested on
+--   three channels: cycles, the clock period (wall time per cycle),
+--   and wall time. Each channel is a full test as 'runCTWith'
+--   describes, with its own clip bound and cut points fixed by the
+--   same warmup pairs, and each holds its own type-I error at
+--   'cfgAlpha'. The cycles channel decides when the run stops: on
+--   its rejection, or at the budget. That stop is a stopping time
+--   for the readings of all three, and the order bit is independent
+--   of all three, so the other two channels' guarantees hold where
+--   it falls.
+--
+--   The cycles channel answers the constant-time question. The
+--   period channel answers whether the clock moved with the class,
+--   as it does when the core's frequency follows data-dependent
+--   power; wall time answers whether elapsed time moved, by either
+--   route. A wall rejection beside a cycles pass, with the period
+--   rejecting too, is a frequency effect rather than a code path.
+--
+--   The period reads cleanly only beside a cycles pass: the counted
+--   region carries a fixed overhead (the clock reads), so wall time
+--   per cycle falls as cycles grow, and a cycles difference
+--   registers on the period as well.
+runSplitWith
+  :: SplitMeter -> Config -> Hypothesis a -> (Frame -> IO ())
+  -> IO (Split Result)
+runSplitWith meter cfg hyp observe = do
+  validateConfig cfg
+  (!root, !wSeed, !mSeed) <- resolveSeeds (cfgSeed cfg)
+  let !samplers = orderedSamplers hyp
+      pair      = runSplitPair meter cfg hyp samplers
+  ws <- warmup cfg pair wSeed
+  let rs = fmap splitReadings ws
+  !cc <- channel cfg (fmap splitCycles rs)
+  !cp <- channel cfg (fmap splitPeriod rs)
+  !cw <- channel cfg (fmap splitWall rs)
+  let finish !n !sc !sp !sw = Split
+        (chanResult cc root n sc)
+        (chanResult cp root n sp)
+        (chanResult cw root n sw)
+      go !n !sc !sp !sw !rng
+        | n >= cfgBudget cfg = pure $! finish n sc sp sw
+        | otherwise = do
+            let (!rng', !bit) = nextOrderBit rng
+            !r <- pair bit
+            case splitReadings r of
+              Split (!ca, !cb) (!pa, !pb) (!wa, !wb) -> do
+                let !sc' = stepChan cc sc ca cb
+                    !sp' = stepChan cp sp pa pb
+                    !sw' = stepChan cw sw wa wb
+                    !n'  = n + 1
+                observe (chanFrame cc n' (ca - cb) sc')
+                if chanRejects cc sc'
+                  then pure $! finish n' sc' sp' sw'
+                  else go n' sc' sp' sw' rng'
+  go 0 (chanInitial cc) (chanInitial cp) (chanInitial cw) mSeed
+
+-- | 'runSplitWith' with the per-pair observer discarded.
+runSplit :: SplitMeter -> Config -> Hypothesis a -> IO (Split Result)
+runSplit meter cfg hyp = runSplitWith meter cfg hyp (\_ -> pure ())
+
+-- | The A\/A and B\/B controls under a t'SplitMeter': each control
+--   is one split run, and each channel's verdict comes from that
+--   channel's readings of the two. Only meaningful for a channel
+--   that rejected, as for 'attribute'.
+attributeSplit
+  :: SplitMeter -> Config -> Hypothesis a -> IO (Split Attribution)
+attributeSplit meter cfg hyp = do
+  Split ac ap aw <- runSplit meter cfg (toAA hyp)
+  Split bc bp bw <- runSplit meter cfg (toBB hyp)
+  pure $! Split (attribution ac bc) (attribution ap bp)
+                (attribution aw bw)
 
 -- | Pick a 'cfgBatch' that lifts the per-batch reading well above the
 --   meter's resolution: probe a class-A sample at geometrically
@@ -895,16 +948,21 @@ attribute :: Meter -> Config -> Hypothesis a -> IO Attribution
 attribute meter cfg hyp = do
   raa <- runAA meter cfg hyp
   rbb <- runBB meter cfg hyp
+  pure $! attribution raa rbb
+
+-- the controls' combined verdict, carrying both runs.
+attribution :: Result -> Result -> Attribution
+attribution raa rbb =
   let !v = case (raa, rbb) of
         (Pass{},   Pass{})   -> ControlsPass
         (Reject{}, Pass{})   -> SampleAAsymmetry
         (Pass{},   Reject{}) -> SampleBAsymmetry
         (Reject{}, Reject{}) -> PervasiveAsymmetry
-  pure $! Attribution
-    { attVerdict = v
-    , attAA      = raa
-    , attBB      = rbb
-    }
+  in  Attribution
+        { attVerdict = v
+        , attAA      = raa
+        , attBB      = rbb
+        }
 
 -- internal
 
@@ -955,15 +1013,50 @@ runPair meter cfg hyp samplers !bit = do
   !t1 <- measure meter (cfgBatch cfg) (target hyp u)
   !v  <- indexSmallArray samplers iSnd
   !t2 <- measure meter (cfgBatch cfg) (target hyp v)
-  -- branchless unscramble: swap iff bit = 1, via an all-ones mask.
-  -- x is class A's reading (slot 1 when the bit is 0, slot 2 when
-  -- it is 1), y class B's.
-  let !m = negate bit
-      !s = (t1 `B.xor` t2) B..&. m
-      !x = t1 `B.xor` s
-      !y = t2 `B.xor` s
+  let (!x, !y) = unscramble bit t1 t2
   pure (x, y)
 {-# INLINE runPair #-}
+
+-- | 'runPair' under a t'SplitMeter': (A's cycles, A's wall time,
+--   B's cycles, B's wall time), each reading unscrambled as there.
+runSplitPair
+  :: SplitMeter -> Config -> Hypothesis a -> SmallArray (IO a) -> Word64
+  -> IO (Word64, Word64, Word64, Word64)
+runSplitPair meter cfg hyp samplers !bit = do
+  prepare hyp
+  let !iFst = fromIntegral bit :: Int
+      !iSnd = 1 - iFst
+  !u <- indexSmallArray samplers iFst
+  (!c1, !w1) <- measureSplit meter (cfgBatch cfg) (target hyp u)
+  !v <- indexSmallArray samplers iSnd
+  (!c2, !w2) <- measureSplit meter (cfgBatch cfg) (target hyp v)
+  let (!ca, !cb) = unscramble bit c1 c2
+      (!wa, !wb) = unscramble bit w1 w2
+  pure (ca, wa, cb, wb)
+{-# INLINE runSplitPair #-}
+
+-- branchless unscramble: swap iff bit = 1, via an all-ones mask. The
+-- first result is class A's reading (slot 1 when the bit is 0, slot
+-- 2 when it is 1), the second class B's.
+unscramble :: Word64 -> Word64 -> Word64 -> (Word64, Word64)
+unscramble !bit !t1 !t2 =
+  let !m = negate bit
+      !s = (t1 `B.xor` t2) B..&. m
+  in  (t1 `B.xor` s, t2 `B.xor` s)
+{-# INLINE unscramble #-}
+
+-- Each channel's (A, B) readings from a split pair. The period is
+-- wall time per cycle in femtoseconds, fine enough that the clip
+-- bound's floor of 1 sits far below its noise. A batch always
+-- retires cycles; the floor on the divisor only keeps the ratio
+-- total.
+splitReadings :: (Word64, Word64, Word64, Word64) -> Split (Double, Double)
+splitReadings (!ca, !wa, !cb, !wb) = Split
+  (fromIntegral ca, fromIntegral cb)
+  (period wa ca, period wb cb)
+  (fromIntegral wa, fromIntegral wb)
+  where
+    period !w !c = fromIntegral w * 1.0e6 / fromIntegral (max 1 c)
 
 -- The hedge composition ----------------------------------------------------
 
@@ -1036,6 +1129,109 @@ mkHedgeCfg !alpha !c qs mmargin = do
     , hcC3     = c3
     , hcMargin = mmargin
     }
+
+-- One reading stream under test: its hedge and the confidence
+-- sequence behind 'resEffect', both resting on the calibration
+-- 'channel' fixes from the warmup pairs. A run tests one channel per
+-- quantity it reads.
+data Chan = Chan
+  { chHedge :: !HedgeCfg
+  , chSeq   :: !EPCS.Config
+  }
+
+data ChanState = ChanState
+  { csHedge :: !HedgeState
+  , csSeq   :: !EPCS.State
+  , csIv    :: !(Double, Double)  -- the latched effect interval
+  , csClips :: !Clips
+  }
+
+-- Calibrate a channel from its warmup (A, B) readings, resolving the
+-- margin against them. Throws as 'runCTWith' documents.
+channel :: Config -> [(Double, Double)] -> IO Chan
+channel cfg ws = do
+  let (!c, !qs, !meterResolves, !medR) = calibrate ws
+  unless meterResolves $ throwIO WarmupZeroDuration
+  !mdelta <- case cfgMargin cfg of
+    Nothing  -> pure Nothing
+    Just rel -> do
+      let !delta = rel * medR
+      unless (delta > 0) $ throwIO $! InvalidConfig
+        "cfgMargin resolves to a zero absolute margin (warmup \
+        \median reading is 0); raise cfgBatch"
+      unless (delta < c) $ throwIO $! InvalidConfig
+        "cfgMargin resolves to an absolute margin at or above the \
+        \warmup clip bound; lower cfgMargin (the tolerance exceeds \
+        \the pair-noise scale the test bets against)"
+      pure (Just delta)
+  !hcfg <- case mkHedgeCfg (cfgAlpha cfg) c qs mdelta of
+    Left  e -> throwIO (InvalidEprocConfig e)
+    Right x -> pure x
+  !cscfg <- case EPCS.config (negate (hcC3 hcfg)) (hcC3 hcfg)
+                   (cfgAlpha cfg) effectGrid of
+    Left  e -> throwIO (InvalidEprocConfig e)
+    Right x -> pure x
+  pure (Chan hcfg cscfg)
+
+chanInitial :: Chan -> ChanState
+chanInitial Chan{..} = ChanState
+  { csHedge = initialHedge chHedge
+  , csSeq   = EPCS.initial chSeq
+  , csIv    = (negate (hcC3 chHedge), hcC3 chHedge)
+  , csClips = noClips
+  }
+
+-- Step a channel on one pair's (A, B) readings. The effect interval
+-- is latched: once the evidence pins the mean below the grid's
+-- resolution the survivor set empties, and the last resolvable
+-- interval (nested within all earlier ones, so still covered by the
+-- time-uniform guarantee) is what 'chanResult' reports.
+stepChan :: Chan -> ChanState -> Double -> Double -> ChanState
+stepChan Chan{..} ChanState{..} !xa !xb =
+  let !d   = xa - xb
+      !h'  = updateHedge chHedge csHedge d xa xb
+      !s'  = EPCS.update chSeq csSeq (clipD (hcC3 chHedge) d)
+      !iv' = case EPCS.interval chSeq s' of
+               Just x  -> x
+               Nothing -> csIv
+      !cl' = bumpClips chHedge csClips d
+  in  ChanState h' s' iv' cl'
+
+-- Whether the channel's mixture has crossed its threshold; latched.
+chanRejects :: Chan -> ChanState -> Bool
+chanRejects Chan{..} ChanState{..} =
+  case EPMix.decide (hcMix chHedge) (hsMix csHedge) of
+    EPMix.Reject -> True
+    _            -> False
+
+-- The channel's frame after pair @n@, whose difference was @d@.
+chanFrame :: Chan -> Int -> Double -> ChanState -> Frame
+chanFrame Chan{..} !n !d ChanState{..} = Frame n d
+  (EPMix.log_evalue mixc (hsMix csHedge))
+  (EPMix.log_evalue_sup mixc (hsMix csHedge))
+  (fst csIv) (snd csIv)
+  (abs d > hcC1 chHedge)
+  where
+    mixc = hcMix chHedge
+
+-- The channel's t'Result' after @n@ pairs, under the run's root seed.
+chanResult :: Chan -> Word64 -> Int -> ChanState -> Result
+chanResult ch@Chan{..} !root !n st@ChanState{..} = ctor
+  n (EPMix.log_evalue_sup mixc (hsMix csHedge))
+  (EPMix.p_value mixc (hsMix csHedge))
+  csIv
+  (clAtC csClips) (clAt4C csClips) (clAt16C csClips) (hcC1 chHedge)
+  (EPSign.log_evalue_sup (hsSign csHedge))
+  (EPMagn.log_evalue_sup (hsMagn1 csHedge))
+  (EPMagn.log_evalue_sup (hsMagn2 csHedge))
+  (EPMagn.log_evalue_sup (hsMagn3 csHedge))
+  (cdfPeaks (hcQs chHedge) (hsCdf csHedge))
+  root
+  (hcMargin chHedge)
+  where
+    mixc = hcMix chHedge
+    ctor | chanRejects ch st = Reject
+         | otherwise         = Pass
 
 -- Running clipped-pair tallies at the hedge's three magnitude
 -- bounds. Kept as one strict record rather than three accumulator
@@ -1191,7 +1387,19 @@ osEntropy = fmap toWord (try (withBinaryFile urandom ReadMode grab))
       | otherwise         = Nothing
     step !acc !w = acc * 256 + fromIntegral w
 
--- Warmup: run @cfgWarmup@ randomly ordered pairs and return
+-- Warmup: run @cfgWarmup@ randomly ordered pairs, returning each
+-- pair's readings for 'channel' to calibrate from.
+warmup :: Config -> (Word64 -> IO r) -> Word64 -> IO [r]
+warmup cfg pair = go 0 []
+  where
+    go !i !acc !rng
+      | i >= cfgWarmup cfg = pure acc
+      | otherwise = do
+          let (!rng', !bit) = nextOrderBit rng
+          !r <- pair bit
+          go (i + 1) (r : acc) rng'
+
+-- Calibrate from warmup (A, B) readings, returning
 -- @(c, qs, meterResolves, medReading)@:
 --
 --   * @c = max 1 (2 * p99(|d|))@, the clip bound; the floor keeps it
@@ -1206,28 +1414,17 @@ osEntropy = fmap toWord (try (withBinaryFile urandom ReadMode grab))
 --     throws 'WarmupZeroDuration'.
 --   * @medReading@, the pooled median, which resolves a relative
 --     'cfgMargin'.
-warmup
-  :: Meter -> Config -> Hypothesis a -> SmallArray (IO a) -> Word64
-  -> IO (Double, [Double], Bool, Double)
-warmup meter cfg hyp samplers seed = do
-  let go !i !rng !accD !accR
-        | i >= cfgWarmup cfg = pure (accD, accR)
-        | otherwise = do
-            let (!rng', !bit) = nextOrderBit rng
-            (!x, !y) <- runPair meter cfg hyp samplers bit
-            let !dx = fromIntegral x :: Double
-                !dy = fromIntegral y :: Double
-                !da = abs (dx - dy)
-            go (i + 1) rng' (da : accD) (x : y : accR)
-  (diffs, readings) <- go 0 seed [] []
-  let !sortedR = sort readings
-      !p99d    = orderStat99 diffs
-      !p99r    = orderStat99 readings
-      !qs      = cutPoints sortedR
-      !medR    = fromIntegral (nth (length sortedR `div` 2) sortedR)
+calibrate :: [(Double, Double)] -> (Double, [Double], Bool, Double)
+calibrate ws =
+  let !readings = concat [ [x, y] | (x, y) <- ws ]
+      !sortedR  = sort readings
+      !p99d     = orderStat99 [ abs (x - y) | (x, y) <- ws ]
+      !p99r     = orderStat99 readings
+      !qs       = cutPoints sortedR
+      !medR     = nth (length sortedR `div` 2) sortedR
   -- twice the order statistic leaves headroom for occasional
   -- outliers; larger differences are clipped in the main phase.
-  pure (max 1 (2 * p99d), qs, p99r > 0, medR)
+  in  (max 1 (2 * p99d), qs, p99r > 0, medR)
 
 -- Empirical @~p99@ order statistic. Sorts and picks index
 -- @(m * 99) \/ 100@; degenerates to the sample max at small @m@
@@ -1251,15 +1448,13 @@ cdfLevels = [0.10, 0.25, 0.50, 0.75, 0.90]
 -- Nearest-rank order statistics of a sorted reading list at
 -- 'cdfLevels', ascending and deduplicated. Empty when warmup
 -- collected nothing.
-cutPoints :: [Word64] -> [Double]
+cutPoints :: [Double] -> [Double]
 cutPoints sorted
   | m == 0    = []
   | otherwise = dedupAsc (map pick cdfLevels)
   where
     !m = length sorted
-    pick !p =
-      fromIntegral (nth (max 0 (min (m - 1) (floor (p * fromIntegral m))))
-                        sorted)
+    pick !p = nth (max 0 (min (m - 1) (floor (p * fromIntegral m)))) sorted
 
 -- Drop repeats from an ascending list.
 dedupAsc :: [Double] -> [Double]

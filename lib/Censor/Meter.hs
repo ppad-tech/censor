@@ -17,7 +17,9 @@
 -- properties of the executed code, immune to the frequency, cache,
 -- and scheduling noise that limits the wall clock on fast targets,
 -- while the other counters help attribute a difference to a channel
--- (see t'Counter').
+-- (see t'Counter'). 'withSplitMeter' reads the cycle counter and the
+-- wall clock over the same execution, splitting wall time into the
+-- cycles the code took and the clock period they ran at.
 
 module Censor.Meter (
     -- * Meter type
@@ -30,6 +32,10 @@ module Censor.Meter (
   , Counter(..)
   , MeterError(..)
   , withCounter
+
+    -- * Wall time split into cycles and period (Linux)
+  , SplitMeter(..)
+  , withSplitMeter
   ) where
 
 import Control.Exception (Exception, throwIO)
@@ -50,6 +56,17 @@ import Foreign.C.Types (CInt(..))
 --   counter once per batch.
 newtype Meter = Meter
   { measure :: Int -> IO () -> IO Word64
+  }
+
+-- | A meter reading two quantities over one execution of the batch:
+--   @'measureSplit' m k act@ returns @(cycles, nanoseconds)@. Wall
+--   time is cycles times the clock period, and a secret can move it
+--   through either factor: through cycles when the code's execution
+--   depends on it, through the period when the core's frequency
+--   does (data-dependent power under frequency scaling). Reading
+--   both on the same execution tells the two apart.
+newtype SplitMeter = SplitMeter
+  { measureSplit :: Int -> IO () -> IO (Word64, Word64)
   }
 
 -- | Wall-clock meter: elapsed nanoseconds over the batch.
@@ -164,11 +181,26 @@ counterCode CacheMisses         = 6
 --   to a user-only clock. A counter is bound to the thread that
 --   opened it, so the callback runs on one OS thread.
 withCounter :: Counter -> (Meter -> IO a) -> IO a
-withCounter counter k = onOneThread $ do
+withCounter counter k = withPerf counter (k . meterFor)
+
+-- | Acquire a t'SplitMeter' for the duration of the callback, then
+--   release it. Throws 'MeterError' if the cycle counter cannot be
+--   opened.
+--
+--   The wall clock is read inside the counted region, so both
+--   readings cover the batch and the clock reads; the overhead is
+--   the same in both classes. As with 'withCounter', the callback
+--   runs on one OS thread.
+withSplitMeter :: (SplitMeter -> IO a) -> IO a
+withSplitMeter k = withPerf Cycles (k . splitFor)
+
+-- open a counter on one OS thread for the callback, closing it after.
+withPerf :: Counter -> (CInt -> IO a) -> IO a
+withPerf counter k = onOneThread $ do
   fd <- c_perf_open (counterCode counter)
   if fd < 0
     then throwIO (OpenFailed (negate (fromIntegral fd)))
-    else k (meterFor fd) `finally` c_perf_close fd
+    else k fd `finally` c_perf_close fd
   where
     -- the perf fd is thread-affine; keep open + measures on one OS
     -- thread. runInBoundThread requires the threaded RTS, so fall back
@@ -184,11 +216,26 @@ meterFor !fd = Meter $ \k act -> do
   c_perf_end fd
 {-# INLINE meterFor #-}
 
+splitFor :: CInt -> SplitMeter
+splitFor !fd = SplitMeter $ \k act -> do
+  c_perf_begin fd
+  !t0 <- monotonicNS
+  rep k act
+  !t1 <- monotonicNS
+  !cy <- c_perf_end fd
+  pure (cy, t1 - t0)
+{-# INLINE splitFor #-}
+
 #else
 
 -- | Hardware performance-counter meters are only available on Linux;
 --   on other platforms this always throws 'Unsupported'.
 withCounter :: Counter -> (Meter -> IO a) -> IO a
 withCounter _ _ = throwIO Unsupported
+
+-- | The split meter needs the cycle counter, so it is only available
+--   on Linux; on other platforms this always throws 'Unsupported'.
+withSplitMeter :: (SplitMeter -> IO a) -> IO a
+withSplitMeter _ = throwIO Unsupported
 
 #endif

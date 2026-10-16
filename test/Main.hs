@@ -29,6 +29,7 @@ main = defaultMain $ testGroup "ppad-censor" [
   , configValidationTests
   , deterministicLeakTests
   , runCTWithTests
+  , splitTests
   , evidenceTests
   , offByOneTests
   , clipCountTests
@@ -310,6 +311,135 @@ configValidationTests = testGroup "config validation" [
         Left other -> assertFailure $
           "expected InvalidConfig, got " ++ show other
         Right _ -> assertFailure "expected InvalidConfig"
+
+-- A split meter over synthetic readings: the target writes its
+-- class's (base cycles, picoseconds per cycle) into the ref, and each
+-- batch reads the base plus class-blind noise from a fixed-seed
+-- stream, with wall time the noisy cycles at that period plus a
+-- small noisy overhead.
+synthSplit :: IO (C.SplitMeter, IORef (Word64, Word64))
+synthSplit = do
+  g   <- C.mkRng 0x5EED
+  ref <- newIORef (0, 0)
+  let m = C.SplitMeter $ \k act -> do
+        let go 0 = pure ()
+            go i = act >> go (i - 1 :: Int)
+        go k
+        (cy0, ps) <- readIORef ref
+        w <- C.nextWord g
+        let !cy = cy0 + w `mod` 64
+            !ns = cy * ps `div` 1000 + (w `div` 64) `mod` 4
+        pure (cy, ns)
+  pure (m, ref)
+
+splitHyp
+  :: IORef (Word64, Word64) -> (Word64, Word64) -> (Word64, Word64)
+  -> C.Hypothesis (Word64, Word64)
+splitHyp ref a b = C.Hypothesis
+  { C.target  = writeIORef ref
+  , C.prepare = pure ()
+  , C.sampleA = pure a
+  , C.sampleB = pure b
+  }
+
+splitCfg :: C.Config
+splitCfg = C.defaultConfig
+  { C.cfgAlpha  = 1.0e-4
+  , C.cfgBudget = 3000
+  , C.cfgWarmup = 150
+  , C.cfgSeed   = Just 0xABCDEF
+  }
+
+isPass :: C.Result -> Bool
+isPass C.Pass{}   = True
+isPass C.Reject{} = False
+
+splitTests :: TestTree
+splitTests = testGroup "split meter" [
+    testCase "a clock that follows the class: period and wall reject, \
+             \cycles pass" $ do
+      (m, ref) <- synthSplit
+      sp <- C.runSplit m splitCfg
+              (splitHyp ref (1000, 1020) (1000, 1000))
+      assertBool ("cycles: " ++ show (C.splitCycles sp))
+        (isPass (C.splitCycles sp))
+      assertBool ("period: " ++ show (C.splitPeriod sp))
+        (not (isPass (C.splitPeriod sp)))
+      assertBool ("wall: " ++ show (C.splitWall sp))
+        (not (isPass (C.splitWall sp)))
+      C.resPairs (C.splitCycles sp) @?= C.cfgBudget splitCfg
+
+  , testCase "a cycles leak stops the run for every channel" $ do
+      (m, ref) <- synthSplit
+      sp <- C.runSplit m splitCfg
+              (splitHyp ref (1100, 1000) (1000, 1000))
+      assertBool ("cycles: " ++ show (C.splitCycles sp))
+        (not (isPass (C.splitCycles sp)))
+      let ns = fmap C.resPairs sp
+      assertBool ("stopped early: " ++ show ns)
+        (C.splitCycles ns < C.cfgBudget splitCfg)
+      C.splitPeriod ns @?= C.splitCycles ns
+      C.splitWall ns @?= C.splitCycles ns
+
+  , testCase "the period channel reads femtoseconds per cycle" $ do
+      (m, ref) <- synthSplit
+      sp <- C.runSplit m splitCfg
+              (splitHyp ref (1000, 1020) (1000, 1000))
+      -- class A's clock is 20 ps per cycle slower: 2e4 fs
+      let (lo, hi) = C.resEffect (C.splitPeriod sp)
+      assertBool ("period effect " ++ show (lo, hi))
+        (lo < 2.0e4 && 2.0e4 < hi + 2.0e3 && lo > 1.0e4)
+
+  , testCase "frames are the cycles channel's" $ do
+      (m, ref) <- synthSplit
+      fr <- newIORef (0 :: Int)
+      sp <- C.runSplitWith m splitCfg
+              (splitHyp ref (1100, 1000) (1000, 1000))
+              (\_ -> modifyIORef' fr (+ 1))
+      n <- readIORef fr
+      n @?= C.resPairs (C.splitCycles sp)
+
+  , testCase "controls carry a verdict per channel" $ do
+      (m, ref) <- synthSplit
+      att <- C.attributeSplit m splitCfg
+               (splitHyp ref (1000, 1020) (1000, 1000))
+      fmap C.attVerdict att @?=
+        C.Split C.ControlsPass C.ControlsPass C.ControlsPass
+
+  , testCase "unavailable off Linux" $
+      if Info.os == "linux"
+        then pure ()
+        else do
+          r <- try (C.withSplitMeter (\_ -> pure ()))
+          case r of
+            Left C.Unsupported -> pure ()
+            other -> assertFailure ("expected Unsupported, got "
+              ++ show other)
+
+  , testCase "report JSON carries the channels beside the result" $ do
+      (m, ref) <- synthSplit
+      sp <- C.runSplit m splitCfg
+              (splitHyp ref (1000, 1020) (1000, 1000))
+      let hdr = Rep.ReportHeader
+            { Rep.rhMeter     = R.splitMeterName
+            , Rep.rhConfig    = splitCfg
+            , Rep.rhSeed      = Nothing
+            , Rep.rhTarget    = Nothing
+            , Rep.rhNote      = Nothing
+            , Rep.rhEnv       = Nothing
+            , Rep.rhPerCaseBatch = False
+            }
+          cr = Rep.CaseReport "case" (C.splitCycles sp) Nothing
+                 Nothing Nothing Nothing Nothing
+                 [ Rep.ChannelReport "period" "fs" (C.splitPeriod sp)
+                     Nothing ]
+          j  = Rep.reportJSON hdr [cr]
+      assertBool ("meter in " ++ j)
+        ("\"meter\":\"cycles+wall\"" `isInfixOf` j)
+      assertBool ("channels in " ++ j)
+        ("\"channels\":[{\"name\":\"period\",\"unit\":\"fs\",\
+         \\"result\":{\"verdict\":\"REJECT\"" `isInfixOf` j)
+  ]
 
 -- deterministic A/B divergence via a meter that reports state the
 -- target wrote during the timed region. No wall-clock noise: every
@@ -1302,6 +1432,7 @@ reportJSONTests = testGroup "reportJSON" [
             , Rep.crNoise       = Just (C.Noise 100 5)
             , Rep.crBaseline    = Just (C.Noise 41000 12)
             , Rep.crTrace       = Nothing
+            , Rep.crChannels    = []
             }
           j = Rep.reportJSON hdr [cr]
       assertBool ("expected env block in " ++ j)
@@ -1325,10 +1456,12 @@ reportJSONTests = testGroup "reportJSON" [
             , Rep.rhPerCaseBatch = False
             }
           cr = Rep.CaseReport "case" r Nothing Nothing Nothing Nothing
-                 Nothing
+                 Nothing []
           j  = Rep.reportJSON hdr [cr]
       assertBool ("unexpected env block in " ++ j)
         (not ("\"env\":" `isInfixOf` j))
+      assertBool ("unexpected channels in " ++ j)
+        (not ("\"channels\":" `isInfixOf` j))
       assertBool ("unexpected noise in " ++ j)
         (not ("\"noise\":" `isInfixOf` j))
       assertBool ("unexpected baseline in " ++ j)

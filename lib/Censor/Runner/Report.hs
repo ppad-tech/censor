@@ -34,6 +34,7 @@ module Censor.Runner.Report (
     -- * Data model
   , ReportHeader(..)
   , CaseReport(..)
+  , ChannelReport(..)
   , BatteryTail(..)
 
     -- * Renderers
@@ -88,6 +89,7 @@ import qualified Censor as C
 import Censor.Runner
   ( traceResult, traceFrames, record, thin
   , verdictName, shapeName, clipText, withMeterArg
+  , splitMeterName, withSplitMeterArg
   )
 import Censor.Runner.Env (Env(..), captureEnv)
 import qualified Paths_ppad_censor as Paths
@@ -181,6 +183,23 @@ data CaseReport = CaseReport
     -- ^ per-pair 'Frame' trajectory, when the runner recorded one
     --   (via 'record'). Surfaces in the JSON artefact as a thinned
     --   array; the human renderers ignore it.
+  , crChannels    :: ![ChannelReport]
+    -- ^ further channels read on the case's own pairs and reported
+    --   beside its verdict: the period and wall channels of a split
+    --   run ('Censor.runSplitWith'), whose 'crResult' is the cycles
+    --   channel. Empty under a single meter.
+  } deriving Show
+
+-- | A channel reported beside a case's verdict.
+data ChannelReport = ChannelReport
+  { chName        :: !String
+    -- ^ channel name (@period@, @wall@).
+  , chUnit        :: !String
+    -- ^ the unit of its readings (@fs@ per cycle, @ns@).
+  , chResult      :: !Result
+    -- ^ the channel's own test over the case's pairs.
+  , chAttribution :: !(Maybe Attribution)
+    -- ^ the channel's A\/A + B\/B controls, on a rejection.
   } deriving Show
 
 -- | The tail passed to a renderer's 'rndClose'. Carries the
@@ -423,9 +442,27 @@ detailLines gap cr = concat
       Pass{} -> []
   , maybe [] pure (calibText cr)
   , maybe [] (pure . attributionText) (crAttribution cr)
+  , concatMap channelLines (crChannels cr)
   ]
   where
     r = crResult cr
+
+-- a reported-beside channel's lines: its verdict, evidence, and
+-- effect interval in its own unit, the driver on a rejection, and
+-- its controls when they ran.
+channelLines :: ChannelReport -> [String]
+channelLines ch =
+  printf "%s %s peakLogW=%.2f p=%.2g effect=[%.1f,%.1f] %s%s"
+    (chName ch) (verdictName r) (resPeakLogW r) (resPValue r)
+    elo ehi (chUnit ch) drv
+  : maybe [] (pure . ((chName ch ++ " ") ++) . attributionText)
+      (chAttribution ch)
+  where
+    r = chResult ch
+    (elo, ehi) = resEffect r
+    drv = case r of
+      Reject{} -> " driver=" ++ shapeName (leakShape r)
+      Pass{}   -> ""
 
 -- the run-metadata line under a case row: resolved batch, the
 -- meter's noise floor at that batch when recorded, the target's
@@ -511,6 +548,11 @@ jsonClose _ hdr tl = putStrLn (reportJSON hdr (btCases tl))
 --   @orderSeed@ inside each case result is the resolved per-run
 --   A\/B order seed that replays that case.
 --
+--   A split run's case carries a @channels@ array: the period and
+--   wall channels read on its own pairs, each with its name, unit,
+--   result, and controls on a rejection. The case's @result@ is the
+--   cycles channel, which carries the verdict.
+--
 --   The 'json' renderer and 'runTraceSuite' both call this so
 --   stdout output and the on-disk artefact are byte-identical.
 reportJSON :: ReportHeader -> [CaseReport] -> String
@@ -585,7 +627,21 @@ caseJSON cr = concat
   , ",\"result\":", resultToJSON (crResult cr)
   , maybe "" (\a -> ",\"controls\":" ++ controlsJSON a)
       (crAttribution cr)
+  , case crChannels cr of
+      []  -> ""
+      chs -> ",\"channels\":["
+        ++ intercalate "," (map channelJSON chs) ++ "]"
   , maybe "" (\frs -> ",\"trace\":" ++ traceArrayJSON frs) (crTrace cr)
+  , "}"
+  ]
+
+channelJSON :: ChannelReport -> String
+channelJSON ch = concat
+  [ "{\"name\":",   jstr (chName ch)
+  , ",\"unit\":",   jstr (chUnit ch)
+  , ",\"result\":", resultToJSON (chResult ch)
+  , maybe "" (\a -> ",\"controls\":" ++ controlsJSON a)
+      (chAttribution ch)
   , "}"
   ]
 
@@ -931,6 +987,13 @@ data TraceSuite = TraceSuite
 --   even for pure targets), 'record' streams the run and keeps its
 --   frames, and on 'Reject' 'attribute' runs the A\/A + B\/B
 --   diagnostics automatically (two extra runs).
+--
+--   The meter @cycles+wall@ ('splitMeterName') runs each case under
+--   the split meter ('Censor.runSplitWith'): the case's result is
+--   the cycles channel, and the period and wall channels of the same
+--   pairs are reported beside it ('crChannels'). Calibration and the
+--   baseline read cycles, and the controls run when any channel
+--   rejects.
 runTraceSuite :: TraceSuite -> IO ()
 runTraceSuite ts = do
   hSetBuffering stdout LineBuffering
@@ -943,62 +1006,121 @@ runTraceSuite ts = do
   let out = case saExtra sa of
         (o:_) -> Just o
         _     -> Nothing
-  withMeterArg (saMeter sa) $ \mname meter -> do
-    env <- captureEnv
-    let cfgBase = (tsConfig ts)
-          { cfgMargin =
-              maybe (cfgMargin (tsConfig ts)) Just (saMargin sa) }
-        hdr = ReportHeader
-          { rhMeter     = mname
-          , rhConfig    = cfgBase
-              { cfgBatch = fromMaybe (cfgBatch cfgBase) (saBatch sa) }
-          , rhSeed      = tsSeed ts
-          , rhTarget    = Just (tsTarget ts)
-          , rhNote      = tsNote ts
-          , rhEnv       = Just env
-          , rhPerCaseBatch = maybe True (const False) (saBatch sa)
-          }
-        path = fromMaybe (prog ++ "-" ++ mname ++ ".json") out
-    ref <- newIORef ([] :: [CaseReport])
-    _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
-      forM_ (tsCases ts) $ \(TraceCase name policy mkH) -> do
-        -- --batch overrides every case's policy; otherwise the
-        -- case's own declared policy governs, and only
-        -- RepeatableAuto runs a calibration probe.
-        --
-        -- Each probe gets its own instance: it runs a prologue and
-        -- class-A draws, and the main run should start from the
-        -- same state whether or not any probe happened.
-        (b, mnoise) <- case maybe policy FixedBatch (saBatch sa) of
-          SingleShot     -> pure (1, Nothing)
-          FixedBatch n   -> pure (n, Nothing)
-          RepeatableAuto -> do
-            hCal <- mkH
-            cb   <- calibrateBatchReport meter hCal
-            pure (C.crBatch cb, C.crNoise cb)
-        let c = cfgBase { cfgBatch = b }
-        hBase <- mkH
-        base  <- baselineReading meter c hBase
-        h <- mkH
-        t <- record name mname meter c h
-        let r = traceResult t
-        mat <- case r of
-          Reject{} -> do
-            hAtt <- mkH
-            Just <$> attribute meter c hAtt
-          Pass{}   -> pure Nothing
-        let cr = CaseReport
-              { crName        = name
-              , crResult      = r
-              , crAttribution = mat
-              , crBatch       = Just b
-              , crNoise       = mnoise
-              , crBaseline    = Just base
-              , crTrace       = Just (traceFrames t)
+      suite mname runCase = do
+        env <- captureEnv
+        let cfgBase = (tsConfig ts)
+              { cfgMargin =
+                  maybe (cfgMargin (tsConfig ts)) Just (saMargin sa) }
+            hdr = ReportHeader
+              { rhMeter     = mname
+              , rhConfig    = cfgBase
+                  { cfgBatch = fromMaybe (cfgBatch cfgBase) (saBatch sa) }
+              , rhSeed      = tsSeed ts
+              , rhTarget    = Just (tsTarget ts)
+              , rhNote      = tsNote ts
+              , rhEnv       = Just env
+              , rhPerCaseBatch = maybe True (const False) (saBatch sa)
               }
-        modifyIORef' ref (cr :)
-        emit cr
-      cases <- fmap reverse (readIORef ref)
-      writeFile path (reportJSON hdr cases)
-      pure (Just path)
-    pure ()
+            path = fromMaybe (prog ++ "-" ++ mname ++ ".json") out
+        ref <- newIORef ([] :: [CaseReport])
+        _ <- withReport rc (saRenderer sa) hdr $ \emit -> do
+          forM_ (tsCases ts) $ \tc -> do
+            cr <- runCase cfgBase (saBatch sa) tc
+            modifyIORef' ref (cr :)
+            emit cr
+          cases <- fmap reverse (readIORef ref)
+          writeFile path (reportJSON hdr cases)
+          pure (Just path)
+        pure ()
+  case saMeter sa of
+    Just m | m == splitMeterName ->
+      withSplitMeterArg (suite splitMeterName . splitCase)
+    marg -> withMeterArg marg $ \mname meter ->
+      suite mname (meterCase mname meter)
+
+-- One case under a single meter: the batch, the baseline, the
+-- recorded run, and the controls on a rejection.
+meterCase :: String -> Meter -> Config -> Maybe Int -> TraceCase
+          -> IO CaseReport
+meterCase mname meter cfgBase mbatch (TraceCase name policy mkH) = do
+  (b, mnoise) <- caseBatch meter mbatch policy mkH
+  let c = cfgBase { cfgBatch = b }
+  hBase <- mkH
+  base  <- baselineReading meter c hBase
+  h <- mkH
+  t <- record name mname meter c h
+  let r = traceResult t
+  mat <- case r of
+    Reject{} -> do
+      hAtt <- mkH
+      Just <$> attribute meter c hAtt
+    Pass{}   -> pure Nothing
+  pure CaseReport
+    { crName        = name
+    , crResult      = r
+    , crAttribution = mat
+    , crBatch       = Just b
+    , crNoise       = mnoise
+    , crBaseline    = Just base
+    , crTrace       = Just (traceFrames t)
+    , crChannels    = []
+    }
+
+-- One case under the split meter: as 'meterCase', with the cycles
+-- channel as the case's result (batch, noise, and baseline are in
+-- cycles too) and the period and wall channels beside it. The
+-- controls run when any channel rejects, and each rejecting channel
+-- carries its own.
+splitCase :: SplitMeter -> Config -> Maybe Int -> TraceCase
+          -> IO CaseReport
+splitCase meter cfgBase mbatch (TraceCase name policy mkH) = do
+  let cyc = Meter (\k act -> fmap fst (measureSplit meter k act))
+  (b, mnoise) <- caseBatch cyc mbatch policy mkH
+  let c = cfgBase { cfgBatch = b }
+  hBase <- mkH
+  base  <- baselineReading cyc c hBase
+  h   <- mkH
+  ref <- newIORef []
+  sp  <- runSplitWith meter c h $ \ !fr -> modifyIORef' ref (fr :)
+  frs <- fmap reverse (readIORef ref)
+  matt <- if any isReject [splitCycles sp, splitPeriod sp, splitWall sp]
+    then do
+      hAtt <- mkH
+      Just <$> attributeSplit meter c hAtt
+    else pure Nothing
+  let ctl r a
+        | isReject r = a
+        | otherwise  = Nothing
+      chan nm unit r a = ChannelReport nm unit r (ctl r a)
+  pure CaseReport
+    { crName        = name
+    , crResult      = splitCycles sp
+    , crAttribution = ctl (splitCycles sp) (fmap splitCycles matt)
+    , crBatch       = Just b
+    , crNoise       = mnoise
+    , crBaseline    = Just base
+    , crTrace       = Just frs
+    , crChannels    =
+        [ chan "period" "fs" (splitPeriod sp) (fmap splitPeriod matt)
+        , chan "wall" "ns" (splitWall sp) (fmap splitWall matt)
+        ]
+    }
+
+-- A case's batch, and the meter's noise floor at it when calibrated.
+-- --batch overrides every case's policy; otherwise the case's own
+-- declared policy governs, and only RepeatableAuto runs a
+-- calibration probe.
+--
+-- Each probe gets its own instance: it runs a prologue and class-A
+-- draws, and the main run should start from the same state whether
+-- or not any probe happened.
+caseBatch
+  :: Meter -> Maybe Int -> BatchPolicy -> IO (Hypothesis a)
+  -> IO (Int, Maybe Noise)
+caseBatch meter mbatch policy mkH = case maybe policy FixedBatch mbatch of
+  SingleShot     -> pure (1, Nothing)
+  FixedBatch n   -> pure (n, Nothing)
+  RepeatableAuto -> do
+    hCal <- mkH
+    cb   <- calibrateBatchReport meter hCal
+    pure (C.crBatch cb, C.crNoise cb)
