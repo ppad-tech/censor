@@ -1,6 +1,6 @@
 # Changelog
 
-- 0.6.0 (unreleased)
+- 0.6.0 (2026-10-16)
   * **Split meter.** `withSplitMeter` (Linux) reads the cycle counter
     and the wall clock over the same execution, and `runSplit` /
     `runSplitWith` test three channels on every pair: cycles, the
