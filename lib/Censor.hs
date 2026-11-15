@@ -130,11 +130,9 @@ import Data.Primitive.SmallArray
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import System.IO (IOMode(ReadMode), withBinaryFile)
-import qualified Numeric.Eproc.Bernoulli.TwoSided as EPSign
-import qualified Numeric.Eproc.Bounded as EPMagn
 import qualified Numeric.Eproc.ConfSeq as EPCS
-import qualified Numeric.Eproc.Mixture as EPMix
-import Numeric.Eproc.Bounded (Bettor(Newton), ConfigError)
+import Numeric.Eproc.Common (ConfigError)
+import qualified Numeric.Eproc.TwoSample as TS
 
 import Censor.Meter
 import Censor.Rng
@@ -1060,25 +1058,19 @@ splitReadings (!ca, !wa, !cb, !wb) = Split
 
 -- The hedge composition ----------------------------------------------------
 
--- The components are heterogeneous, so the driver steps each one
--- itself and hands their log e-values to 'EPMix.update' once per
--- pair. On a tie the sign component is unchanged, which is still its
--- current value, so the mixture's lockstep precondition holds. The
--- mixture owns the rejection latch and the threshold
--- @log(K \/ alpha)@, with @K = 4 + n@ for @n@ cut points: the
--- hedging price is @log K@ nats against @log(1 \/ alpha) = 13.8@ at
--- the default alpha. Under a margin only the three magnitude
--- components are mixed (@K = 3@); the sign and CDF ones are stepped
--- for their diagnostic peaks.
+-- eproc's two-sample hedge ("Numeric.Eproc.TwoSample") on the pair's
+-- difference: its sign, its magnitude clipped at c, 4c and 16c, and
+-- indicators at the cut points, their mean e-value against
+-- @1 \/ alpha@ with its supremum latched. With @n@ cut points the
+-- hedging price is @log(4 + n)@ nats against @log(1 \/ alpha) = 13.8@
+-- at the default alpha. Under a margin only the three magnitude
+-- components are mixed (a price of @log 3@); the sign and CDF ones are
+-- stepped for their diagnostic peaks. The clip level and cut points
+-- are censor's own calibration ('calibrate').
 
 data HedgeCfg = HedgeCfg
-  { hcSign   :: !EPSign.Config
-  , hcMagn1  :: !EPMagn.Config
-  , hcMagn2  :: !EPMagn.Config
-  , hcMagn3  :: !EPMagn.Config
-  , hcCdf    :: !EPMagn.Config          -- shared by every cut point
+  { hcTest   :: !TS.Config
   , hcQs     :: ![Double]               -- the cut points themselves
-  , hcMix    :: !EPMix.Config
   , hcC1     :: {-# UNPACK #-} !Double  -- tight clip level (base c)
   , hcC2     :: {-# UNPACK #-} !Double  -- 4c
   , hcC3     :: {-# UNPACK #-} !Double  -- 16c
@@ -1086,14 +1078,7 @@ data HedgeCfg = HedgeCfg
                                         -- sharp null
   }
 
-data HedgeState = HedgeState
-  { hsSign  :: !EPSign.State
-  , hsMagn1 :: !EPMagn.State
-  , hsMagn2 :: !EPMagn.State
-  , hsMagn3 :: !EPMagn.State
-  , hsCdf   :: ![EPMagn.State]         -- aligned with 'hcQs'
-  , hsMix   :: !EPMix.State
-  }
+type HedgeState = TS.State
 
 mkHedgeCfg
   :: Double -> Double -> [Double] -> Maybe Double
@@ -1101,29 +1086,15 @@ mkHedgeCfg
 mkHedgeCfg !alpha !c qs mmargin = do
   let !c2 = 4  * c
       !c3 = 16 * c
-      -- a magnitude component on d clipped to [-b, b]: mean-zero
-      -- under the sharp null, anchored at ±delta under a margin.
-      magn !b = case mmargin of
-        Nothing -> EPMagn.config 0 (negate b) b alpha Newton
-        Just d  ->
-          EPMagn.configInterval (negate d) d (negate b) b alpha Newton
-      !k = case mmargin of
-        Nothing -> 4 + length qs
-        Just _  -> 3
-  !sc <- EPSign.config 0.5 alpha Newton
-  !m1 <- magn c
-  !m2 <- magn c2
-  !m3 <- magn c3
-  !cd <- EPMagn.config 0 (negate 1)  1  alpha Newton
-  !mx <- EPMix.config k alpha
+      bounds = [c, c2, c3]
+  !t <- case mmargin of
+    -- each magnitude component on d clipped to [-b, b]: mean-zero
+    -- under the sharp null, anchored at ±delta under a margin.
+    Nothing -> TS.config alpha bounds 1 qs
+    Just d  -> TS.configInterval d alpha bounds 1 qs
   pure HedgeCfg
-    { hcSign   = sc
-    , hcMagn1  = m1
-    , hcMagn2  = m2
-    , hcMagn3  = m3
-    , hcCdf    = cd
+    { hcTest   = t
     , hcQs     = qs
-    , hcMix    = mx
     , hcC1     = c
     , hcC2     = c2
     , hcC3     = c3
@@ -1175,7 +1146,7 @@ channel cfg ws = do
 
 chanInitial :: Chan -> ChanState
 chanInitial Chan{..} = ChanState
-  { csHedge = initialHedge chHedge
+  { csHedge = TS.initial (hcTest chHedge)
   , csSeq   = EPCS.initial chSeq
   , csIv    = (negate (hcC3 chHedge), hcC3 chHedge)
   , csClips = noClips
@@ -1189,7 +1160,7 @@ chanInitial Chan{..} = ChanState
 stepChan :: Chan -> ChanState -> Double -> Double -> ChanState
 stepChan Chan{..} ChanState{..} !xa !xb =
   let !d   = xa - xb
-      !h'  = updateHedge chHedge csHedge d xa xb
+      !h'  = TS.update_pair (hcTest chHedge) csHedge (xa, xb)
       !s'  = EPCS.update chSeq csSeq (clipD (hcC3 chHedge) d)
       !iv' = case EPCS.interval chSeq s' of
                Just x  -> x
@@ -1200,36 +1171,35 @@ stepChan Chan{..} ChanState{..} !xa !xb =
 -- Whether the channel's mixture has crossed its threshold; latched.
 chanRejects :: Chan -> ChanState -> Bool
 chanRejects Chan{..} ChanState{..} =
-  case EPMix.decide (hcMix chHedge) (hsMix csHedge) of
-    EPMix.Reject -> True
+  case TS.decide (hcTest chHedge) csHedge of
+    TS.Reject -> True
     _            -> False
 
 -- The channel's frame after pair @n@, whose difference was @d@.
 chanFrame :: Chan -> Int -> Double -> ChanState -> Frame
 chanFrame Chan{..} !n !d ChanState{..} = Frame n d
-  (EPMix.log_evalue mixc (hsMix csHedge))
-  (EPMix.log_evalue_sup mixc (hsMix csHedge))
+  (TS.log_evalue (hcTest chHedge) csHedge)
+  (TS.log_evalue_sup csHedge)
   (fst csIv) (snd csIv)
   (abs d > hcC1 chHedge)
-  where
-    mixc = hcMix chHedge
 
 -- The channel's t'Result' after @n@ pairs, under the run's root seed.
 chanResult :: Chan -> Word64 -> Int -> ChanState -> Result
 chanResult ch@Chan{..} !root !n st@ChanState{..} = ctor
-  n (EPMix.log_evalue_sup mixc (hsMix csHedge))
-  (EPMix.p_value mixc (hsMix csHedge))
+  n (TS.log_evalue_sup csHedge)
+  (TS.p_value csHedge)
   csIv
   (clAtC csClips) (clAt4C csClips) (clAt16C csClips) (hcC1 chHedge)
-  (EPSign.log_evalue_sup (hsSign csHedge))
-  (EPMagn.log_evalue_sup (hsMagn1 csHedge))
-  (EPMagn.log_evalue_sup (hsMagn2 csHedge))
-  (EPMagn.log_evalue_sup (hsMagn3 csHedge))
-  (cdfPeaks (hcQs chHedge) (hsCdf csHedge))
+  (TS.log_evalue_sup_sign csHedge)
+  (magnPeak 0) (magnPeak 1) (magnPeak 2)
+  (zip (hcQs chHedge) (TS.log_evalue_sup_cdf csHedge))
   root
   (hcMargin chHedge)
   where
-    mixc = hcMix chHedge
+    -- the magnitude components' peaks, in their clip bounds' order
+    magnPeak i = case drop i (TS.log_evalue_sup_magnitude csHedge) of
+      x : _ -> x
+      []    -> 0
     ctor | chanRejects ch st = Reject
          | otherwise         = Pass
 
@@ -1254,81 +1224,6 @@ bumpClips HedgeCfg{..} (Clips !a !b !c) !d = Clips
     !m = abs d
     bump !lim !n = if m > lim then n + 1 else n
 {-# INLINE bumpClips #-}
-
-initialHedge :: HedgeCfg -> HedgeState
-initialHedge HedgeCfg{..} = HedgeState
-  { hsSign  = EPSign.initial hcSign
-  , hsMagn1 = EPMagn.initial hcMagn1
-  , hsMagn2 = EPMagn.initial hcMagn2
-  , hsMagn3 = EPMagn.initial hcMagn3
-  , hsCdf   = map (const (EPMagn.initial hcCdf)) hcQs
-  , hsMix   = EPMix.initial hcMix
-  }
-
-updateHedge
-  :: HedgeCfg -> HedgeState -> Double -> Double -> Double -> HedgeState
-updateHedge HedgeCfg{..} HedgeState{..} !d !ta !tb =
-  let !s'  = if d == 0
-             then hsSign
-             else EPSign.update hcSign hsSign (d > 0)
-      !m1' = EPMagn.update hcMagn1 hsMagn1 (clipD hcC1 d)
-      !m2' = EPMagn.update hcMagn2 hsMagn2 (clipD hcC2 d)
-      !m3' = EPMagn.update hcMagn3 hsMagn3 (clipD hcC3 d)
-      !cd' = stepCdf hcCdf hcQs hsCdf ta tb
-      -- under a margin only the magnitude components gate; the
-      -- sign and CDF components are stepped above for their
-      -- diagnostic peaks but stay out of the mixture.
-      !evs = case hcMargin of
-        Just _  ->
-          [ EPMagn.log_evalue m1'
-          , EPMagn.log_evalue m2'
-          , EPMagn.log_evalue m3'
-          ]
-        Nothing ->
-          ( EPSign.log_evalue s'
-          : EPMagn.log_evalue m1'
-          : EPMagn.log_evalue m2'
-          : EPMagn.log_evalue m3'
-          : map EPMagn.log_evalue cd'
-          )
-      !x'  = EPMix.update hcMix hsMix evs
-  in  HedgeState
-        { hsSign  = s'
-        , hsMagn1 = m1'
-        , hsMagn2 = m2'
-        , hsMagn3 = m3'
-        , hsCdf   = cd'
-        , hsMix   = x'
-        }
-
--- Step every CDF-indicator component. Spine- and element-strict so
--- the per-pair states don't accumulate thunks across the budget.
-stepCdf
-  :: EPMagn.Config -> [Double] -> [EPMagn.State] -> Double -> Double
-  -> [EPMagn.State]
-stepCdf !cfg = go
-  where
-    go (q : qs) (s : ss) !ta !tb =
-      let !s'  = EPMagn.update cfg s (cdfDiff q ta tb)
-          !ss' = go qs ss ta tb
-      in  s' : ss'
-    go _ _ _ _ = []
-
--- The antisymmetric indicator functional at cut point @q@:
--- @1[ta <= q] - 1[tb <= q]@, valued in @{-1, 0, 1}@, with
--- conditional mean @F_A(q) - F_B(q)@.
-cdfDiff :: Double -> Double -> Double -> Double
-cdfDiff !q !ta !tb = ind ta - ind tb
-  where
-    ind !t | t <= q    = 1
-           | otherwise = 0
-{-# INLINE cdfDiff #-}
-
--- Pair each cut point with its component's peak log e-value. The
--- state list is aligned with 'hcQs' by construction, so the zip is
--- total on both.
-cdfPeaks :: [Double] -> [EPMagn.State] -> [(Double, Double)]
-cdfPeaks qs = zip qs . map EPMagn.log_evalue_sup
 
 clipD :: Double -> Double -> Double
 clipD !lim !x
