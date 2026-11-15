@@ -1,5 +1,10 @@
 # Changelog
 
+- 0.6.1 (unreleased)
+  * The hedge is ppad-eproc's Numeric.Eproc.TwoSample (0.5.3), which
+    took up censor's construction; censor's calibration, results and
+    diagnostics are unchanged (censor-validate's output identical).
+
 - 0.6.0 (2026-10-16)
   * **Split meter.** `withSplitMeter` (Linux) reads the cycle counter
     and the wall clock over the same execution, and `runSplit` /
