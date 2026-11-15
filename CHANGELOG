@@ -1,6 +1,6 @@
 # Changelog
 
-- 0.6.1 (unreleased)
+- 0.6.1 (2026-11-15)
   * The hedge is ppad-eproc's Numeric.Eproc.TwoSample (0.5.3), which
     took up censor's construction; censor's calibration, results and
     diagnostics are unchanged (censor-validate's output identical).
