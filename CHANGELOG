@@ -7,6 +7,11 @@
     generator's state. A generator is no longer safe to share between
     threads. splitMix, which derives a run's seeds and order bits, is
     unchanged, so a seed orders a run's pairs as before.
+  * censor-validate's trials are independent: each draws its own
+    order-bit seed and stream seeds from a generator rooted per cell,
+    where before every trial in a cell repeated the same seeds, so a
+    cell's rejection count could only be 0 or N. The baseline is
+    recaptured.
 
 - 0.6.1 (2026-11-15)
   * The hedge is ppad-eproc's Numeric.Eproc.TwoSample (0.5.3), which
