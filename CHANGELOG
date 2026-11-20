@@ -1,5 +1,13 @@
 # Changelog
 
+- 0.6.2 (unreleased)
+  * Censor.Rng draws from ppad-random's xoshiro256++ (Crypto.PRNG), in
+    place of splitmix64, so a seed's stream differs from 0.6.1's.
+    Draws and byte fills no longer allocate; a reseed allocates the new
+    generator's state. A generator is no longer safe to share between
+    threads. splitMix, which derives a run's seeds and order bits, is
+    unchanged, so a seed orders a run's pairs as before.
+
 - 0.6.1 (2026-11-15)
   * The hedge is ppad-eproc's Numeric.Eproc.TwoSample (0.5.3), which
     took up censor's construction; censor's calibration, results and
