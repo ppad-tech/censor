@@ -1,6 +1,6 @@
 # Changelog
 
-- 0.6.2 (unreleased)
+- 0.6.2 (2026-11-20)
   * Censor.Rng draws from ppad-random's xoshiro256++ (Crypto.PRNG), in
     place of splitmix64, so a seed's stream differs from 0.6.1's.
     Draws and byte fills no longer allocate; a reseed allocates the new
