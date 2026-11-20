@@ -26,6 +26,7 @@ module Main where
 import qualified Censor as C
 import qualified Censor.Runner as R
 import Control.Monad (forM, forM_, unless)
+import Data.Bits (xor)
 import Data.IORef
 import Data.List (intercalate)
 import Data.Maybe (isJust)
@@ -142,20 +143,29 @@ mkSyntheticMeter !nextA !nextB = do
 -- A scenario is a stream factory: each trial calls scInit afresh,
 -- producing two new per-class streams (and any state they share).
 -- scInit takes the Config so scenarios that need to coordinate
--- with cfgWarmup (the pathological-clipping case) can do so.
+-- with cfgWarmup (the pathological-clipping case) can do so, and
+-- the trial's seed, from which the streams are seeded along with
+-- the scenario's own, so that every trial draws fresh ones.
 data Scenario = Scenario
   { scName :: !String
-  , scInit :: !(C.Config -> IO (IO Word64, IO Word64))
+  , scInit :: !(C.Config -> Word64 -> IO (IO Word64, IO Word64))
   }
 
+-- A trial's two per-class generators, from the scenario's seed and
+-- the trial's.
+classRngs :: Word64 -> Word64 -> IO (C.Rng, C.Rng)
+classRngs !seed !t = do
+  ra <- C.mkRng (seed `xor` t)
+  rb <- C.mkRng ((seed + 1) `xor` t)
+  pure (ra, rb)
+
 scConstant :: Scenario
-scConstant = Scenario "constant" $ \_ ->
+scConstant = Scenario "constant" $ \_ _ ->
   pure (pure 100, pure 100)
 
 scSymUniform :: Word64 -> Scenario
-scSymUniform !seed = Scenario "sym-uniform-iid" $ \_ -> do
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+scSymUniform !seed = Scenario "sym-uniform-iid" $ \_ t -> do
+  (ra, rb) <- classRngs seed t
   pure (uniformInt ra 0 200, uniformInt rb 0 200)
 
 -- A uniform over a wide range, B uniform over a narrow centred
@@ -168,18 +178,16 @@ scSymUniform !seed = Scenario "sym-uniform-iid" $ \_ -> do
 -- detect it. It is the cell that distinguishes a null of
 -- "d is symmetric" from a null of "the pair is exchangeable".
 scAsymUniform :: Word64 -> Scenario
-scAsymUniform !seed = Scenario "asym-uniform-equal-mean" $ \_ -> do
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+scAsymUniform !seed = Scenario "asym-uniform-equal-mean" $ \_ t -> do
+  (ra, rb) <- classRngs seed t
   pure (uniformInt ra 0 200, uniformInt rb 50 150)
 
 -- 95% uniform[50, 150] + 5% uniform[5000, 10000] for both classes.
 -- Heavy upper tail exercises the clipping branch heavily; equal
 -- distributions mean equal means, so H_0 holds.
 scHeavyTail :: Word64 -> Scenario
-scHeavyTail !seed = Scenario "heavy-tail" $ \_ -> do
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+scHeavyTail !seed = Scenario "heavy-tail" $ \_ t -> do
+  (ra, rb) <- classRngs seed t
   let draw rng = do
         u <- C.nextWord rng
         if u `mod` 20 == 0
@@ -194,10 +202,9 @@ scHeavyTail !seed = Scenario "heavy-tail" $ \_ -> do
 -- highly non-stationary — exercising the conditional-null regime
 -- the order-bit randomisation is supposed to handle.
 scDriftingBaseline :: Word64 -> Scenario
-scDriftingBaseline !seed = Scenario "drifting-baseline" $ \_ -> do
+scDriftingBaseline !seed = Scenario "drifting-baseline" $ \_ t -> do
   ctr <- newIORef (0 :: Int)
-  noiseA <- C.mkRng seed
-  noiseB <- C.mkRng (seed + 1)
+  (noiseA, noiseB) <- classRngs seed t
   let draw rng = do
         n <- atomicModifyIORef' ctr (\x -> (x + 1, x))
         let !base = 100 + fromIntegral (n `div` 2) * 10
@@ -214,7 +221,7 @@ scDriftingBaseline !seed = Scenario "drifting-baseline" $ \_ -> do
 -- conditional mean of the difference stays zero — the test is that
 -- clipping doesn't *itself* generate spurious rejections.
 scAllClipping :: Word64 -> Scenario
-scAllClipping !seed = Scenario "pathological-clipping" $ \cfg -> do
+scAllClipping !seed = Scenario "pathological-clipping" $ \cfg _ -> do
   ctrA <- newIORef (0 :: Int)
   ctrB <- newIORef (0 :: Int)
   let !cutover = C.cfgWarmup cfg
@@ -227,9 +234,8 @@ scAllClipping !seed = Scenario "pathological-clipping" $ \cfg -> do
 -- Readings concentrated right against the upper end of the warmup
 -- bound. Tests behaviour at the clipping boundary.
 scNearBound :: Word64 -> Scenario
-scNearBound !seed = Scenario "near-bound" $ \_ -> do
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+scNearBound !seed = Scenario "near-bound" $ \_ t -> do
+  (ra, rb) <- classRngs seed t
   pure (uniformInt ra 180 200, uniformInt rb 180 200)
 
 -- Mid-run regime change: warmup and the early main phase see a
@@ -239,10 +245,9 @@ scNearBound !seed = Scenario "near-bound" $ \_ -> do
 -- the main phase — stresses the assumption that warmup calibration
 -- characterises the whole run.
 scRegimeChange :: Word64 -> Scenario
-scRegimeChange !seed = Scenario "regime-change" $ \cfg -> do
+scRegimeChange !seed = Scenario "regime-change" $ \cfg t -> do
   ctr <- newIORef (0 :: Int)
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+  (ra, rb) <- classRngs seed t
   let !switchAt = 2 * C.cfgWarmup cfg + C.cfgBudget cfg
       draw rng = do
         n <- atomicModifyIORef' ctr (\x -> (x + 1, x))
@@ -259,9 +264,8 @@ scRegimeChange !seed = Scenario "regime-change" $ \cfg -> do
 -- is set by @|d|@ and stays ~500x higher than it would be if it
 -- scaled with reading magnitude.
 scNarrowJitter :: Word64 -> Scenario
-scNarrowJitter !seed = Scenario "narrow-jitter" $ \_ -> do
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+scNarrowJitter !seed = Scenario "narrow-jitter" $ \_ t -> do
+  (ra, rb) <- classRngs seed t
   pure (uniformInt ra 9990 10010, uniformInt rb 9990 10010)
 
 -- Rare-outlier H_0: both classes are 99% uniform[50,150] + 1%
@@ -271,9 +275,8 @@ scNarrowJitter !seed = Scenario "narrow-jitter" $ \_ -> do
 -- (symmetric clipping preserves symmetry across all three magnitude
 -- components, so it shouldn't).
 scRareOutlier :: Word64 -> Scenario
-scRareOutlier !seed = Scenario "rare-outlier" $ \_ -> do
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+scRareOutlier !seed = Scenario "rare-outlier" $ \_ t -> do
+  (ra, rb) <- classRngs seed t
   let draw rng = do
         u <- C.nextWord rng
         if u `mod` 100 == 0
@@ -289,9 +292,8 @@ scRareOutlier !seed = Scenario "rare-outlier" $ \_ -> do
 -- spike signal — this is the scenario that exercises the multi-clip
 -- rationale for the hedge.
 scRareOutlierAsym :: Word64 -> Scenario
-scRareOutlierAsym !seed = Scenario "rare-outlier-asym" $ \_ -> do
-  ra <- C.mkRng seed
-  rb <- C.mkRng (seed + 1)
+scRareOutlierAsym !seed = Scenario "rare-outlier-asym" $ \_ t -> do
+  (ra, rb) <- classRngs seed t
   let drawA = uniformInt ra 50 150
       drawB = do
         u <- C.nextWord rb
@@ -320,8 +322,8 @@ h0Scenarios =
 addShift :: Scenario -> Word64 -> Scenario
 addShift !base !shift = base
   { scName = scName base ++ "+shift=" ++ show shift
-  , scInit = \cfg -> do
-      (a, b) <- scInit base cfg
+  , scInit = \cfg t -> do
+      (a, b) <- scInit base cfg t
       pure (a, fmap (+ shift) b)
   }
 
@@ -359,10 +361,9 @@ baseCfg !budget !batch !alpha = C.defaultConfig
   , C.cfgBudget = budget
   , C.cfgBatch  = batch
   , C.cfgWarmup = 200
-  , C.cfgSeed   = Just 0xBA5E11EDBA5E11ED
-    -- Pin the order-bit seed so the baseline CSV is reproducible
-    -- across runs. Production use of censor should leave cfgSeed at
-    -- the default 'Nothing' (fresh entropy per run).
+    -- cfgSeed is set per trial by the runner (see 'sweepSeed').
+    -- Production use of censor should leave cfgSeed at the default
+    -- 'Nothing' (fresh entropy per run).
   }
 
 -- Gated cells: alphas where it is feasible to PASS at our N. A
@@ -483,22 +484,34 @@ powerCells = shiftedCells ++ asymCells ++ varianceCells
 
 -- runner ---------------------------------------------------------------------
 
-runTrial :: Scenario -> C.Config -> IO C.Result
-runTrial !sc !cfg = do
-  (a, b)        <- scInit sc cfg
+-- The root of every cell's trial seeds. Each trial draws its
+-- order-bit seed and its streams' seed from a generator started
+-- here, so that a cell's trials are independent and the sweep (and
+-- the baseline CSV) is reproducible.
+sweepSeed :: Word64
+sweepSeed = 0xBA5E11EDBA5E11ED
+
+runTrial :: Scenario -> C.Config -> C.Rng -> IO C.Result
+runTrial !sc !cfg !g = do
+  !o <- C.nextWord g
+  !t <- C.nextWord g
+  let !cfg' = cfg { C.cfgSeed = Just o }
+  (a, b)        <- scInit sc cfg' t
   (meter, hyp)  <- mkSyntheticMeter a b
-  C.runCT meter cfg hyp
+  C.runCT meter cfg' hyp
 
 countRejects :: Scenario -> C.Config -> Int -> IO Int
-countRejects !sc !cfg !trials = go trials 0
+countRejects !sc !cfg !trials = do
+  g <- C.mkRng sweepSeed
+  go g trials 0
   where
-    go !0 !acc = pure acc
-    go !n !acc = do
-      r <- runTrial sc cfg
+    go _ !0 !acc = pure acc
+    go g !n !acc = do
+      r <- runTrial sc cfg g
       let !inc = case r of
             C.Reject{} -> 1
             C.Pass{}   -> 0
-      go (n - 1) (acc + inc)
+      go g (n - 1) (acc + inc)
 
 data CellResult = CellResult
   { crCell    :: !Cell
