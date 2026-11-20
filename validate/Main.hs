@@ -39,7 +39,7 @@ import qualified System.IO as IO
 import Text.Printf (printf)
 import Text.Read (readMaybe)
 
--- splitmix64 -----------------------------------------------------------------
+-- prng -----------------------------------------------------------------------
 
 -- Internal PRNG for the synthetic distributions, from Censor.Rng.
 -- A separate generator is used for every stream; deterministic
