@@ -115,8 +115,10 @@ with known distributions, and tabulates power against effect size:
 $ cabal run -f+validate censor-validate -- 10000 --csv out.csv
 ```
 
-The current baseline is in `etc/validate/baseline.csv`; it records
-zero rejections in every null cell at every alpha.
+The current baseline is in `etc/validate/baseline.csv`: no null cell
+fails, and null rejection rates are at most 0.74% at alpha 1e-2 and
+0.08% at 1e-3. At 1e-4 and 1e-6, which N = 10000 can't resolve, at
+most 2 of 10000 trials reject.
 
 ## Documentation
 
