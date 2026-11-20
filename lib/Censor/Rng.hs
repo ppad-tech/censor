@@ -7,7 +7,7 @@
 -- License: MIT
 -- Maintainer: Jared Tobin <jared@ppad.tech>
 --
--- A minimal splitmix64 PRNG for input samplers.
+-- A minimal PRNG for input samplers: ppad-random's xoshiro256++.
 --
 -- Samplers feeding 'Censor.runCT' want a pseudorandom source that is
 -- deterministic under a fixed seed, cheap, and light on allocation,
@@ -16,6 +16,8 @@
 -- exactly that and nothing more. It is /not/ a cryptographic
 -- generator; the sampled inputs only need to be independent of the
 -- target's timing distribution, not unpredictable.
+--
+-- A generator is not thread-safe: use one per thread.
 
 module Censor.Rng (
     -- * Stateful generator
@@ -32,40 +34,45 @@ module Censor.Rng (
   , splitMix
   ) where
 
+import qualified Crypto.PRNG as PRNG
 import qualified Data.Bits as B
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BI
 import Data.IORef
 import Data.Word (Word8, Word64)
+import GHC.Exts (RealWorld)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (pokeByteOff)
 
--- | splitmix64 state threaded through an 'IORef'.
-newtype Rng = Rng (IORef Word64)
+-- | A xoshiro256++ generator, behind an 'IORef' so that it can be
+--   reseeded in place.
+newtype Rng = Rng (IORef (PRNG.Gen RealWorld))
 
 -- | Create a generator from a seed. Equal seeds yield equal streams.
 mkRng :: Word64 -> IO Rng
-mkRng s = Rng <$> newIORef s
+mkRng s = PRNG.new s >>= fmap Rng . newIORef
 {-# INLINE mkRng #-}
 
 -- | Draw the next 'Word64' from the generator.
 nextWord :: Rng -> IO Word64
-nextWord (Rng ref) = atomicModifyIORef' ref splitMix
+nextWord (Rng ref) = readIORef ref >>= PRNG.word64
 {-# INLINE nextWord #-}
 
 -- | Reset a generator to a seed in place: after @reseed g s@ the
 --   generator draws exactly the stream of a fresh @'mkRng' s@.
 --
 --   Lets one long-lived generator replay a pinned stream, or adopt
---   a fresh one, without allocating per use — so the two classes
---   of a fix-vs-random sampler can share a single generator object
---   and differ only in the seed value written into it.
+--   a fresh one, allocating only the new generator's state — so the
+--   two classes of a fix-vs-random sampler can share a single
+--   generator object and differ only in the seed value written into
+--   it.
 reseed :: Rng -> Word64 -> IO ()
-reseed (Rng ref) s = atomicWriteIORef ref s
+reseed (Rng ref) s = PRNG.new s >>= writeIORef ref
 {-# INLINE reseed #-}
 
 -- | The pure splitmix64 step: from a state, produce the successor
---   state and an output word.
+--   state and an output word. "Censor" derives a run's seeds and
+--   its order bits with it; an 'Rng' doesn't use it.
 splitMix :: Word64 -> (Word64, Word64)
 splitMix !s =
   let !s' = s + 0x9E3779B97F4A7C15
