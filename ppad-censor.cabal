@@ -89,7 +89,6 @@ library
       base >= 4.9 && < 5
     , bytestring >= 0.9 && < 0.13
     , ppad-eproc >= 0.5.3 && < 0.6
-    , ppad-random >= 0.1 && < 0.2
     , primitive >= 0.8 && < 0.10
 
 test-suite censor-tests
