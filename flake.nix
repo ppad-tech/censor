@@ -13,18 +13,11 @@
       ref  = "master";
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
     };
-    ppad-random = {
-      type = "git";
-      url  = "git://git.ppad.tech/random.git";
-      ref  = "master";
-      inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
-    };
     flake-utils.follows = "ppad-nixpkgs/flake-utils";
     nixpkgs.follows = "ppad-nixpkgs/nixpkgs";
   };
 
-  outputs = { self, nixpkgs, flake-utils, ppad-nixpkgs, ppad-eproc
-            , ppad-random }:
+  outputs = { self, nixpkgs, flake-utils, ppad-nixpkgs, ppad-eproc }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         lib = "ppad-censor";
@@ -34,14 +27,11 @@
         clang = pkgs.llvmPackages_19.clang;
 
         eproc = ppad-eproc.packages.${system}.default;
-        random = ppad-random.packages.${system}.default;
 
         hpkgs = pkgs.haskell.packages.ghc910.extend (new: old: {
           ppad-eproc = eproc;
-          ppad-random = random;
           ${lib} = new.callCabal2nix lib ./. {
             ppad-eproc = new.ppad-eproc;
-            ppad-random = new.ppad-random;
           };
         });
 

@@ -1,5 +1,12 @@
 # Changelog
 
+- 0.6.3 (unreleased)
+  * censor no longer depends on ppad-random: Censor.Rng implements
+    xoshiro256++ itself, drawing the same stream for a seed as 0.6.2.
+    A harness depending on censor no longer carries ppad-random's
+    ppad-chacha, which collided with a target pinning another
+    ppad-chacha. A reseed no longer allocates.
+
 - 0.6.2 (2026-11-20)
   * Censor.Rng draws from ppad-random's xoshiro256++ (Crypto.PRNG), in
     place of splitmix64, so a seed's stream differs from 0.6.1's.

@@ -864,7 +864,19 @@ fixVsRandomTests = testGroup "fixVsRandom" [
 
 rngTests :: TestTree
 rngTests = testGroup "Censor.Rng" [
-    testCase "equal seeds give equal streams" $ do
+    -- xoshiro256++ seeded via splitmix64, as ppad-random's
+    -- Crypto.PRNG draws it
+    testCase "xoshiro256++ vectors" $ do
+      g42 <- C.mkRng 42
+      ws42 <- mapM (\_ -> C.nextWord g42) [1 .. 4 :: Int]
+      ws42 @?= [ 0xd0764d4f4476689f, 0x519e4174576f3791
+               , 0xfbe07cfb0c24ed8c, 0xb37d9f600cd835b8 ]
+      g0 <- C.mkRng 0
+      ws0 <- mapM (\_ -> C.nextWord g0) [1 .. 4 :: Int]
+      ws0 @?= [ 0x53175d61490b23df, 0x61da6f3dc380d507
+              , 0x5c0fdf91ec9a7bfc, 0x02eebf8c3bbe5e1a ]
+
+  , testCase "equal seeds give equal streams" $ do
       g1 <- C.mkRng 0xFEEDFACE
       g2 <- C.mkRng 0xFEEDFACE
       ws1 <- mapM (\_ -> C.nextWord g1) [1 .. 16 :: Int]
