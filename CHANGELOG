@@ -1,6 +1,6 @@
 # Changelog
 
-- 0.6.3 (unreleased)
+- 0.6.3 (2026-11-21)
   * censor no longer depends on ppad-random: Censor.Rng implements
     xoshiro256++ itself, drawing the same stream for a seed as 0.6.2.
     A harness depending on censor no longer carries ppad-random's
